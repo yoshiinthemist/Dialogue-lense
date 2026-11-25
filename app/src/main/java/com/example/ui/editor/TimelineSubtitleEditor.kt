@@ -1855,6 +1855,9 @@ private fun StudioDiagnosticsTab(
                         "#${diag.seekGeneration} · ${if (!diag.isSeekInFlight) "Acknowledged" else "Awaiting"}",
                     )
                     DiagnosticMetricRow("Buffering episodes", "${diag.bufferingEpisodeCount}")
+                    if (diag.scoutWindowServiceMs > 0L) {
+                        DiagnosticMetricRow("Scout processing time", "${diag.scoutWindowServiceMs / 1000.0}s for ${diag.scoutWindowMediaMs / 1000.0}s of video (rolling average)")
+                    }
                     DiagnosticMetricRow("Auto-resumes", "${diag.autoResumeCount}")
                     if (readinessSnapshot.isWatchNowBypassActive) {
                         DiagnosticMetricRow("Watch Now bypass", "Active for current segment")

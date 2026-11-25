@@ -468,6 +468,52 @@ class DialogueLensV1OverhaulTest {
     }
 
     @Test
+    fun urgentSeekCanClaimTheLastGapBeforeAnInterruptedRepairReturns() {
+        val ledger = com.example.domain.analysis.TranscriptCoverageLedger(60_000)
+        val silent = com.example.data.model.CoverageStatus.VERIFIED_SILENCE
+        ledger.recordOutcome(0, 30_000, silent)
+        ledger.recordOutcome(45_000, 60_000, silent)
+        val mark = HealBeacon("manual", 36_000, 30_000, 45_000, HealBeaconStatus.MARKED, repairRevision = 3, revision = 4)
+        val project = sampleProject(beacons = listOf(mark)).copy(subtitleSource = SubtitleSourceKind.AI_DRAFT)
+        val coordinator = com.example.domain.sentinel.SentinelWorkforceCoordinator()
+        coordinator.syncWithProject(project)
+        assertNotNull(coordinator.claimNextWork(com.example.domain.sentinel.SentinelWorkforceCoordinator.WORKER_1_ID))
+        val running = mark.copy(status = HealBeaconStatus.HEALING)
+        val live = java.util.concurrent.atomic.AtomicReference(project.copy(healBeacons = listOf(running)))
+        val started = java.util.concurrent.CountDownLatch(1)
+        val lateReply = java.util.concurrent.CountDownLatch(1)
+        val delayedWorker = java.util.concurrent.CompletableFuture.supplyAsync {
+            check(ledger.tryReserveRepair("old", 30_000, 45_000))
+            started.countDown()
+            check(lateReply.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            HealBeaconEngine.applyValidatedLocalizedRepair(live.get(), mark.id,
+                listOf(sampleEvent("late", 34_000, 37_000, "Late result", "spk_a")),
+                expectedRepairRevision = mark.repairRevision)
+        }
+        try {
+            assertTrue(started.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertNull(ledger.nextPriorityInterval(36_000))
+            assertTrue(ledger.revokeRepairReservations())
+            coordinator.yieldWorkersToPlayback()
+            assertEquals(0, coordinator.inspectorSnapshot().activeWorkerCount)
+            val deferred = HealBeaconEngine.deferToPlayback(live.get())
+            val next = requireNotNull(ledger.nextPriorityInterval(36_000))
+            assertEquals(30_000L, next.startMs)
+            assertEquals(45_000L, next.endMs)
+            ledger.markInProgress(next.startMs, next.endMs)
+            assertFalse(ledger.tryReserveRepair("retry", 30_000, 45_000))
+            val retried = deferred.healBeacons.single().copy(status = HealBeaconStatus.HEALING)
+            assertTrue(retried.repairRevision > mark.repairRevision)
+            live.set(deferred.copy(healBeacons = listOf(retried)))
+        } finally {
+            lateReply.countDown()
+        }
+        val late = delayedWorker.get(5, java.util.concurrent.TimeUnit.SECONDS)
+        assertFalse(late.applied)
+        assertTrue(late.updatedProject.dialogueEvents.isEmpty())
+    }
+
+    @Test
     fun interruptedHealingBeaconsRestoreToMarkedOnReload() {
         val project = sampleProject(
             beacons = listOf(

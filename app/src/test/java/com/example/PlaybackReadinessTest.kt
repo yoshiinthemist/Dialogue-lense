@@ -122,6 +122,41 @@ class PlaybackReadinessTest {
         assertNull(update(10_000L, pos = 40_000L, now = 45).playCommand)
     }
 
+    @Test fun slowScoutBuildsEnoughContinuousLeadForItsNextCompletionAtOneAndTwoTimesSpeed() {
+        for ((speed, serviceMs) in listOf(1f to 10_000L, 2f to 12_000L)) {
+            val ledger = TranscriptCoverageLedger(180_000L)
+            val player = PlaybackReadinessController()
+            val position = 65_390L
+            player.setIntent(true)
+            player.seek(position, 3)
+            assertTrue(player.acknowledge(3, position, true))
+            var elapsed = 0L
+            var lead = 0L
+            val expected = ((serviceMs + 2_000L) * speed).toLong()
+            while (lead < expected) {
+                val next = ledger.nextPriorityInterval(position, openingWindowMs = 7_000L, rollingWindowMs = 7_000L,
+                    startAtPlayhead = true)!!
+                assertEquals(position + lead, next.startMs)
+                elapsed += serviceMs
+                ledger.recordOutcome(next.startMs, next.endMs, CoverageStatus.VERIFIED_SILENCE)
+                player.recordScoutWindow(next.endMs - next.startMs, serviceMs)
+                lead = ledger.verifiedLeadMs(position)
+                val decision = player.evaluate(position, 180_000L, speed, lead, true, false, MediaTransport.PAUSED, elapsed)
+                assertEquals(expected, decision.minimumLeadMs)
+                if (lead < expected) {
+                    assertNull(decision.playCommand)
+                    assertEquals(PlaybackPhase.PREPARING, decision.phase)
+                } else assertEquals(true, decision.playCommand)
+            }
+            val beforeNextCompletion = lead - (serviceMs * speed).toLong()
+            assertTrue(beforeNextCompletion >= (2_000L * speed).toLong())
+            assertEquals(serviceMs, player.snapshot().diagnostics.scoutWindowServiceMs)
+            player.setIntent(false)
+            assertEquals(false, player.evaluate(position, 180_000L, speed, lead, true, false, MediaTransport.PLAYING, elapsed).playCommand)
+            assertNull(player.evaluate(position, 180_000L, speed, lead, true, false, MediaTransport.PAUSED, elapsed + 50L).playCommand)
+        }
+    }
+
     @Test fun transportStallDoesNotStartClockOrRepeatedlyIssuePlay() {
         controller.setIntent(true)
         val waiting = update(10_000, transport = MediaTransport.BUFFERING)

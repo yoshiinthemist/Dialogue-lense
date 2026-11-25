@@ -83,6 +83,8 @@ data class PlaybackTimingDiagnostics(
     val bufferingStartedAtEpochMs: Long = 0L,
     val lastBufferingDurationMs: Long = 0L,
     val autoResumeCount: Int = 0,
+    val scoutWindowServiceMs: Long = 0L,
+    val scoutWindowMediaMs: Long = 0L,
     val watchNowBypassActive: Boolean = false,
     val waitTimedOut: Boolean = false,
     val statusDetail: String = "",
@@ -147,6 +149,8 @@ class PlaybackReadinessController(
     private var acknowledgedGeneration = 0
     private var episodeStarted: Long? = null
     private var episodeStartedAtEpochMs = 0L
+    private var scoutServiceMs = 0L
+    private var scoutMediaMs = 0L
     private var episodeCount = 0
     private var previousWaitDuration = 0L
     private var resumeSeq = 0L
@@ -180,6 +184,8 @@ class PlaybackReadinessController(
         lastNow = 0
         episodeStarted = null
         episodeStartedAtEpochMs = 0L
+        scoutServiceMs = 0L
+        scoutMediaMs = 0L
         episodeCount = 0
         previousWaitDuration = 0
         directive = null
@@ -262,6 +268,8 @@ class PlaybackReadinessController(
         nowMs: Long,
         nowEpochMs: Long = nowMs,
     ): ReadinessDecision {
+        // Only advancement of contiguous evidence at the held target extends the stall timeout.
+        if (waitingForCoverage && positionMs == lastPosition && verifiedLeadMs > lead) waitingSinceMs = nowMs
         lastPosition = positionMs
         duration = durationMs?.takeIf { it > 0L }
         this.speed = speed.coerceIn(0.25f, 4f)
@@ -387,8 +395,8 @@ class PlaybackReadinessController(
     fun evaluateCoverage(ledger: TranscriptCoverageLedger,
                          nowEpochMs: Long = System.currentTimeMillis()): PlaybackReadinessSnapshot {
         val target = pendingTargetMs ?: lastPosition
-        lead = ledger.continuousVerifiedLeadFrom(target)
-        refresh(nowEpochMs, failed = ledger.hasFailedIntervalAt(target))
+        evaluate(lastPosition, duration, speed, ledger.continuousVerifiedLeadFrom(target), needsDialogue,
+            ledger.hasFailedIntervalAt(target), transport, nowEpochMs)
         return snapshot()
     }
 
@@ -431,9 +439,22 @@ class PlaybackReadinessController(
         return snapshot()
     }
 
-    fun requiredInitialOrSeekLeadMs(positionMs: Long): Long = threshold(BASE_START_AND_RESUME_LEAD_MS, positionMs)
+    /** Update only after a real window has been verified. Smooth variable network/decoder time per session. */
+    fun recordScoutWindow(mediaMs: Long, elapsedMs: Long) {
+        if (mediaMs <= 0L || elapsedMs <= 0L) return
+        scoutServiceMs = if (scoutServiceMs == 0L) elapsedMs else (scoutServiceMs * 3 + elapsedMs) / 4
+        scoutMediaMs = if (scoutMediaMs == 0L) mediaMs else (scoutMediaMs * 3 + mediaMs) / 4
+    }
+
+    fun requiredInitialOrSeekLeadMs(positionMs: Long): Long {
+        // A worker that consumes an entire window's viewing time needs a cushion for the next
+        // completion. The two-second depletion threshold still governs uninterrupted playback.
+        val realMs = if (scoutServiceMs * speed < scoutMediaMs || scoutMediaMs <= 0L) BASE_START_AND_RESUME_LEAD_MS
+            else (scoutServiceMs + BASE_MID_PLAYBACK_TRIGGER_MS).coerceIn(BASE_START_AND_RESUME_LEAD_MS, BASE_COMFORTABLE_LEAD_MS)
+        return threshold(realMs, positionMs)
+    }
     fun midPlaybackBufferTriggerMs(positionMs: Long): Long = threshold(BASE_MID_PLAYBACK_TRIGGER_MS, positionMs)
-    fun healthyLeadTargetMs(positionMs: Long): Long = threshold(BASE_HEALTHY_LEAD_MS, positionMs)
+    fun healthyLeadTargetMs(positionMs: Long): Long = maxOf(requiredInitialOrSeekLeadMs(positionMs), threshold(BASE_HEALTHY_LEAD_MS, positionMs))
     fun comfortableLeadTargetMs(positionMs: Long): Long = threshold(BASE_COMFORTABLE_LEAD_MS, positionMs)
 
     private fun threshold(base: Long, position: Long): Long =
@@ -455,7 +476,8 @@ class PlaybackReadinessController(
             isSeekInFlight = pendingTargetMs != null, bufferingEpisodeCount = episodeCount,
             bufferingStartedAtEpochMs = if (episodeStarted != null) episodeStartedAtEpochMs else 0L,
             lastBufferingDurationMs = previousWaitDuration,
-            autoResumeCount = resumesDispatched, watchNowBypassActive = bypassEndMs != null,
+            autoResumeCount = resumesDispatched, scoutWindowServiceMs = scoutServiceMs, scoutWindowMediaMs = scoutMediaMs,
+            watchNowBypassActive = bypassEndMs != null,
             waitTimedOut = waitTimedOut, statusDetail = failureReason,
         )
         return PlaybackReadinessSnapshot(

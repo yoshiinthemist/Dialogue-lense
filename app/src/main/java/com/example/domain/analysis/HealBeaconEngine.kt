@@ -267,6 +267,16 @@ object HealBeaconEngine {
         return project.copy(healBeacons = restored)
     }
 
+    /** Requeue immutable attempts before their read access is transferred to an urgent Scout request. */
+    fun deferToPlayback(project: DialogueLensProject, nowMs: Long = System.currentTimeMillis()): DialogueLensProject {
+        if (project.healBeacons.none { it.status == HealBeaconStatus.HEALING }) return project
+        return project.copy(healBeacons = project.healBeacons.map { mark ->
+            if (mark.status != HealBeaconStatus.HEALING) mark else mark.copy(status = HealBeaconStatus.MARKED,
+                revision = mark.revision + 1, repairRevision = mark.repairRevision + 1,
+                updatedAtEpochMs = nowMs, statusNote = "Waiting for playback to be ready.")
+        })
+    }
+
     /**
      * Validates candidate replacement cues for [beacon] and applies them atomically ONLY inside
      * `[beacon.windowStartMs, beacon.windowEndMs]`:

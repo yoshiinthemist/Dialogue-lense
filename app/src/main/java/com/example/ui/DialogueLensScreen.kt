@@ -45,6 +45,7 @@ import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -85,6 +86,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.BuildConfig
@@ -436,9 +438,13 @@ fun DialogueLensScreen(
                                             onLanguage = { showLanguage = true }, onAttach = ::attach, onBrowser = { browserControls = !browserControls },
                                             onCast = { inspectorTabRequest = InspectorTab.CAST; navigate(AppDestination.STUDIO) },
                                             onOpenVideo = { viewModel.pausePlayback(); viewModel.exitFullscreenTheater(); showIntake = true },
-                                            onMenuVisible = { menuOpen = it }, compact = compactLandscape, onHide = { controlsVisible = false })
+                                            onMenuVisible = { menuOpen = it }, compact = compactLandscape, onHide = {
+                                                menuOpen = false
+                                                controlsVisible = false
+                                            })
                                     } else {
-                                        TextButton(onClick = { controlsVisible = true }, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+                                        FilledTonalButton(onClick = { controlsVisible = true },
+                                            modifier = Modifier.align(Alignment.CenterHorizontally).testTag("reveal_watch_controls")) {
                                             Text("Show controls")
                                         }
                                     }
@@ -539,7 +545,7 @@ fun DialogueLensScreen(
                                     )
                                 }
                                 if (nativeOverlay) {
-                                    Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                                    Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().zIndex(1f), contentAlignment = Alignment.Center) {
                                         transportControls()
                                     }
                                 }

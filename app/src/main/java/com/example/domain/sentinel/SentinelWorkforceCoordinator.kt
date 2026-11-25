@@ -497,6 +497,14 @@ class SentinelWorkforceCoordinator {
         null
     }
 
+    fun yieldWorkersToPlayback() {
+        synchronized(lock) {
+            // Only Sentinel-owned reservations are eligible for preemption.
+            reservations.entries.removeAll { it.value.ownerId in workers }
+            workers.keys.toList().forEach { id -> workers[id] = SentinelWorkerState(id, isActive = false) }
+        }
+    }
+
     fun markWorkerIdle(workerId: String, reservationId: String? = null, repairCompleted: Boolean = false) {
         synchronized(lock) {
             if (reservationId != null) reservations.remove(reservationId)

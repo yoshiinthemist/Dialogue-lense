@@ -1,5 +1,7 @@
 package com.example.domain.analysis
 
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import com.example.data.model.CachedVideoTranscript
 import com.example.data.model.CoverageInterval
 import com.example.data.model.CoverageStatus
@@ -101,6 +103,19 @@ class TranscriptCoverageLedger(
     initialIntervals: List<CoverageInterval> = emptyList(),
 ) {
     private val lock = Any()
+    private val revisions = MutableStateFlow(0L)
+    val workRevision: Long get() = revisions.value
+
+    /** Sleep through a temporarily empty queue until a worker or repair releases its reservation. */
+    suspend fun awaitWorkRelease(revision: Long): Boolean {
+        val pending = synchronized(lock) {
+            repairReservations.isNotEmpty() || intervals.any { it.status == CoverageStatus.IN_PROGRESS }
+        }
+        if (workRevision != revision) return true
+        if (!pending) return false
+        revisions.first { it != revision }
+        return true
+    }
     private val repairReservations = mutableMapOf<String, Pair<Long, Long>>()
 
     fun tryReserveRepair(key: String, startMs: Long, endMs: Long): Boolean = synchronized(lock) {
@@ -112,9 +127,18 @@ class TranscriptCoverageLedger(
         true
     }
 
-    fun releaseRepair(key: String) { synchronized(lock) { repairReservations.remove(key) } }
+    fun releaseRepair(key: String) {
+        synchronized(lock) { if (repairReservations.remove(key) != null) revisions.value++ }
+    }
 
-    fun clearRepairReservations() { synchronized(lock) { repairReservations.clear() } }
+    fun revokeRepairReservations(): Boolean = synchronized(lock) {
+        if (repairReservations.isEmpty()) return@synchronized false
+        repairReservations.clear()
+        revisions.value++
+        true
+    }
+
+    fun clearRepairReservations() { revokeRepairReservations() }
     private var totalDurationMs: Long = initialDurationMs.coerceAtLeast(0L)
     private val intervals = mutableListOf<CoverageInterval>()
     private var verifiedRanges: List<TimeWindowRange> = emptyList()
@@ -141,6 +165,7 @@ class TranscriptCoverageLedger(
         synchronized(lock) {
             totalDurationMs = durationMs.coerceAtLeast(0L)
             activeSource = source
+            revisions.value++
             intervals.clear()
             verifiedRanges = emptyList()
             requestedWindows = 0
@@ -276,6 +301,15 @@ class TranscriptCoverageLedger(
                         updatedAtEpochMs = nowEpochMs,
                     )
                 }
+            }
+        }
+    }
+
+    /** Release unfinished subranges while preserving any evidence, failures, and retry counts already committed. */
+    fun releaseScoutWindow(startMs: Long, endMs: Long) = synchronized(lock) {
+        if (intervals.any { it.status == CoverageStatus.IN_PROGRESS && it.startMs < endMs && it.endMs > startMs }) {
+            applyIntervalMutationLocked(startMs, endMs) { span ->
+                if (span.status == CoverageStatus.IN_PROGRESS) span.copy(status = CoverageStatus.PENDING) else span
             }
         }
     }
@@ -610,6 +644,7 @@ class TranscriptCoverageLedger(
         lookaheadHorizonMs: Long = 180_000L,
         openingWindowMs: Long = LookaheadWindowPlanner.OPENING_SCOUT_WINDOW_SEC * 1000L,
         rollingWindowMs: Long = LookaheadWindowPlanner.ROLLING_SCOUT_WINDOW_SEC * 1000L,
+        startAtPlayhead: Boolean = false,
     ): CoverageInterval? = synchronized(lock) {
         if (totalDurationMs <= 0L) return@synchronized null
         val safePlayhead = playheadMs.coerceIn(0L, totalDurationMs)
@@ -648,7 +683,9 @@ class TranscriptCoverageLedger(
             ?: candidates.first()
 
         val maxChunkMs = if (chosen.startMs == 0L) openingWindowMs else rollingWindowMs
-        val sliceStart = if (safePlayhead in chosen.startMs until chosen.endMs &&
+        val sliceStart = if (startAtPlayhead && safePlayhead in chosen.startMs until chosen.endMs) {
+            safePlayhead
+        } else if (safePlayhead in chosen.startMs until chosen.endMs &&
             (chosen.endMs - chosen.startMs) > maxChunkMs &&
             chosen.status != CoverageStatus.FAILED
         ) {
@@ -659,11 +696,7 @@ class TranscriptCoverageLedger(
         } else {
             chosen.startMs
         }
-        val sliceEnd = if (chosen.status == CoverageStatus.FAILED || chosen.status == CoverageStatus.PARTIAL_RECOVERY) {
-            minOf(chosen.endMs, sliceStart + maxChunkMs)
-        } else {
-            minOf(chosen.endMs, sliceStart + maxChunkMs)
-        }
+        val sliceEnd = minOf(chosen.endMs, sliceStart + maxChunkMs)
         chosen.copy(startMs = sliceStart, endMs = sliceEnd.coerceAtLeast(sliceStart))
     }
 
@@ -821,6 +854,7 @@ class TranscriptCoverageLedger(
         intervals.addAll(coalesced)
         verifiedRanges = LookaheadWindowPlanner.coalesceBufferedRanges(
             coalesced.filter { it.verified }.map { TimeWindowRange(it.startMs, it.endMs) }, bridgeGapMs = 0L)
+        revisions.value++
     }
 
     companion object {

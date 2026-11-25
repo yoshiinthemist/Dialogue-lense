@@ -6,6 +6,36 @@ import com.example.data.model.DialogueLensProject
 import com.example.data.model.QuotaSaverMode
 import com.example.data.model.SubtitleSourceKind
 import kotlin.math.abs
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+/** Coalesce timeline drags before moving expensive Scout requests; the visible player seeks immediately. */
+internal class ScoutSeekRequests(private val scope: CoroutineScope, private val onSettled: (Long) -> Unit) {
+    private var pending: Job? = null
+
+    fun submit(targetMs: Long) {
+        pending?.cancel()
+        pending = scope.launch {
+            delay(200L)
+            onSettled(targetMs)
+        }
+    }
+
+    suspend fun awaitLatest() {
+        while (true) {
+            val current = pending ?: return
+            current.join()
+            if (pending === current) return
+        }
+    }
+
+    fun clear() {
+        pending?.cancel()
+        pending = null
+    }
+}
 
 enum class ScoutExecutionTier(
     val modelId: String?,
@@ -198,6 +228,16 @@ object LookaheadWindowPlanner {
         durationMs <= 0L || durationMs == Long.MAX_VALUE || durationMs <= 150_000L -> INTRO_DURATION_MS
         durationMs <= 480_000L -> 28_000L
         else -> 42_000L
+    }
+
+    /** Keep opaque browser recordings bounded while the recorder can seek back to uncaptured gaps. */
+    fun canAnalyzeRecording(startMs: Long, endMs: Long, active: Collection<TimeWindowRange>): Boolean =
+        endMs > startMs && active.size < 2 && active.none { it.startMs < endMs && it.endMs > startMs }
+
+    /** Keep a request already preparing the first missing instant. Otherwise reuse one distant worker. */
+    fun supersededScoutWindow(firstMissingMs: Long, active: Collection<TimeWindowRange>): TimeWindowRange? {
+        if (active.any { firstMissingMs in it.startMs until it.endMs }) return null
+        return active.maxByOrNull { maxOf(it.startMs - firstMissingMs, firstMissingMs - it.endMs) }
     }
 
     fun recommendedWorkerCount(durationMs: Long): Int = when {
