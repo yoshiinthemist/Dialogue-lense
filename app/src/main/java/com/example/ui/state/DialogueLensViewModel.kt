@@ -167,7 +167,7 @@ data class DialogueLensUiState(
     val scoutStatusText: String = "",
     val scoutPlayRequest: Pair<Int, Boolean>? = null,
     val scoutSeekRequest: Pair<Int, Long>? = null,
-    val showScoutMonitorPip: Boolean = true,
+    val showScoutMonitorPip: Boolean = false,
     val playbackSpeed: Float = 1.0f,
     val isFullscreenTheater: Boolean = false,
     val canUndo: Boolean = false,

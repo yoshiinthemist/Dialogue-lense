@@ -1043,7 +1043,7 @@ fun VideoPlayerStage(
                                     }
                                 }
                             }
-                        } else {
+                        } else if (showPip) {
                             Surface(
                                 color = CinemaObsidian.copy(alpha = 0.78f),
                                 shape = RoundedCornerShape(14.dp),
@@ -1214,12 +1214,12 @@ fun VideoPlayerStage(
                         )
                         Column(modifier = Modifier.widthIn(max = 190.dp)) {
                             Text(
-                                text = "Scout catching up",
+                                text = "Preparing upcoming dialogue",
                                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
                                 color = Color.White,
                             )
                             Text(
-                                text = scoutStatusText.ifBlank { "Buffering upcoming dialogue..." },
+                                text = "You can continue with available subtitles.",
                                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                 color = LensMint,
                                 maxLines = 1,
@@ -1275,12 +1275,12 @@ fun VideoPlayerStage(
                         )
                         Column {
                             Text(
-                                text = if (isOpeningSpeakersReady) "Play · Bubbles Ready" else "Play · Smart Pre-Roll",
+                                text = if (isOpeningSpeakersReady) "Play" else "Prepare and play",
                                 style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
                                 color = Color.White,
                             )
                             Text(
-                                text = scoutStatusText.ifBlank { "Scout preparing bubbles..." },
+                                text = "Dialogue is prepared automatically.",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = LensMint,
                                 maxLines = 1,

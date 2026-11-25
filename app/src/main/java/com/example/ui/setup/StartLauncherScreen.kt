@@ -140,14 +140,16 @@ fun StartLauncherScreen(
     onLaunchPreparedProject: () -> Unit = {},
     onExportSavedProjectSubtitles: (DialogueLensProject) -> Unit = {},
 ) {
-    var urlInput by remember { mutableStateOf("") }
+    var homeTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
+    val prefs = androidx.compose.ui.platform.LocalContext.current.getSharedPreferences("consumer_ux", android.content.Context.MODE_PRIVATE)
+    var urlInput by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("") }
     var pastedTranscriptInput by remember { mutableStateOf("") }
     var selectedVideoUri by remember { mutableStateOf<Uri?>(null) }
     var selectedVideoName by remember { mutableStateOf("") }
     var selectedSubtitleUri by remember { mutableStateOf<Uri?>(null) }
     var selectedSubtitleName by remember { mutableStateOf("") }
     var sourceLanguage by remember { mutableStateOf("Auto-Detect") }
-    var targetLanguage by remember { mutableStateOf("English") }
+    var targetLanguage by remember { mutableStateOf(prefs.getString("language", "English") ?: "English") }
     var translationMode by remember { mutableStateOf(TranslationMode.NATURAL) }
 
     val videoPhotoPicker = rememberLauncherForActivityResult(
@@ -156,6 +158,9 @@ fun StartLauncherScreen(
         if (uri != null) {
             selectedVideoUri = uri
             selectedVideoName = uri.lastPathSegment?.substringAfterLast('/') ?: "Local MP4"
+            if (homeTab == 0) {
+                onStartLocalProject(uri, selectedVideoName, null, "", "Auto-Detect", targetLanguage, TranslationMode.NATURAL, SubtitleSourceKind.UPLOADED_FILE, ProcessingQualityMode.BALANCED)
+            }
         }
     }
 
@@ -165,6 +170,9 @@ fun StartLauncherScreen(
         if (uri != null) {
             selectedVideoUri = uri
             selectedVideoName = uri.lastPathSegment?.substringAfterLast('/') ?: "Local MP4"
+            if (homeTab == 0) {
+                onStartLocalProject(uri, selectedVideoName, null, "", "Auto-Detect", targetLanguage, TranslationMode.NATURAL, SubtitleSourceKind.UPLOADED_FILE, ProcessingQualityMode.BALANCED)
+            }
         }
     }
 
@@ -181,6 +189,17 @@ fun StartLauncherScreen(
     val normalizedWebUrl = remember(urlInput) { normalizeWebStreamUrl(urlInput) }
     val isUrlReady = extractedYoutubeId != null || normalizedWebUrl != null
 
+    ConsumerHome(
+        tab = homeTab, onTab = { homeTab = it }, url = urlInput, onUrl = { urlInput = it }, valid = isUrlReady,
+        language = targetLanguage, onLanguage = { targetLanguage = it; prefs.edit().putString("language", it).apply() }, languages = TARGET_LANGUAGES,
+        projects = savedProjects,
+        onWatch = {
+            if (extractedYoutubeId != null) onStartYouTubeProject(urlInput, extractedYoutubeId, null, "", "Auto-Detect", targetLanguage, TranslationMode.NATURAL, "")
+            else if (normalizedWebUrl != null) onStartWebStreamProject(normalizedWebUrl, null, "", "Auto-Detect", targetLanguage, TranslationMode.NATURAL, "")
+        },
+        onLocal = { videoDocPicker.launch(arrayOf("video/*")) }, onDemo = onLoadDemoScenario,
+        onOpen = onOpenSavedProject, onExport = onExportSavedProjectSubtitles,
+    ) {
     Scaffold(
         contentWindowInsets = WindowInsets.safeDrawing,
         containerColor = CinemaObsidian,
@@ -733,6 +752,8 @@ fun StartLauncherScreen(
             }
         }
     }
+}
+
 }
 
 @Composable

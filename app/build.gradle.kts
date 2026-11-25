@@ -13,7 +13,7 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.aistudio.dialoguelens.vkpzmx"
+    applicationId = "com.aistudio.dialoguelens.vkpzmx.uxedition"
     minSdk = 24
     targetSdk = 36
     versionCode = 25
@@ -50,6 +50,7 @@ android {
       signingConfig = signingConfigs.getByName("release")
     }
     debug {
+      versionNameSuffix = "-ux"
       // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
       // AI Studio.
       signingConfig = signingConfigs.getByName("debugConfig")

@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -140,6 +141,9 @@ fun DialogueLensScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
 
+    var consumerStudio by remember(state.project.id) { mutableStateOf(false) }
+    var consumerBrowser by remember(state.project.id) { mutableStateOf(false) }
+    var consumerLanguage by remember { mutableStateOf(false) }
     var showImportSheet by remember { mutableStateOf(false) }
     var showPrivacySheet by remember { mutableStateOf(false) }
     var showStyleSheet by remember { mutableStateOf(false) }
@@ -625,34 +629,8 @@ fun DialogueLensScreen(
                     )
                 },
                 actions = {
-                    // Subtle live Scout status pill (replaces the bulky telemetry strip below the video)
-                    if (state.project.videoSource.kind != VideoSourceKind.DEMO_SCENARIO) {
-                        QuietScoutTopPill(
-                            state = state,
-                            onClick = {
-                                expandScoutDiagInDrawer = true
-                                inspectorTabRequest = InspectorTab.TIMELINE
-                                showToolsDrawer = true
-                            },
-                        )
-                    }
+                    TextButton(onClick = { consumerStudio = !consumerStudio }) { Text(if (consumerStudio) "Watch" else "Studio") }
 
-                    TextButton(
-                        onClick = { showImportSheet = true },
-                        contentPadding = PaddingValues(horizontal = 10.dp),
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("open_media_import_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.AddCircleOutline,
-                            contentDescription = "Load media",
-                            tint = LensSky,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text("Media", color = LensSky, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                    }
                 },
             )
         },
@@ -662,7 +640,7 @@ fun DialogueLensScreen(
                 .fillMaxSize()
                 .padding(innerPadding),
         ) {
-            val isExpandedLayout = maxWidth >= 820.dp
+            val isExpandedLayout = maxWidth >= 820.dp && consumerStudio
 
             if (isExpandedLayout) {
                 // Desktop / Tablet Canonical Layout: Dominant Video + Clean Controls on Left, Inspector on Right
@@ -914,6 +892,17 @@ fun DialogueLensScreen(
                         onDismissQuickPicker = { viewModel.dismissQuickSpeakerPicker(resumePlayback = true) },
                     )
 
+                    if (!consumerStudio) com.example.ui.player.ConsumerPlayer(
+                        state = state, onSeek = viewModel::seekTo, onPlay = viewModel::togglePlayPause,
+                        onMute = viewModel::toggleMute, onFullscreen = viewModel::toggleFullscreenTheater,
+                        onSpeed = viewModel::cyclePlaybackSpeed, onMode = viewModel::setDisplayMode,
+                        onAppearance = { showStyleSheet = true },
+                        onCharacters = { inspectorTabRequest = InspectorTab.CAST; showToolsDrawer = true },
+                        onStudio = { consumerStudio = true; inspectorTabRequest = InspectorTab.TIMELINE; showToolsDrawer = true },
+                        onAttach = { showImportSheet = true }, onRetry = viewModel::retryYouTubeAiTranscription,
+                        onContinue = viewModel::dismissScoutCatchUpBuffering,
+                        onBrowser = { consumerBrowser = !consumerBrowser }, onLanguage = { consumerLanguage = true },
+                    ) else
                     PlayerControlsBar(
                         project = state.project,
                         currentTimeMs = state.currentTimeMs,
@@ -950,7 +939,7 @@ fun DialogueLensScreen(
                         },
                     )
 
-                    if (state.project.videoSource.kind == VideoSourceKind.WEB_STREAM) {
+                    if (state.project.videoSource.kind == VideoSourceKind.WEB_STREAM && (consumerStudio || consumerBrowser)) {
                         WebBrowserControlStrip(
                             seedUrl = state.project.videoSource.uriString,
                             viewerNav = state.viewerWebNav,
@@ -967,7 +956,7 @@ fun DialogueLensScreen(
                     }
 
                     // Quiet Ambient Now-Speaking Dock (calm breathing room below controls; zero clutter!)
-                    AmbientNowSpeakingDock(
+                    if (consumerStudio) AmbientNowSpeakingDock(
                         state = state,
                         onTapActiveCue = { eventId -> viewModel.openQuickSpeakerPicker(eventId) },
                         onOpenCastTab = {
@@ -984,6 +973,18 @@ fun DialogueLensScreen(
         }
     }
 
+    if (consumerLanguage) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { consumerLanguage = false },
+            title = { Text("Subtitle language") },
+            text = { Column(Modifier.verticalScroll(rememberScrollState())) {
+                com.example.ui.setup.TARGET_LANGUAGES.forEach { lang ->
+                    TextButton(onClick = { consumerLanguage = false; viewModel.translateCurrentProjectWithAi(overrideTargetLanguage = lang) }) { Text(lang) }
+                }
+            } },
+            confirmButton = { TextButton(onClick = { consumerLanguage = false }) { Text("Cancel") } },
+        )
+    }
     // Unified Slide-Up Tools & Inspector Drawer (holds Style, Speed, Translation Mode, Names, Edit Mode, Scout, Lines, Cast, Export)
     if (showToolsDrawer) {
         val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
