@@ -1,11 +1,6 @@
 package com.example.ui.player
 
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -14,19 +9,21 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Subtitles
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -34,7 +31,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,279 +39,280 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.material3.LinearProgressIndicator
 import com.example.data.model.Speaker
+import com.example.data.subtitle.SubtitleParser
 import com.example.domain.analysis.LookaheadWindowPlanner
-import com.example.ui.theme.CinemaElevated
+import com.example.domain.playback.PlaybackReadinessSnapshot
+import com.example.domain.playback.PlaybackReadinessState
+import com.example.ui.theme.CinemaBorder
+import com.example.ui.theme.CinemaGraphite
 import com.example.ui.theme.CinemaObsidian
-import com.example.ui.theme.LensMint
-import com.example.ui.theme.LensSky
+import com.example.ui.theme.InkPrimary
+import com.example.ui.theme.InkSecondary
+import com.example.ui.theme.SoftJade
 import com.example.ui.theme.SpeakerAccentPalette
 import com.example.ui.theme.UnknownSpeakerGray
-import kotlin.math.ceil
+import com.example.ui.theme.WarmAmber
 
 /**
- * Adaptive Smart Pre-Roll slate displayed over Instance 1 (Viewer) while Scout locks onto opening
- * speakers, context, and dialogue cues — releases immediately once opening lines & cast are ready.
+ * Calm, honest DialogueLens 2.0 Intelligent Buffering Overlay (Section 47 & Section 14).
+ * - Never displays fake countdown timers, fake percentages, or internal agent/model jargon.
+ * - Promises automatic resumption ONLY when the user's intent is PLAY and no timeout occurred.
+ * - Clearly displays the requested seek timestamp when preparing a jumped section.
+ * - Offers explicit "Watch Now" with a transparent limitation note, plus structured recovery
+ *   actions ("Retry", "Watch without subtitles", "Attach subtitles") on timeout or failure.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun CinemaIntroOverlay(
     visible: Boolean,
-    remainingMs: Long,
+    remainingMs: Long = 0L,
     totalIntroMs: Long = LookaheadWindowPlanner.INTRO_DURATION_MS,
-    scoutStatusText: String,
-    readyLinesCount: Int,
+    scoutStatusText: String = "",
+    readyLinesCount: Int = 0,
     openingSpeakersReady: Boolean = false,
     speakers: List<Speaker> = emptyList(),
     bufferedWindows: Int = 0,
     totalWindows: Int = 0,
     requiredOpeningWindows: Int = 1,
+    readinessSnapshot: PlaybackReadinessSnapshot? = null,
+    onRetryBuffering: () -> Unit = {},
+    onOpenAttachCaptions: () -> Unit = {},
     onSkipIntro: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val isErrorOrTimeout = readinessSnapshot?.state == PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR ||
+        readinessSnapshot?.waitTimedOut == true
+    val isSeekBuffer = readinessSnapshot?.state == PlaybackReadinessState.BUFFERING_FOR_SEEK
+    val targetMs = readinessSnapshot?.targetPositionMs ?: 0L
+    val willAutoResume = readinessSnapshot?.willAutoResumeWhenReady ?: true
+
     AnimatedVisibility(
         visible = visible,
-        enter = fadeIn(animationSpec = tween(220)),
-        exit = fadeOut(animationSpec = tween(320)),
+        enter = fadeIn(animationSpec = tween(200)),
+        exit = fadeOut(animationSpec = tween(260)),
         modifier = modifier,
     ) {
-        val safeTotal = totalIntroMs.coerceAtLeast(1L)
-        val fraction = (remainingMs.toFloat() / safeTotal.toFloat()).coerceIn(0f, 1f)
-        val secRemaining = ceil(remainingMs / 1000.0).toInt().coerceAtLeast(1)
-
-        val pulseTransition = rememberInfiniteTransition(label = "intro_wave_pulse")
-        val wavePhase by pulseTransition.animateFloat(
-            initialValue = 0.25f,
-            targetValue = 1.0f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 720, easing = LinearEasing),
-                repeatMode = RepeatMode.Reverse,
-            ),
-            label = "wave_bar_amp",
-        )
-
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
-                    Brush.radialGradient(
+                    Brush.verticalGradient(
                         colors = listOf(
-                            Color(0xFF101B2E),
-                            CinemaObsidian.copy(alpha = 0.96f),
-                            Color.Black.copy(alpha = 0.98f),
+                            CinemaObsidian.copy(alpha = 0.88f),
+                            CinemaObsidian.copy(alpha = 0.94f),
                         )
                     )
                 )
-                .padding(horizontal = 18.dp, vertical = 12.dp)
+                .padding(horizontal = 20.dp, vertical = 14.dp)
                 .testTag("cinema_intro_overlay"),
             contentAlignment = Alignment.Center,
         ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+            Surface(
+                color = CinemaGraphite.copy(alpha = 0.94f),
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(
+                    1.dp,
+                    if (isErrorOrTimeout) WarmAmber.copy(alpha = 0.55f) else CinemaBorder,
+                ),
+                modifier = Modifier.widthIn(max = 360.dp),
             ) {
-                val badgeTint = if (openingSpeakersReady) LensMint else LensSky
-                Surface(
-                    color = badgeTint.copy(alpha = 0.14f),
-                    shape = RoundedCornerShape(20.dp),
-                    border = BorderStroke(1.dp, badgeTint.copy(alpha = 0.48f)),
+                Column(
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
+                    if (isErrorOrTimeout) {
                         Icon(
-                            imageVector = Icons.Filled.GraphicEq,
-                            contentDescription = null,
-                            tint = badgeTint,
-                            modifier = Modifier.size(16.dp),
+                            imageVector = Icons.Filled.WarningAmber,
+                            contentDescription = "Dialogue preparation attention",
+                            tint = WarmAmber,
+                            modifier = Modifier.size(28.dp),
                         )
-                        Text(
-                            text = if (openingSpeakersReady) {
-                                "DIALOGUELENS · CAST & BUBBLES READY"
-                            } else {
-                                "DIALOGUELENS · SMART PRE-ROLL"
-                            },
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 0.8.sp,
-                            ),
-                            color = badgeTint,
+                    } else {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(30.dp),
+                            color = SoftJade,
+                            trackColor = CinemaObsidian,
+                            strokeWidth = 2.8.dp,
                         )
                     }
-                }
 
-                Box(contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(
-                        progress = { 1f - fraction },
-                        modifier = Modifier.size(56.dp),
-                        color = badgeTint,
-                        trackColor = CinemaElevated,
-                        strokeWidth = 4.dp,
-                    )
                     Text(
-                        text = "${secRemaining}s",
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold),
-                        color = Color.White,
-                    )
-                }
-
-                // Subtle dual-instance waveform equalizer bar
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.height(16.dp),
-                ) {
-                    val heights = listOf(0.45f, 0.85f, 0.62f, 1.0f, 0.55f, 0.9f, 0.48f)
-                    heights.forEachIndexed { idx, base ->
-                        val mod = if (idx % 2 == 0) wavePhase else (1.25f - wavePhase).coerceIn(0.25f, 1f)
-                        Box(
-                            modifier = Modifier
-                                .width(3.dp)
-                                .height((14.dp * base * mod).coerceAtLeast(4.dp))
-                                .clip(CircleShape)
-                                .background(if (idx % 2 == 0) LensSky else LensMint)
-                        )
-                    }
-                }
-
-                Text(
-                    text = scoutStatusText.ifBlank { "Scout is buffering opening 35s context & speakers..." },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.White.copy(alpha = 0.92f),
-                    textAlign = TextAlign.Center,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.fillMaxWidth(0.88f),
-                )
-
-                if (totalWindows > 0) {
-                    val targetOpen = requiredOpeningWindows.coerceAtLeast(1)
-                    val openFrac = (bufferedWindows.toFloat() / targetOpen.toFloat()).coerceIn(0f, 1f)
-                    val winFrac = (bufferedWindows.toFloat() / totalWindows.coerceAtLeast(1)).coerceIn(0.05f, 1f)
-                    if (targetOpen > 1) {
-                        Text(
-                            text = if (bufferedWindows >= targetOpen) {
-                                "Opening lead ready ($bufferedWindows/$targetOpen scenes · $totalWindows chunks total)"
-                            } else {
-                                "Buffering opening lead: ${minOf(bufferedWindows, targetOpen)}/$targetOpen scenes ($bufferedWindows/$totalWindows chunks)"
-                            },
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                            color = LensSky.copy(alpha = 0.9f),
-                            textAlign = TextAlign.Center,
-                        )
-                    }
-                    LinearProgressIndicator(
-                        progress = {
-                            when {
-                                openingSpeakersReady -> maxOf(winFrac, 0.25f)
-                                targetOpen > 1 -> maxOf(openFrac * 0.85f, (1f - fraction) * 0.65f, 0.08f)
-                                else -> (1f - fraction).coerceAtLeast(0.08f)
-                            }
+                        text = when {
+                            isErrorOrTimeout -> "Dialogue unavailable here"
+                            isSeekBuffer -> "Preparing dialogue at ${SubtitleParser.formatCompactTime(targetMs)}"
+                            else -> "Preparing dialogue"
                         },
-                        modifier = Modifier
-                            .fillMaxWidth(0.66f)
-                            .height(4.dp)
-                            .clip(CircleShape),
-                        color = badgeTint,
-                        trackColor = CinemaElevated,
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                        color = InkPrimary,
+                        textAlign = TextAlign.Center,
                     )
-                }
 
-                val displaySpeakers = speakers.take(5)
-                if (displaySpeakers.isNotEmpty()) {
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                        modifier = Modifier.fillMaxWidth(0.92f),
-                    ) {
-                        displaySpeakers.forEach { spk ->
-                            val chipTint = if (spk.isConfirmedCharacter) {
-                                SpeakerAccentPalette[spk.accentIndex % SpeakerAccentPalette.size]
-                            } else {
-                                UnknownSpeakerGray
-                            }
-                            Surface(
-                                color = CinemaElevated.copy(alpha = 0.9f),
-                                shape = RoundedCornerShape(12.dp),
-                                border = BorderStroke(1.dp, chipTint.copy(alpha = 0.55f)),
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    Text(
+                        text = when {
+                            isErrorOrTimeout -> readinessSnapshot?.failureReason?.ifBlank {
+                                "This section could not be prepared in time."
+                            } ?: "This section could not be prepared in time."
+                            willAutoResume -> "Playback will resume automatically once dialogue is synced."
+                            else -> "Syncing speakers and timing for this moment."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = InkSecondary,
+                        textAlign = TextAlign.Center,
+                    )
+
+                    val displaySpeakers = speakers.filter { it.isConfirmedCharacter }.take(4)
+                    if (displaySpeakers.isNotEmpty() && !isErrorOrTimeout) {
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            displaySpeakers.forEach { spk ->
+                                val chipTint = SpeakerAccentPalette[spk.accentIndex % SpeakerAccentPalette.size]
+                                Surface(
+                                    color = CinemaObsidian.copy(alpha = 0.72f),
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, chipTint.copy(alpha = 0.45f)),
                                 ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(6.dp)
-                                            .clip(CircleShape)
-                                            .background(chipTint)
-                                    )
-                                    Text(
-                                        text = spk.displayName,
-                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                                        color = Color.White.copy(alpha = 0.92f),
-                                        maxLines = 1,
-                                    )
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(6.dp)
+                                                .clip(CircleShape)
+                                                .background(chipTint)
+                                        )
+                                        Text(
+                                            text = spk.displayName,
+                                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                            color = InkPrimary,
+                                            maxLines = 1,
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    if (readyLinesCount > 0) {
-                        Surface(
-                            color = LensMint.copy(alpha = 0.16f),
-                            shape = RoundedCornerShape(14.dp),
-                            border = BorderStroke(1.dp, LensMint.copy(alpha = 0.5f)),
+                    if (isErrorOrTimeout) {
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
                         ) {
-                            Text(
-                                text = if (openingSpeakersReady) {
-                                    "$readyLinesCount lines · ready"
-                                } else {
-                                    "$readyLinesCount lines buffered"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = LensMint,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                            )
+                            Surface(
+                                color = SoftJade,
+                                shape = RoundedCornerShape(18.dp),
+                                onClick = onRetryBuffering,
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("buffering_retry_button"),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Refresh,
+                                        contentDescription = "Retry dialogue preparation",
+                                        tint = CinemaObsidian,
+                                        modifier = Modifier.size(15.dp),
+                                    )
+                                    Text(
+                                        text = "Retry",
+                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                        color = CinemaObsidian,
+                                    )
+                                }
+                            }
+                            Surface(
+                                color = CinemaObsidian.copy(alpha = 0.85f),
+                                shape = RoundedCornerShape(18.dp),
+                                border = BorderStroke(1.dp, CinemaBorder),
+                                onClick = onSkipIntro,
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("skip_intro_button"),
+                            ) {
+                                Text(
+                                    text = "Watch without subtitles",
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+                                    color = InkPrimary,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                )
+                            }
+                            Surface(
+                                color = Color.Transparent,
+                                shape = RoundedCornerShape(18.dp),
+                                border = BorderStroke(1.dp, CinemaBorder),
+                                onClick = onOpenAttachCaptions,
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("buffering_attach_subtitles_button"),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Subtitles,
+                                        contentDescription = "Attach subtitles",
+                                        tint = InkSecondary,
+                                        modifier = Modifier.size(14.dp),
+                                    )
+                                    Text(
+                                        text = "Attach subtitles",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = InkSecondary,
+                                    )
+                                }
+                            }
                         }
-                    }
-
-                    Surface(
-                        color = LensSky,
-                        shape = RoundedCornerShape(20.dp),
-                        onClick = onSkipIntro,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("skip_intro_button"),
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    } else {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
-                            Icon(
-                                imageVector = Icons.Filled.PlayArrow,
-                                contentDescription = "Start watching now",
-                                tint = CinemaObsidian,
-                                modifier = Modifier.size(16.dp),
-                            )
+                            Surface(
+                                color = CinemaObsidian.copy(alpha = 0.85f),
+                                shape = RoundedCornerShape(18.dp),
+                                border = BorderStroke(1.dp, SoftJade.copy(alpha = 0.55f)),
+                                onClick = onSkipIntro,
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("skip_intro_button"),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.PlayArrow,
+                                        contentDescription = "Watch now",
+                                        tint = SoftJade,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                    Text(
+                                        text = "Watch Now",
+                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                        color = InkPrimary,
+                                    )
+                                }
+                            }
                             Text(
-                                text = "Watch Now",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                                color = CinemaObsidian,
+                                text = "Some bubbles may appear after dialogue catches up.",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                color = InkSecondary.copy(alpha = 0.82f),
+                                textAlign = TextAlign.Center,
                             )
                         }
                     }

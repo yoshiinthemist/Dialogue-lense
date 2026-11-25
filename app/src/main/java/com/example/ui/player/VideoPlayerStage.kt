@@ -63,6 +63,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -115,6 +116,7 @@ import com.example.domain.analysis.SniffedWebMediaStream
 import com.example.domain.analysis.WebNavCommand
 import com.example.domain.analysis.WebNavigationState
 import com.example.domain.layout.PlacedBalloon
+import com.example.domain.playback.PlaybackReadinessSnapshot
 import com.example.ui.state.ScoutCaptionState
 import com.example.ui.state.SpeakerGlossaryToast
 import kotlinx.coroutines.delay
@@ -206,6 +208,10 @@ fun VideoPlayerStage(
     onQuickEditDialogue: ((String) -> Unit)? = null,
     onQuickHealMoment: (() -> Unit)? = null,
     onLiveFrameSnapshot: ((Long, LiveStageFrameSnapshot) -> Unit)? = null,
+    seekGeneration: Long = 0L,
+    onMeasuredBubbleSize: (String, Float, Float) -> Unit = { _, _, _ -> },
+    readinessSnapshot: PlaybackReadinessSnapshot? = null,
+    onRetryBuffering: () -> Unit = onRetryYouTubeAiTranscript,
     onDismissQuickPicker: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -266,6 +272,10 @@ fun VideoPlayerStage(
         val latestTimeMs by rememberUpdatedState(currentTimeMs)
         val latestOnLiveFaces by rememberUpdatedState(onLiveFacesDetected)
         val latestOnLiveSnapshot by rememberUpdatedState(onLiveFrameSnapshot)
+        val latestSeekGeneration by rememberUpdatedState(seekGeneration)
+        val latestActiveBalloonRects by rememberUpdatedState(
+            placedBalloons.map { it.rect.expand(0.02f, 0.02f) }
+        )
 
         LaunchedEffect(project.id) {
             liveFaceTracker.resetSceneHistory()
@@ -283,10 +293,15 @@ fun VideoPlayerStage(
             while (isActive) {
                 if (stageBoundsInWindow.width >= 48f && stageBoundsInWindow.height >= 48f) {
                     val sampleTime = latestTimeMs
+                    // DialogueLens 2.0 Section 21D: mask active speech-balloon rects out of PixelCopy luma grid
+                    // so balloon appearance/motion never triggers false visual scene cuts!
                     val snapshot = liveFaceTracker.captureFrameSnapshot(
                         hostView = hostView,
                         stageBoundsInWindow = stageBoundsInWindow,
                         videoTimeMs = sampleTime,
+                        overlayExclusionRects = latestActiveBalloonRects,
+                        projectId = project.id,
+                        seekGeneration = latestSeekGeneration,
                     )
                     if (snapshot != null) {
                         val snapHandler = latestOnLiveSnapshot
@@ -851,25 +866,30 @@ fun VideoPlayerStage(
                 val nonSfxBalloons = placedBalloons
                     .filter { it.event.dialogueType != DialogueType.SOUND_DESCRIPTION }
                 nonSfxBalloons.forEachIndexed { idx, placed ->
-                    val priorBubbleRects = nonSfxBalloons
-                        .take(idx)
-                        .mapNotNull { measuredBubbleBounds[it.event.id] }
-                    SpeechBalloonView(
-                        placed = placed,
-                        translationMode = project.translationMode,
-                        style = project.styleSettings,
-                        isEditMode = isEditMode,
-                        isSelected = placed.event.id == selectedEventId,
-                        containerWidthPx = widthPx,
-                        containerHeightPx = heightPx,
-                        faceExclusionRects = activeFaceExclusions,
-                        occupiedBubbleRects = priorBubbleRects,
-                        onPixelBoundsResolved = { rect ->
-                            measuredBubbleBounds[placed.event.id] = rect
-                        },
-                        onClick = { onTapBalloon(placed.event.id) },
-                        onDragCommit = { newCenter -> onDragBalloonAnchor(placed.event.id, newCenter) },
-                    )
+                    key("${project.id}:${placed.event.id}") {
+                        val priorBubbleRects = nonSfxBalloons
+                            .take(idx)
+                            .mapNotNull { measuredBubbleBounds[it.event.id] }
+                        SpeechBalloonView(
+                            placed = placed,
+                            translationMode = project.translationMode,
+                            style = project.styleSettings,
+                            isEditMode = isEditMode,
+                            isSelected = placed.event.id == selectedEventId,
+                            containerWidthPx = widthPx,
+                            containerHeightPx = heightPx,
+                            faceExclusionRects = activeFaceExclusions,
+                            occupiedBubbleRects = priorBubbleRects,
+                            onPixelBoundsResolved = { rect ->
+                                measuredBubbleBounds[placed.event.id] = rect
+                            },
+                            onMeasuredNormalizedSize = { normW, normH ->
+                                onMeasuredBubbleSize(placed.event.id, normW, normH)
+                            },
+                            onClick = { onTapBalloon(placed.event.id) },
+                            onDragCommit = { newCenter -> onDragBalloonAnchor(placed.event.id, newCenter) },
+                        )
+                    }
                 }
             }
 
@@ -878,20 +898,22 @@ fun VideoPlayerStage(
                 val bubbleObstacles = activeNonSfxIds.mapNotNull { measuredBubbleBounds[it] }
                 val sfxList = placedBalloons.filter { it.event.dialogueType == DialogueType.SOUND_DESCRIPTION }
                 sfxList.forEachIndexed { idx, sfxPlaced ->
-                    val priorSfxObstacles = sfxList.take(idx).mapNotNull { measuredSfxBounds[it.event.id] }
-                    SpatialSfxNoteView(
-                        placed = sfxPlaced,
-                        translationMode = project.translationMode,
-                        style = project.styleSettings,
-                        containerWidthPx = widthPx,
-                        containerHeightPx = heightPx,
-                        faceExclusionRects = activeFaceExclusions,
-                        occupiedBubbleRects = bubbleObstacles + priorSfxObstacles,
-                        onPixelBoundsResolved = { rect ->
-                            measuredSfxBounds[sfxPlaced.event.id] = rect
-                        },
-                        onTap = { onTapBalloon(sfxPlaced.event.id) },
-                    )
+                    key("${project.id}:sfx:${sfxPlaced.event.id}") {
+                        val priorSfxObstacles = sfxList.take(idx).mapNotNull { measuredSfxBounds[it.event.id] }
+                        SpatialSfxNoteView(
+                            placed = sfxPlaced,
+                            translationMode = project.translationMode,
+                            style = project.styleSettings,
+                            containerWidthPx = widthPx,
+                            containerHeightPx = heightPx,
+                            faceExclusionRects = activeFaceExclusions,
+                            occupiedBubbleRects = bubbleObstacles + priorSfxObstacles,
+                            onPixelBoundsResolved = { rect ->
+                                measuredSfxBounds[sfxPlaced.event.id] = rect
+                            },
+                            onTap = { onTapBalloon(sfxPlaced.event.id) },
+                        )
+                    }
                 }
             } else if (displayMode == CaptionDisplayMode.CLASSIC || displayMode == CaptionDisplayMode.BOTH) {
                 ClassicSubtitleBar(
@@ -1008,12 +1030,12 @@ fun VideoPlayerStage(
                                                         ) {
                                                             Icon(
                                                                 imageVector = Icons.Filled.Refresh,
-                                                                contentDescription = "Retry Flash-Lite AI transcription",
+                                                                contentDescription = "Retry dialogue preparation",
                                                                 tint = LensSky,
                                                                 modifier = Modifier.size(12.dp),
                                                             )
                                                             Text(
-                                                                text = "Retry Lite",
+                                                                text = "Retry",
                                                                 style = MaterialTheme.typography.labelSmall.copy(
                                                                     fontSize = 10.sp,
                                                                     fontWeight = FontWeight.Bold,
@@ -1060,39 +1082,7 @@ fun VideoPlayerStage(
                                 }
                             }
                         } else {
-                            Surface(
-                                color = CinemaObsidian.copy(alpha = 0.78f),
-                                shape = RoundedCornerShape(14.dp),
-                                border = BorderStroke(1.dp, LensSky.copy(alpha = 0.45f)),
-                                onClick = onToggleScoutMonitorPip,
-                                modifier = Modifier.testTag("scout_instance_badge"),
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.GraphicEq,
-                                        contentDescription = "7-second lookahead scout status",
-                                        tint = LensMint,
-                                        modifier = Modifier.size(12.dp),
-                                    )
-                                    Text(
-                                        text = when (project.videoSource.kind) {
-                                            VideoSourceKind.LOCAL_MP4 ->
-                                                "Scout ${SubtitleParser.formatCompactTime(scoutedUpToMs)}"
-                                            else ->
-                                                "Scout +${String.format(java.util.Locale.US, "%.1f", leadSec)}s"
-                                        },
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            fontSize = 10.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                        ),
-                                        color = Color.White,
-                                    )
-                                }
-                            }
+                            // DialogueLens 2.0: Agents are invisible on Watch; no persistent Scout pill over video.
                         }
                     }
 
@@ -1190,9 +1180,11 @@ fun VideoPlayerStage(
                 }
             }
 
-            // 6. Adaptive Smart Pre-Roll Slate on Viewer while Scout locks onto opening cast & bubbles
+            // 6. Calm DialogueLens 2.0 Intelligent Buffering Overlay (no fake timers or internal jargon)
+            val showUnifiedBufferingOverlay = isCinemaIntroActive ||
+                ((readinessSnapshot?.isBufferingHoldActive == true || readinessSnapshot?.waitTimedOut == true) && !isEditMode)
             CinemaIntroOverlay(
-                visible = isCinemaIntroActive,
+                visible = showUnifiedBufferingOverlay,
                 remainingMs = introRemainingMs,
                 totalIntroMs = introTotalDurationMs,
                 scoutStatusText = scoutStatusText,
@@ -1202,12 +1194,21 @@ fun VideoPlayerStage(
                 bufferedWindows = scoutCompletedWindows,
                 totalWindows = scoutTotalWindows,
                 requiredOpeningWindows = requiredOpeningWindows,
-                onSkipIntro = onSkipIntro,
+                readinessSnapshot = readinessSnapshot,
+                onRetryBuffering = onRetryBuffering,
+                onOpenAttachCaptions = onOpenAttachCaptions,
+                onSkipIntro = {
+                    if (isScoutCatchUpBuffering && !isCinemaIntroActive) {
+                        onDismissCatchUpBuffering()
+                    } else {
+                        onSkipIntro()
+                    }
+                },
                 modifier = Modifier.fillMaxSize(),
             )
 
-            // Sleek Catch-Up Buffering pill when live playback catches up to an active mid-video Scout window
-            if (isScoutCatchUpBuffering && !isCinemaIntroActive && !isEditMode) {
+            // Sleek Catch-Up Buffering pill when live playback pauses mid-stream to sync upcoming dialogue
+            if (isScoutCatchUpBuffering && !showUnifiedBufferingOverlay && !isEditMode) {
                 Surface(
                     color = CinemaObsidian.copy(alpha = 0.90f),
                     shape = RoundedCornerShape(22.dp),
@@ -1228,14 +1229,14 @@ fun VideoPlayerStage(
                             color = LensSky,
                             strokeWidth = 2.5.dp,
                         )
-                        Column(modifier = Modifier.widthIn(max = 190.dp)) {
+                        Column(modifier = Modifier.widthIn(max = 195.dp)) {
                             Text(
-                                text = "Scout catching up",
+                                text = "Preparing upcoming dialogue",
                                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
                                 color = Color.White,
                             )
                             Text(
-                                text = scoutStatusText.ifBlank { "Buffering upcoming dialogue..." },
+                                text = "Playback resumes automatically once synced.",
                                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                 color = LensMint,
                                 maxLines = 1,
@@ -1251,7 +1252,7 @@ fun VideoPlayerStage(
                                 .testTag("catch_up_watch_anyway_button"),
                         ) {
                             Text(
-                                text = "Watch Anyway",
+                                text = "Watch Now",
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                                 color = CinemaObsidian,
                                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
@@ -1261,10 +1262,10 @@ fun VideoPlayerStage(
                 }
             }
 
-            // Sleek centered Play CTA when paused awaiting the Smart Pre-Roll
+            // Sleek centered Play CTA when paused awaiting initial dialogue preparation
             if (hasPendingPlayIntro &&
                 !isPlaying &&
-                !isCinemaIntroActive &&
+                !showUnifiedBufferingOverlay &&
                 !isEditMode &&
                 project.videoSource.kind != VideoSourceKind.DEMO_SCENARIO
             ) {
@@ -1285,18 +1286,18 @@ fun VideoPlayerStage(
                     ) {
                         Icon(
                             imageVector = Icons.Filled.PlayArrow,
-                            contentDescription = "Play video with Smart Pre-Roll",
+                            contentDescription = "Play video with DialogueLens bubbles",
                             tint = LensSky,
                             modifier = Modifier.size(26.dp),
                         )
                         Column {
                             Text(
-                                text = if (isOpeningSpeakersReady) "Play · Bubbles Ready" else "Play · Smart Pre-Roll",
+                                text = if (isOpeningSpeakersReady) "Play · Dialogue Ready" else "Play with DialogueLens",
                                 style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
                                 color = Color.White,
                             )
                             Text(
-                                text = scoutStatusText.ifBlank { "Scout preparing bubbles..." },
+                                text = if (isOpeningSpeakersReady) "Tap to start watching" else "Dialogue will sync as playback begins",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = LensMint,
                                 maxLines = 1,

@@ -270,8 +270,23 @@ class TranscriptCoverageLedger(
             if (sourcePriority(source) >= sourcePriority(activeSource)) {
                 activeSource = source
             }
-            val isVerified = status == CoverageStatus.VERIFIED_DIALOGUE || status == CoverageStatus.VERIFIED_SILENCE
-            val isSilence = status == CoverageStatus.VERIFIED_SILENCE
+            // Epistemic integrity guard (Operation Golden Video Section 3):
+            // Never allow an empty/rejected window with dialogueCount == 0 to be committed as VERIFIED_DIALOGUE.
+            val effectiveStatus = if (status == CoverageStatus.VERIFIED_DIALOGUE && dialogueCount <= 0) {
+                CoverageStatus.FAILED
+            } else {
+                status
+            }
+            val effectiveReason = if (status == CoverageStatus.VERIFIED_DIALOGUE && dialogueCount <= 0) {
+                failureReason.ifBlank { "EMPTY_VERIFIED_DIALOGUE_REJECTED" }
+            } else {
+                failureReason
+            }
+            val effectiveIncrementRetry = incrementRetry ||
+                (status == CoverageStatus.VERIFIED_DIALOGUE && dialogueCount <= 0)
+            val isVerified = effectiveStatus == CoverageStatus.VERIFIED_DIALOGUE ||
+                effectiveStatus == CoverageStatus.VERIFIED_SILENCE
+            val isSilence = effectiveStatus == CoverageStatus.VERIFIED_SILENCE
             applyIntervalMutationLocked(s, e) { existing ->
                 if (!forceOverrideHigherAuthority &&
                     existing.verified &&
@@ -279,13 +294,13 @@ class TranscriptCoverageLedger(
                 ) {
                     existing
                 } else {
-                    val nextRetries = if (incrementRetry) existing.retryAttempts + 1 else existing.retryAttempts
+                    val nextRetries = if (effectiveIncrementRetry) existing.retryAttempts + 1 else existing.retryAttempts
                     existing.copy(
-                        status = status,
+                        status = effectiveStatus,
                         source = source,
                         verified = isVerified,
                         retryAttempts = nextRetries,
-                        lastFailureReason = if (isVerified) "" else failureReason.ifBlank { existing.lastFailureReason },
+                        lastFailureReason = if (isVerified) "" else effectiveReason.ifBlank { existing.lastFailureReason },
                         dialogueCount = if (isSilence) 0 else dialogueCount.coerceAtLeast(0),
                         silenceConfirmed = isSilence,
                         updatedAtEpochMs = nowEpochMs,
@@ -409,6 +424,56 @@ class TranscriptCoverageLedger(
             cursor = maxOf(cursor, iv.endMs)
         }
         cursor
+    }
+
+    /**
+     * Returns the exact duration in milliseconds of contiguous verified coverage
+     * (`VERIFIED_DIALOGUE` or `VERIFIED_SILENCE`) starting at [positionMs] and extending
+     * forward without any unverified gap.
+     */
+    fun continuousVerifiedLeadFrom(positionMs: Long): Long = synchronized(lock) {
+        if (totalDurationMs <= 0L || intervals.isEmpty()) return@synchronized 0L
+        val start = positionMs.coerceIn(0L, totalDurationMs)
+        if (start >= totalDurationMs) return@synchronized 0L
+        var cursor = start
+        for (iv in intervals) {
+            if (iv.endMs <= cursor) continue
+            if (iv.startMs > cursor) break
+            if (!iv.verified) break
+            cursor = maxOf(cursor, iv.endMs)
+        }
+        (cursor - start).coerceAtLeast(0L)
+    }
+
+    /**
+     * Returns the epistemic [CoverageStatus] at [positionMs], or null if outside known duration.
+     */
+    fun coverageStatusAt(positionMs: Long): CoverageStatus? = synchronized(lock) {
+        if (totalDurationMs <= 0L || intervals.isEmpty()) return@synchronized null
+        val clamped = positionMs.coerceIn(0L, (totalDurationMs - 1L).coerceAtLeast(0L))
+        intervals.firstOrNull { clamped in it.startMs until it.endMs }?.status
+            ?: intervals.lastOrNull()?.status
+    }
+
+    /**
+     * Returns true if [positionMs] falls inside a `FAILED` or `PARTIAL_RECOVERY` interval.
+     */
+    fun hasFailedIntervalAt(positionMs: Long): Boolean {
+        val status = coverageStatusAt(positionMs)
+        return status == CoverageStatus.FAILED || status == CoverageStatus.PARTIAL_RECOVERY
+    }
+
+    /**
+     * Returns the first unverified interval within `[positionMs, positionMs + horizonMs]`, or null
+     * if the entire horizon is contiguously verified.
+     */
+    fun firstUnverifiedGapFrom(positionMs: Long, horizonMs: Long): CoverageInterval? = synchronized(lock) {
+        if (totalDurationMs <= 0L || intervals.isEmpty()) return@synchronized null
+        val start = positionMs.coerceIn(0L, totalDurationMs)
+        val end = (start + horizonMs.coerceAtLeast(0L)).coerceAtMost(totalDurationMs)
+        intervals.firstOrNull { iv ->
+            !iv.verified && iv.endMs > start && iv.startMs < end
+        }
     }
 
     fun isFullyVerified(): Boolean = synchronized(lock) {

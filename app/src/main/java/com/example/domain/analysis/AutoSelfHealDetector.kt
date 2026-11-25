@@ -198,26 +198,37 @@ class AutoSelfHealDetector {
         const val TEMPORAL_OVERHANG_TOLERANCE_MS = 450L
 
         /**
-         * Safely merges duplicate speakers that share the exact same normalized name (Layer A
-         * Video Memory hygiene) without invoking any cloud call and while preserving user-locked
-         * speaker confirmations and colors.
+         * Safely consolidates duplicate speaker entries ONLY when at least one duplicate is
+         * unconfirmed (`!isConfirmedCharacter`) and they do not represent two distinct confirmed
+         * people (e.g., two confirmed guests sharing the same first name or opposing studio positions).
          */
         fun consolidateDuplicateSpeakers(project: DialogueLensProject): DialogueLensProject {
             if (project.speakers.size < 2) return project
-            val canonicalByNorm = linkedMapOf<String, Speaker>()
+            val keptSpeakers = mutableListOf<Speaker>()
+            val canonicalByNorm = linkedMapOf<String, Int>()
             val remapIds = mutableMapOf<String, String>()
 
             for (speaker in project.speakers) {
                 val norm = HierarchicalContextEngine.normalizeSpeakerKey(speaker.displayName)
                 if (norm.isBlank()) {
-                    canonicalByNorm[speaker.id] = speaker
+                    keptSpeakers.add(speaker)
                     continue
                 }
-                val existing = canonicalByNorm[norm]
-                if (existing == null) {
-                    canonicalByNorm[norm] = speaker
+                val existingIdx = canonicalByNorm[norm]
+                if (existingIdx == null) {
+                    canonicalByNorm[norm] = keptSpeakers.size
+                    keptSpeakers.add(speaker)
                 } else {
-                    // Prefer confirmed character with preferredScreenSideX
+                    val existing = keptSpeakers[existingIdx]
+                    val bothConfirmedDistinct = existing.isConfirmedCharacter && speaker.isConfirmedCharacter
+                    val conflictingSides = existing.preferredScreenSideX != null &&
+                        speaker.preferredScreenSideX != null &&
+                        abs(existing.preferredScreenSideX - speaker.preferredScreenSideX) >= 0.25f
+                    if (bothConfirmedDistinct || (existing.isLocked && speaker.isLocked) || conflictingSides) {
+                        // Never merge two distinct confirmed people solely on display name
+                        keptSpeakers.add(speaker)
+                        continue
+                    }
                     val winner = if (!existing.isConfirmedCharacter && speaker.isConfirmedCharacter) {
                         speaker.copy(
                             preferredScreenSideX = speaker.preferredScreenSideX ?: existing.preferredScreenSideX,
@@ -229,14 +240,13 @@ class AutoSelfHealDetector {
                         )
                     }
                     val loserId = if (winner.id == existing.id) speaker.id else existing.id
-                    canonicalByNorm[norm] = winner
+                    keptSpeakers[existingIdx] = winner
                     remapIds[loserId] = winner.id
                 }
             }
 
             if (remapIds.isEmpty()) return project
 
-            val mergedSpeakers = canonicalByNorm.values.toList()
             val mergedEvents = project.dialogueEvents.map { evt ->
                 val remapped = evt.speakerId?.let { remapIds[it] }
                 if (remapped != null) evt.copy(speakerId = remapped) else evt
@@ -246,7 +256,7 @@ class AutoSelfHealDetector {
                 if (remapped != null) track.copy(speakerId = remapped) else track
             }
             return project.copy(
-                speakers = mergedSpeakers,
+                speakers = keptSpeakers,
                 dialogueEvents = mergedEvents,
                 faceTracks = mergedTracks,
             )

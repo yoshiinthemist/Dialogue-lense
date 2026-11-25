@@ -128,6 +128,7 @@ import com.example.ui.player.VideoPlayerStage
 import com.example.ui.player.WebBrowserControlStrip
 import com.example.ui.player.WebStreamSessionHolder
 import com.example.ui.settings.BalloonStyleSheet
+import com.example.ui.setup.FirstTimeOnboardingOverlay
 import com.example.ui.setup.MediaImportSheet
 import com.example.ui.setup.ProjectAndPrivacySheet
 import com.example.ui.setup.StartLauncherScreen
@@ -319,34 +320,45 @@ fun DialogueLensScreen(
     }
 
     if (state.showStartLauncher && state.activeDestination == AppDestination.LIBRARY) {
-        StartLauncherScreen(
-            savedProjects = state.savedProjects,
-            onStartLocalProject = viewModel::createProjectFromMedia,
-            onStartYouTubeProject = viewModel::createYouTubeProject,
-            onStartWebStreamProject = viewModel::createWebStreamProject,
-            onStartDirectMediaUrl = viewModel::createDirectMediaUrlProject,
-            onOpenSavedProject = viewModel::loadProject,
-            onLoadDemoScenario = viewModel::loadDemoScenario,
-            subtitlePrepState = state.subtitlePrepState,
-            selectedPrepFormat = state.selectedPrepFormat,
-            onSelectPrepFormat = viewModel::setSubtitlePrepFormat,
-            onGenerateSubtitlesFromUrl = viewModel::generateSubtitlesForUrl,
-            onGenerateSubtitlesFromLocal = viewModel::generateSubtitlesForLocalVideo,
-            onCancelSubtitlePrep = viewModel::cancelSubtitlePreGeneration,
-            onClearSubtitlePrep = viewModel::clearSubtitlePrepState,
-            onDownloadPreparedSubtitles = {
-                val ready = state.subtitlePrepState as? SubtitlePrepState.Ready ?: return@StartLauncherScreen
-                val fmt = state.selectedPrepFormat
-                val filename = SubtitleParser.suggestedExportFilename(ready.generatedProject.title, fmt)
-                when (fmt) {
-                    SubtitleParser.SubtitleExportFormat.SRT -> exportPrepSrtLauncher.launch(filename)
-                    SubtitleParser.SubtitleExportFormat.VTT -> exportPrepVttLauncher.launch(filename)
-                    SubtitleParser.SubtitleExportFormat.ASS -> exportPrepAssLauncher.launch(filename)
-                }
-            },
-            onLaunchPreparedProject = viewModel::launchPreparedProject,
-            onExportSavedProjectSubtitles = { proj -> subtitleExportProject = proj },
-        )
+        Box(modifier = Modifier.fillMaxSize()) {
+            StartLauncherScreen(
+                savedProjects = state.savedProjects,
+                onStartLocalProject = viewModel::createProjectFromMedia,
+                onStartYouTubeProject = viewModel::createYouTubeProject,
+                onStartWebStreamProject = viewModel::createWebStreamProject,
+                onStartDirectMediaUrl = viewModel::createDirectMediaUrlProject,
+                onOpenSavedProject = viewModel::loadProject,
+                onLoadDemoScenario = viewModel::loadDemoScenario,
+                subtitlePrepState = state.subtitlePrepState,
+                selectedPrepFormat = state.selectedPrepFormat,
+                onSelectPrepFormat = viewModel::setSubtitlePrepFormat,
+                onGenerateSubtitlesFromUrl = viewModel::generateSubtitlesForUrl,
+                onGenerateSubtitlesFromLocal = viewModel::generateSubtitlesForLocalVideo,
+                onCancelSubtitlePrep = viewModel::cancelSubtitlePreGeneration,
+                onClearSubtitlePrep = viewModel::clearSubtitlePrepState,
+                onDownloadPreparedSubtitles = {
+                    val ready = state.subtitlePrepState as? SubtitlePrepState.Ready ?: return@StartLauncherScreen
+                    val fmt = state.selectedPrepFormat
+                    val filename = SubtitleParser.suggestedExportFilename(ready.generatedProject.title, fmt)
+                    when (fmt) {
+                        SubtitleParser.SubtitleExportFormat.SRT -> exportPrepSrtLauncher.launch(filename)
+                        SubtitleParser.SubtitleExportFormat.VTT -> exportPrepVttLauncher.launch(filename)
+                        SubtitleParser.SubtitleExportFormat.ASS -> exportPrepAssLauncher.launch(filename)
+                    }
+                },
+                onLaunchPreparedProject = viewModel::launchPreparedProject,
+                onExportSavedProjectSubtitles = { proj -> subtitleExportProject = proj },
+            )
+            if (!state.hasCompletedOnboarding) {
+                FirstTimeOnboardingOverlay(
+                    onComplete = viewModel::completeOnboarding,
+                    onTryDemoScene = {
+                        viewModel.completeOnboarding()
+                        viewModel.loadDemoScenario()
+                    },
+                )
+            }
+        }
         return
     }
 
@@ -498,6 +510,10 @@ fun DialogueLensScreen(
                     viewModel.markHealBeaconAtCurrentTime()
                 },
                 onDismissQuickPicker = { viewModel.dismissQuickSpeakerPicker(resumePlayback = true) },
+                seekGeneration = state.seekGeneration,
+                onMeasuredBubbleSize = viewModel::onMeasuredBubbleSize,
+                readinessSnapshot = state.readinessSnapshot,
+                onRetryBuffering = viewModel::retryBufferingReadiness,
                 modifier = Modifier.fillMaxSize(),
             )
 
@@ -623,7 +639,7 @@ fun DialogueLensScreen(
                         }
                     }
 
-                    if (!state.isPlaying) {
+                    if (!state.isPlaying && state.readinessSnapshot.isIntentionallyPausedByUser) {
                         HealThisMomentPill(
                             onClick = { viewModel.markHealBeaconAtCurrentTime() },
                             isCompact = true,
@@ -843,7 +859,8 @@ fun DialogueLensScreen(
                                         val nextStyle = when (state.styleSettings.visualStyle) {
                                             BubbleVisualStyle.CINEMA_SUBTLE -> BubbleVisualStyle.MANGA_INK
                                             BubbleVisualStyle.MANGA_INK -> BubbleVisualStyle.STREAMING_CLEAN
-                                            BubbleVisualStyle.STREAMING_CLEAN -> BubbleVisualStyle.CINEMA_SUBTLE
+                                            BubbleVisualStyle.STREAMING_CLEAN -> BubbleVisualStyle.READING_COMFORT
+                                            BubbleVisualStyle.READING_COMFORT -> BubbleVisualStyle.CINEMA_SUBTLE
                                         }
                                         viewModel.updateStyleSettings(state.styleSettings.copy(visualStyle = nextStyle))
                                     },
@@ -899,6 +916,11 @@ fun DialogueLensScreen(
                                     onSelectQuotaMode = viewModel::setQuotaSaverMode,
                                     onRetryAiTranscription = viewModel::retryYouTubeAiTranscription,
                                     onAttachSubtitleFile = { showImportSheet = true },
+                                    visualStabilitySnapshot = state.visualStabilitySnapshot,
+                                    readinessSnapshot = state.readinessSnapshot,
+                                    sentinelSnapshot = state.sentinelSnapshot,
+                                    onInspectChapterNow = viewModel::inspectChapterNow,
+                                    onResetStabilityDiagnostics = viewModel::resetVisualStabilityDiagnostics,
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .weight(1f),
@@ -1002,6 +1024,10 @@ fun DialogueLensScreen(
                                                 viewModel.markHealBeaconAtCurrentTime()
                                             },
                                             onDismissQuickPicker = { viewModel.dismissQuickSpeakerPicker(resumePlayback = true) },
+                                            seekGeneration = state.seekGeneration,
+                                            onMeasuredBubbleSize = viewModel::onMeasuredBubbleSize,
+                                            readinessSnapshot = state.readinessSnapshot,
+                                            onRetryBuffering = viewModel::retryBufferingReadiness,
                                             modifier = Modifier.weight(1f),
                                         )
 
@@ -1009,6 +1035,7 @@ fun DialogueLensScreen(
                                             project = state.project,
                                             currentTimeMs = state.currentTimeMs,
                                             isPlaying = state.isPlaying,
+                                            isIntentionallyPausedByUser = state.readinessSnapshot.isIntentionallyPausedByUser,
                                             isMuted = state.isMuted,
                                             playbackSpeed = state.playbackSpeed,
                                             isFullscreenTheater = state.isFullscreenTheater,
@@ -1097,6 +1124,11 @@ fun DialogueLensScreen(
                                         onSelectQuotaMode = viewModel::setQuotaSaverMode,
                                         onRetryAiTranscription = viewModel::retryYouTubeAiTranscription,
                                         onAttachSubtitleFile = { showImportSheet = true },
+                                        visualStabilitySnapshot = state.visualStabilitySnapshot,
+                                        readinessSnapshot = state.readinessSnapshot,
+                                        sentinelSnapshot = state.sentinelSnapshot,
+                                        onInspectChapterNow = viewModel::inspectChapterNow,
+                                        onResetStabilityDiagnostics = viewModel::resetVisualStabilityDiagnostics,
                                         modifier = Modifier
                                             .weight(1f)
                                             .fillMaxHeight(),
@@ -1196,12 +1228,17 @@ fun DialogueLensScreen(
                                             viewModel.markHealBeaconAtCurrentTime()
                                         },
                                         onDismissQuickPicker = { viewModel.dismissQuickSpeakerPicker(resumePlayback = true) },
+                                        seekGeneration = state.seekGeneration,
+                                        onMeasuredBubbleSize = viewModel::onMeasuredBubbleSize,
+                                        readinessSnapshot = state.readinessSnapshot,
+                                        onRetryBuffering = viewModel::retryBufferingReadiness,
                                     )
 
                                     PlayerControlsBar(
                                         project = state.project,
                                         currentTimeMs = state.currentTimeMs,
                                         isPlaying = state.isPlaying,
+                                        isIntentionallyPausedByUser = state.readinessSnapshot.isIntentionallyPausedByUser,
                                         isMuted = state.isMuted,
                                         playbackSpeed = state.playbackSpeed,
                                         isFullscreenTheater = state.isFullscreenTheater,
@@ -1307,7 +1344,8 @@ fun DialogueLensScreen(
                         val nextStyle = when (state.styleSettings.visualStyle) {
                             BubbleVisualStyle.CINEMA_SUBTLE -> BubbleVisualStyle.MANGA_INK
                             BubbleVisualStyle.MANGA_INK -> BubbleVisualStyle.STREAMING_CLEAN
-                            BubbleVisualStyle.STREAMING_CLEAN -> BubbleVisualStyle.CINEMA_SUBTLE
+                            BubbleVisualStyle.STREAMING_CLEAN -> BubbleVisualStyle.READING_COMFORT
+                            BubbleVisualStyle.READING_COMFORT -> BubbleVisualStyle.CINEMA_SUBTLE
                         }
                         viewModel.updateStyleSettings(state.styleSettings.copy(visualStyle = nextStyle))
                     },
@@ -1362,6 +1400,29 @@ fun DialogueLensScreen(
                         showToolsDrawer = false
                         subtitleExportProject = state.project
                     },
+                    onMergeSpeakers = viewModel::mergeSpeakers,
+                    onMarkHealBeaconHere = { scope -> viewModel.markHealBeaconAtCurrentTime(scope = scope) },
+                    onRetryHealBeacon = viewModel::retryHealBeacon,
+                    onUndoHealBeacon = viewModel::undoHealBeacon,
+                    onDismissHealBeacon = viewModel::dismissHealBeacon,
+                    onChapterHealAt = { ts ->
+                        viewModel.seekTo(ts)
+                        viewModel.markHealBeaconAtCurrentTime(scope = HealScope.CHAPTER)
+                    },
+                    mediaCapabilities = state.mediaCapabilities,
+                    transcriptDiagnostics = state.transcriptDiagnostics,
+                    quotaSaverMode = state.quotaSaverMode,
+                    onSelectQuotaMode = viewModel::setQuotaSaverMode,
+                    onRetryAiTranscription = viewModel::retryYouTubeAiTranscription,
+                    onAttachSubtitleFile = {
+                        showToolsDrawer = false
+                        showImportSheet = true
+                    },
+                    visualStabilitySnapshot = state.visualStabilitySnapshot,
+                    readinessSnapshot = state.readinessSnapshot,
+                    sentinelSnapshot = state.sentinelSnapshot,
+                    onInspectChapterNow = viewModel::inspectChapterNow,
+                    onResetStabilityDiagnostics = viewModel::resetVisualStabilityDiagnostics,
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f),
@@ -1451,6 +1512,7 @@ fun DialogueLensScreen(
             onRetry = viewModel::retryHealBeacon,
             onUndo = viewModel::undoHealBeacon,
             onRemoveBeacon = viewModel::dismissHealBeacon,
+            onUpdateProblemHint = viewModel::updateHealBeaconProblemHint,
         )
     }
 }

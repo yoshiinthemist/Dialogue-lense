@@ -1560,6 +1560,11 @@ class TranslationAiService {
          * Detects when the model emitted 0-based chunk-relative seconds (e.g. 0..40s) for a later
          * video window (`windowStartSec >= 15`) and returns `windowStartSec.toDouble()` to shift them
          * back to absolute video timeline coordinates instead of silently dropping the entire chunk.
+         *
+         * Also enforces temporal provenance (Operation Golden Video Section 4): if multiple cues in
+         * a later window (`windowStartSec >= 35`) match distant prior dialogue (whether emitted with
+         * relative OR absolute timestamps), returns `Double.NaN` so the response is rejected as
+         * `INVALID_OR_AMBIGUOUS_TIMESTAMPS` and triggers bounded clarification/bisection recovery.
          */
         fun resolveYouTubeTimestampOffsetSec(
             rawStartSecs: List<Double>,
@@ -1577,12 +1582,28 @@ class TranslationAiService {
                 strictlyPreWindow > absMatches &&
                 relMatches >= ((rawStartSecs.size * 6) / 10).coerceAtLeast(2)
             val shouldShift = (absMatches == 0 && relMatches > 0) || majorityRelative
-            if (shouldShift && priorWindowNormalizedTexts.isNotEmpty() && rawCueTexts.isNotEmpty()) {
-                val echoedMatches = rawCueTexts.count { txt ->
+
+            if (priorWindowNormalizedTexts.isNotEmpty() && rawCueTexts.isNotEmpty()) {
+                val canonicalPriors = priorWindowNormalizedTexts
+                    .map { it.lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), "") }
+                    .filter { it.length >= 12 }
+                    .toSet()
+                val echoedMatches = if (canonicalPriors.isEmpty()) 0 else rawCueTexts.count { txt ->
                     val norm = txt.lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), "")
-                    norm.length >= 12 && norm in priorWindowNormalizedTexts
+                    if (norm.length < 12) return@count false
+                    if (norm in canonicalPriors) return@count true
+                    norm.length >= 18 && canonicalPriors.any { prior ->
+                        prior.length >= 18 && (prior.contains(norm) || norm.contains(prior))
+                    }
                 }
-                if (echoedMatches >= 2 || (echoedMatches * 10 >= rawCueTexts.size * 4)) {
+                if (shouldShift && (echoedMatches >= 2 || (echoedMatches * 10 >= rawCueTexts.size * 4))) {
+                    return Double.NaN
+                }
+                // Even when timestamps fall inside [windowStartSec, windowEndSec], reject whole-window
+                // multi-cue echoes (>= 3 echoed lines or >= 2 echoed lines making up >= 50% of a late window).
+                if (windowStartSec >= 35 &&
+                    (echoedMatches >= 3 || (echoedMatches >= 2 && echoedMatches * 10 >= rawCueTexts.size * 5))
+                ) {
                     return Double.NaN
                 }
             }

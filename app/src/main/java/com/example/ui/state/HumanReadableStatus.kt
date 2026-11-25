@@ -5,6 +5,8 @@ import com.example.data.model.HealBeaconStatus
 import com.example.data.model.SubtitleSourceKind
 import com.example.data.model.VideoSourceKind
 import com.example.domain.analysis.CoverageSummary
+import com.example.domain.playback.PlaybackReadinessSnapshot
+import com.example.domain.playback.PlaybackReadinessState
 
 enum class ReadinessTone {
     READY,
@@ -22,9 +24,9 @@ data class HumanReadableReadiness(
 )
 
 /**
- * Translates technical pipeline metrics (Scout segments, coverage intervals, model states) into
- * calm, plain-language viewer states for the Watch and Library interfaces. Technical diagnostics
- * remain accessible exclusively inside Studio -> Diagnostics.
+ * Translates structured playback readiness, coverage ledger state, and Heal Beacon activity into
+ * calm, plain-language viewer states for the Watch and Library interfaces (Section 52).
+ * Technical diagnostics remain accessible exclusively inside Studio -> Diagnostics.
  */
 object HumanReadableStatus {
 
@@ -33,6 +35,7 @@ object HumanReadableStatus {
         scoutState: ScoutCaptionState,
         coverageSummary: CoverageSummary?,
         isOfflineReady: Boolean = false,
+        readinessSnapshot: PlaybackReadinessSnapshot? = null,
     ): HumanReadableReadiness {
         if (project == null) {
             return HumanReadableReadiness(
@@ -42,6 +45,51 @@ object HumanReadableStatus {
             )
         }
 
+        // 1. Playback readiness buffering or error states take highest honesty precedence
+        if (readinessSnapshot != null) {
+            when (readinessSnapshot.state) {
+                PlaybackReadinessState.BUFFERING_INITIAL_WINDOW,
+                PlaybackReadinessState.BUFFERING_FOR_SEEK,
+                PlaybackReadinessState.BUFFERING_MID_PLAYBACK -> {
+                    val label = if (readinessSnapshot.state == PlaybackReadinessState.BUFFERING_FOR_SEEK) {
+                        "Preparing this section"
+                    } else {
+                        "Preparing dialogue"
+                    }
+                    val detail = if (readinessSnapshot.willAutoResumeWhenReady) {
+                        "Playback will resume automatically once dialogue is ready."
+                    } else {
+                        "Preparing verified dialogue for this section."
+                    }
+                    return HumanReadableReadiness(
+                        label = label,
+                        detail = detail,
+                        tone = ReadinessTone.ACTIVE,
+                        isInProgress = true,
+                    )
+                }
+                PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE -> {
+                    return HumanReadableReadiness(
+                        label = "Some dialogue is unavailable",
+                        detail = "Playing while dialogue continues preparing for this section.",
+                        tone = ReadinessTone.WARNING,
+                        isInProgress = true,
+                    )
+                }
+                PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR -> {
+                    return HumanReadableReadiness(
+                        label = "Some dialogue is unavailable",
+                        detail = readinessSnapshot.failureReason.ifBlank {
+                            "A section could not be prepared yet. You can retry or attach subtitles."
+                        },
+                        tone = ReadinessTone.WARNING,
+                    )
+                }
+                else -> Unit
+            }
+        }
+
+        // 2. Active user-visible Heal Beacons
         val activeHealingCount = project.healBeacons.count { it.status == HealBeaconStatus.HEALING }
         if (activeHealingCount > 0) {
             return HumanReadableReadiness(
@@ -56,7 +104,7 @@ object HumanReadableStatus {
             )
         }
 
-        val attentionCount = project.healBeacons.count { it.status == HealBeaconStatus.NEEDS_ATTENTION }
+        val attentionCount = project.healBeacons.count { !it.autoTriggered && it.status == HealBeaconStatus.NEEDS_ATTENTION }
         if (attentionCount > 0) {
             return HumanReadableReadiness(
                 label = "Needs attention",

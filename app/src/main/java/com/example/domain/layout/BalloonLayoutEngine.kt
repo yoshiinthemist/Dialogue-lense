@@ -1,6 +1,7 @@
 package com.example.domain.layout
 
 import com.example.data.model.BalloonStyleSettings
+import com.example.data.model.BubbleVisualStyle
 import com.example.data.model.ConfidenceTier
 import com.example.data.model.DeadSpaceZone
 import com.example.data.model.DialogueEvent
@@ -13,6 +14,7 @@ import com.example.data.model.Speaker
 import com.example.data.model.isBubbleSpeakerUnknown
 import com.example.domain.analysis.HierarchicalContextEngine
 import com.example.domain.analysis.LiveFaceObservation
+import com.example.domain.analysis.LiveStageFaceTracker
 import com.example.domain.analysis.SubtitleTimelineMatcher
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -50,22 +52,58 @@ data class PlacedBalloon(
 
 class BalloonLayoutEngine {
 
+    val stabilityDiagnostics: VisualStabilityDiagnostics = VisualStabilityDiagnostics()
+
+    private data class CommittedBodyState(
+        val sceneKey: String,
+        val center: NormalizedPoint,
+        val previousCenter: NormalizedPoint? = null,
+        val lastRelocationMs: Long = 0L,
+        val lastScore: Float = Float.MAX_VALUE,
+        val missingFaceStreak: Int = 0,
+        val lastTailTarget: NormalizedPoint? = null,
+    )
+
     private val smoothedPositions = mutableMapOf<String, NormalizedPoint>()
     private val smoothedTailTargets = mutableMapOf<String, NormalizedPoint>()
     private val lastShotIds = mutableMapOf<String, String>()
+    private val committedBodies = mutableMapOf<String, CommittedBodyState>()
     private val previousFaceBoxesByShot = mutableMapOf<String, Map<String, NormalizedRect>>()
     private val recentLiveFacesByShot = mutableMapOf<String, Pair<Long, List<Pair<String, com.example.data.model.FaceSample>>>>()
     private val lastTailWasLiveTracked = mutableMapOf<String, Boolean>()
     private val timelineMatcher = SubtitleTimelineMatcher()
 
+    private var cachedEventsRef: List<DialogueEvent>? = null
+    private var cachedOrdinals: Map<String, Int> = emptyMap()
+    private var lastActiveEventIds: Set<String> = emptySet()
+    private var lastGlobalSceneKey: String = ""
+
     fun clearSmoothing() {
         smoothedPositions.clear()
         smoothedTailTargets.clear()
         lastShotIds.clear()
+        committedBodies.clear()
         previousFaceBoxesByShot.clear()
         recentLiveFacesByShot.clear()
         lastTailWasLiveTracked.clear()
+        lastActiveEventIds = emptySet()
         timelineMatcher.reset()
+    }
+
+    /**
+     * Selectively invalidates layout state only for [eventIds] modified by a localized repair,
+     * leaving unrelated active speech bubbles completely undisturbed on screen.
+     */
+    fun invalidateEventsOnly(eventIds: Set<String>) {
+        if (eventIds.isEmpty()) return
+        for (id in eventIds) {
+            smoothedPositions.remove(id)
+            smoothedTailTargets.remove(id)
+            lastShotIds.remove(id)
+            committedBodies.remove(id)
+            lastTailWasLiveTracked.remove(id)
+        }
+        cachedEventsRef = null
     }
 
     fun computeLayout(
@@ -77,10 +115,26 @@ class BalloonLayoutEngine {
         hasLiveVisionSignal: Boolean = false,
         liveFrameObservedEmpty: Boolean = false,
         activeChapterId: String? = null,
+        measuredNormalizedSizes: Map<String, Pair<Float, Float>> = emptyMap(),
     ): List<PlacedBalloon> {
+        stabilityDiagnostics.recordLayoutEvaluation()
         val activeEvents = timelineMatcher.matchActiveEvents(project.dialogueEvents, currentMs)
             // Strict temporal validation: never allow stale dialogue to linger past its end boundary
             .filter { evt -> currentMs <= evt.endTimeMs + 160L }
+
+        val currentActiveIds = activeEvents.map { it.id }.toSet()
+        if (currentActiveIds != lastActiveEventIds) {
+            val activated = (currentActiveIds - lastActiveEventIds).size
+            val deactivated = (lastActiveEventIds - currentActiveIds).size
+            if (activated > 0 || deactivated > 0) {
+                stabilityDiagnostics.recordBubbleActivationDelta(activated, deactivated)
+            }
+            // Clean committed state for expired cues so memory stays bounded
+            for (expiredId in (lastActiveEventIds - currentActiveIds)) {
+                committedBodies.remove(expiredId)
+            }
+            lastActiveEventIds = currentActiveIds
+        }
 
         if (activeEvents.isEmpty()) return emptyList()
 
@@ -91,6 +145,10 @@ class BalloonLayoutEngine {
         } else {
             shotId
         }
+        if (lastGlobalSceneKey.isNotEmpty() && lastGlobalSceneKey != effectiveSceneKey) {
+            stabilityDiagnostics.recordSceneEpochChange()
+        }
+        lastGlobalSceneKey = effectiveSceneKey
         val shotLuminance = activeShot?.sceneLuminance ?: 0.25f
 
         // Fuse precomputed face tracks with real-time 6fps ML Kit live viewport observations
@@ -194,15 +252,23 @@ class BalloonLayoutEngine {
             maxSpeakerDelta = mlKitDelta,
         )
 
-        val countsBySpeaker = mutableMapOf<String, Int>()
-        val ordinalByEventId = mutableMapOf<String, Int>()
-        project.dialogueEvents.sortedBy { it.startTimeMs }.forEach { evt ->
-            val spkId = evt.speakerId
-            if (spkId != null && evt.dialogueType != DialogueType.SOUND_DESCRIPTION) {
-                val nextCount = (countsBySpeaker[spkId] ?: 0) + 1
-                countsBySpeaker[spkId] = nextCount
-                ordinalByEventId[evt.id] = nextCount
+        // Cached per-project speaker ordinals (eliminates O(N log N) sorting on every 16ms frame)
+        val ordinalByEventId = if (cachedEventsRef === project.dialogueEvents) {
+            cachedOrdinals
+        } else {
+            val countsBySpeaker = mutableMapOf<String, Int>()
+            val computed = HashMap<String, Int>(project.dialogueEvents.size)
+            project.dialogueEvents.sortedBy { it.startTimeMs }.forEach { evt ->
+                val spkId = evt.speakerId
+                if (spkId != null && evt.dialogueType != DialogueType.SOUND_DESCRIPTION) {
+                    val nextCount = (countsBySpeaker[spkId] ?: 0) + 1
+                    countsBySpeaker[spkId] = nextCount
+                    computed[evt.id] = nextCount
+                }
             }
+            cachedEventsRef = project.dialogueEvents
+            cachedOrdinals = computed
+            computed
         }
 
         // Place all dialogue / sketch bubbles BEFORE SFX notes so SFX checks every active bubble
@@ -215,9 +281,13 @@ class BalloonLayoutEngine {
             val lineOrdinal = ordinalByEventId[event.id] ?: 0
             val text = event.activeText(project.translationMode)
 
-            // Estimate normalized balloon size based on wrapped line length, maxLines, and font scale
-            val estWidth = estimateNormalizedWidth(text, styleSettings.fontScale, styleSettings.maxLines)
-            val estHeight = estimateNormalizedHeight(text, styleSettings.fontScale, styleSettings.maxLines)
+            // Prefer actual measured normalized bubble dimensions when reported by Compose,
+            // falling back to text-based normalized size estimation on initial placement
+            val measuredPair = measuredNormalizedSizes[event.id]
+            val estWidth = (measuredPair?.first?.takeIf { it in 0.06f..0.88f }
+                ?: estimateNormalizedWidth(text, styleSettings.fontScale, styleSettings.maxLines))
+            val estHeight = (measuredPair?.second?.takeIf { it in 0.04f..0.48f }
+                ?: estimateNormalizedHeight(text, styleSettings.fontScale, styleSettings.maxLines))
 
             // 1. User manual drag override takes priority (clamped inside safe screen margins)
             if (event.placementMode == PlacementMode.MANUAL_OVERRIDE && event.anchorPosition != null) {
@@ -271,8 +341,10 @@ class BalloonLayoutEngine {
                 continue
             }
 
-            // 1b. Accessibility Stable Positioning mode: calm, steady, tailless reading zone preserving speaker identity & color
-            if (styleSettings.stablePositioning && event.dialogueType == DialogueType.SPOKEN) {
+            // 1b. Accessibility Stable Positioning or Reading Comfort mode: calm, steady, tailless reading zone preserving speaker identity & color
+            val useStableCalmMode = styleSettings.stablePositioning ||
+                styleSettings.visualStyle == BubbleVisualStyle.READING_COMFORT
+            if (useStableCalmMode && event.dialogueType == DialogueType.SPOKEN) {
                 val isUnknown = isBubbleSpeakerUnknown(event, speaker)
                 val stableRect = placeNeutralFallbackRect(
                     w = estWidth,
@@ -565,7 +637,7 @@ class BalloonLayoutEngine {
                 }
 
                 val mouthRef = NormalizedPoint(targetX, targetY.coerceIn(0.14f, 0.78f))
-                val bestScoutCenter = scoutCandidates.minByOrNull { cand ->
+                fun scoreScoutCandidate(cand: NormalizedPoint): Float {
                     val r = centeredRect(cand.x, cand.y, scoutEstWidth, scoutEstHeight)
                     var pen = 0f
                     val faceOverlap = r.intersectionArea(synthFaceBox)
@@ -584,19 +656,16 @@ class BalloonLayoutEngine {
                         val ov = r.intersectionArea(obs)
                         if (ov > 0f) pen += ov * 2400f + 120f
                     }
-                    // Line-of-sight tail check: penalize any dead-space pocket whose tail ray cuts across a bystander face/chyron
                     val candCenterPt = NormalizedPoint(r.centerX, r.centerY)
                     for (avoid in bystanderAvoidBoxes) {
                         if (segmentIntersectsRect(candCenterPt, mouthRef, avoid)) {
                             pen += 320f
                         }
                     }
-                    // Anti-tangent breathing margin
                     if (r.left < 0.045f) pen += (0.045f - r.left) * 80f
                     if (r.right > 0.955f) pen += (r.right - 0.955f) * 80f
                     if (r.top < 0.03f) pen += (0.03f - r.top) * 80f
 
-                    // Dead-space affinity: reward the Scout-identified quiet background zone & open upper/side air
                     if (preferredZoneCenter != null) {
                         val distToPref = hypot(
                             (r.centerX - preferredZoneCenter.x).toDouble(),
@@ -604,16 +673,13 @@ class BalloonLayoutEngine {
                         ).toFloat()
                         if (distToPref < 0.14f) pen -= 18f * (1f - distToPref / 0.14f)
                     }
-                    // Gently prefer upper/side negative space as a soft tiebreaker
                     if (r.centerY < synthFaceBox.bottom) {
                         pen -= 0.4f
                     }
-                    // Soft same-side tiebreaker when speaker's side is clear (+1.8f); trivial compared to overlap penalties (+260..+9000f)
                     if (abs(targetX - 0.50f) >= 0.14f && (r.centerX - 0.50f) * (targetX - 0.50f) < 0f) {
                         pen += 1.8f
                     }
 
-                    // Unfettered roaming: prioritize zero face overlap first; gentle elastic pull only breaks clear-space ties
                     val horizDist = abs(r.centerX - targetX)
                     val vertDist = abs(r.centerY - targetY)
                     val euclid = hypot(horizDist.toDouble(), vertDist.toDouble()).toFloat()
@@ -622,7 +688,6 @@ class BalloonLayoutEngine {
                         pen += (euclid - 0.60f) * 14f
                     }
 
-                    // Continuous dead-space heatmap thermal density + edge anchoring when speaker movement detected
                     val thermalDensity = scoutHeatmap.sampleRectDensity(r)
                     pen += thermalDensity * 135f
                     if (scoutHeatmap.speakerMoved) {
@@ -632,26 +697,33 @@ class BalloonLayoutEngine {
                         }
                     }
 
-                    // Same-shot spatial hysteresis so bubbles glide smoothly without micro-jitter
                     if (!scoutHeatmap.speakerMoved && sameShotPrev != null &&
                         hypot((cand.x - sameShotPrev.x).toDouble(), (cand.y - sameShotPrev.y).toDouble()) < 0.005
                     ) {
                         pen -= 14f
                     }
-                    pen
-                } ?: scoutCandidates.first()
+                    return pen
+                }
 
-                val smoothedCenter = applyTemporalSmoothing(
+                val bestScoutCenter = scoutCandidates.minByOrNull { scoreScoutCandidate(it) } ?: scoutCandidates.first()
+                val bestScoutScore = scoreScoutCandidate(bestScoutCenter)
+                val committedCenter = commitBodyPosition(
                     eventId = event.id,
-                    shotId = effectiveSceneKey,
-                    target = bestScoutCenter,
-                    reducedMotion = styleSettings.reducedMotion,
-                    forceResponsiveEdgeTracking = scoutHeatmap.speakerMoved,
-                    movementSensitivity = styleSettings.movementSensitivity,
+                    sceneKey = effectiveSceneKey,
+                    candidateCenter = bestScoutCenter,
+                    candidateScore = bestScoutScore,
+                    scoreCommitted = { prevPt -> scoreScoutCandidate(prevPt) },
+                    isCriticallyInvalid = { prevPt ->
+                        val r = centeredRect(prevPt.x, prevPt.y, scoutEstWidth, scoutEstHeight)
+                        r.intersectionArea(synthFaceBox) > 0.002f ||
+                            bystanderAvoidBoxes.any { r.intersectionArea(it) > 0.002f } ||
+                            occupiedBalloonRects.any { r.intersectionArea(it) > 0.002f }
+                    },
+                    currentMs = currentMs,
+                    styleSettings = styleSettings,
+                    forceResponsiveTracking = scoutHeatmap.speakerMoved,
                 )
-                val finalRect = centeredRect(smoothedCenter.x, smoothedCenter.y, scoutEstWidth, scoutEstHeight)
-                // Aim the rotating comic tail directly at the speaker's mouth/lips once speaker is confirmed
-                // AND within restrained tail reach; unconfirmed or excessively distant anchors drop to tailless.
+                val finalRect = centeredRect(committedCenter.x, committedCenter.y, scoutEstWidth, scoutEstHeight)
                 val rawMouthY = targetY.coerceIn(0.14f, 0.78f)
                 val rawTailCandidate = NormalizedPoint(targetX, rawMouthY)
                 val withinTailReach = HierarchicalContextEngine.isDistanceWithinRestrainedTailReach(
@@ -659,13 +731,19 @@ class BalloonLayoutEngine {
                     tailTarget = rawTailCandidate,
                     hasVerifiedFace = false,
                 )
-                val tailPt = if (isUnknown || !withinTailReach) {
+                val resolvedTailRaw = applyTailVisibilityHysteresis(
+                    eventId = event.id,
+                    sceneKey = effectiveSceneKey,
+                    rawTailTarget = if (isUnknown || !withinTailReach) null else rawTailCandidate,
+                    confirmedEmptyFrame = liveFrameObservedEmpty,
+                )
+                val tailPt = if (resolvedTailRaw == null) {
                     null
                 } else {
                     applyTailTargetSmoothing(
                         eventId = event.id,
                         shotId = effectiveSceneKey,
-                        target = rawTailCandidate,
+                        target = resolvedTailRaw,
                         reducedMotion = styleSettings.reducedMotion,
                         hasLiveFaceTracking = liveFaces.isNotEmpty(),
                     )
@@ -785,15 +863,19 @@ class BalloonLayoutEngine {
                     )
                 }
             }
-            // Include the prior locked anchor within the same shot (suppressed when speaker moved so bubble smoothly relocates)
-            val sameShotPrevious = smoothedPositions[event.id]?.takeIf { lastShotIds[event.id] == effectiveSceneKey }
-            val candidates = if (sameShotPrevious != null && !liveHeatmap.speakerMoved) {
+            // Always keep the prior committed anchor inside the same shot in the candidate pool so
+            // minor face jitter does not cause the bubble to abandon a still-clear position.
+            val sameShotPrevious = committedBodies[event.id]
+                ?.takeIf { it.sceneKey == effectiveSceneKey }
+                ?.center
+                ?: smoothedPositions[event.id]?.takeIf { lastShotIds[event.id] == effectiveSceneKey }
+            val candidates = if (sameShotPrevious != null) {
                 listOf(sameShotPrevious) + rawCandidates
             } else {
                 rawCandidates
             }
 
-            val bestCenter = candidates.minByOrNull { candidate ->
+            fun scoreLiveCandidate(candidate: NormalizedPoint): Float {
                 val candRect = centeredRect(candidate.x, candidate.y, estWidth, estHeight)
                 val candHeat = liveHeatmap.sampleRectDensity(candRect)
                 val stabilityBonus = if (!liveHeatmap.speakerMoved && sameShotPrevious != null &&
@@ -820,7 +902,7 @@ class BalloonLayoutEngine {
                 val tailCrossPenalty = bystanderFaces.sumOf { bf ->
                     if (segmentIntersectsRect(candPt, mouthRefPoint, bf)) 220.0 else 0.0
                 }.toFloat()
-                scoreCandidate(
+                return scoreCandidate(
                     rect = candRect,
                     targetFace = trackSample,
                     headYawDeg = matchedSample.headYawDeg,
@@ -831,23 +913,42 @@ class BalloonLayoutEngine {
                     lipCorridorZones = lipCorridorZones,
                     otherObstacles = allObstacles,
                 ) + candHeat * 110f + stabilityBonus + deadSpaceBonus + edgeMovementBias + tailCrossPenalty
-            } ?: NormalizedPoint(trackSample.centerX, (trackSample.top - estHeight * 0.7f).coerceAtLeast(0.11f))
+            }
 
-            // 5. Temporal smoothing with instant snap on shot/cut boundary changes and movement-responsive edge anchoring
-            val smoothedCenter = applyTemporalSmoothing(
+            val bestCenter = candidates.minByOrNull { scoreLiveCandidate(it) }
+                ?: NormalizedPoint(trackSample.centerX, (trackSample.top - estHeight * 0.7f).coerceAtLeast(0.11f))
+            val bestScore = scoreLiveCandidate(bestCenter)
+
+            // 5. Authoritative hysteresis, relocation cooldown, A-B-A bounce blocker & temporal smoothing
+            val committedCenter = commitBodyPosition(
                 eventId = event.id,
-                shotId = effectiveSceneKey,
-                target = bestCenter,
-                reducedMotion = styleSettings.reducedMotion,
-                forceResponsiveEdgeTracking = liveHeatmap.speakerMoved,
-                movementSensitivity = styleSettings.movementSensitivity,
+                sceneKey = effectiveSceneKey,
+                candidateCenter = bestCenter,
+                candidateScore = bestScore,
+                scoreCommitted = { prevPt -> scoreLiveCandidate(prevPt) },
+                isCriticallyInvalid = { prevPt ->
+                    val r = centeredRect(prevPt.x, prevPt.y, estWidth, estHeight)
+                    faceExclusionZones.any { r.intersectionArea(it) > 0.002f } ||
+                        lipCorridorZones.any { r.intersectionArea(it) > 0.002f } ||
+                        occupiedBalloonRects.any { r.intersectionArea(it) > 0.002f }
+                },
+                currentMs = currentMs,
+                styleSettings = styleSettings,
+                forceResponsiveTracking = liveHeatmap.speakerMoved,
             )
 
-            val finalRect = centeredRect(smoothedCenter.x, smoothedCenter.y, estWidth, estHeight)
+            val finalRect = centeredRect(committedCenter.x, committedCenter.y, estWidth, estHeight)
+            val rawMouthPt = computeMouthPoint(matchedSample)
+            val resolvedMouthPt = applyTailVisibilityHysteresis(
+                eventId = event.id,
+                sceneKey = effectiveSceneKey,
+                rawTailTarget = rawMouthPt,
+                confirmedEmptyFrame = liveFrameObservedEmpty,
+            )
             val mouthTarget = applyTailTargetSmoothing(
                 eventId = event.id,
                 shotId = effectiveSceneKey,
-                target = computeMouthPoint(matchedSample),
+                target = resolvedMouthPt,
                 reducedMotion = styleSettings.reducedMotion,
                 hasLiveFaceTracking = liveFaces.isNotEmpty(),
             )
@@ -1037,6 +1138,202 @@ class BalloonLayoutEngine {
         return penalty
     }
 
+    /**
+     * Authoritative 2.0 body-position stability gate:
+     * - Snaps cleanly across real scene cuts / chapter changes without sliding across shots.
+     * - Within the same shot, preserves committed position unless a critical invalidation
+     *   (face/lip/sibling overlap) occurs OR the candidate beats the committed position by
+     *   at least [RELOCATION_SCORE_MARGIN], exceeds the dead-zone, passes the relocation
+     *   cooldown, and is not an A-B-A bounce within [ABA_GUARD_WINDOW_MS].
+     */
+    private fun commitBodyPosition(
+        eventId: String,
+        sceneKey: String,
+        candidateCenter: NormalizedPoint,
+        candidateScore: Float,
+        scoreCommitted: (NormalizedPoint) -> Float,
+        isCriticallyInvalid: (NormalizedPoint) -> Boolean,
+        currentMs: Long,
+        styleSettings: BalloonStyleSettings,
+        forceResponsiveTracking: Boolean,
+    ): NormalizedPoint {
+        val existing = committedBodies[eventId]
+        if (existing == null || existing.sceneKey != sceneKey) {
+            val prevPoint = existing?.center
+            if (prevPoint != null) {
+                val dist = hypot(
+                    (candidateCenter.x - prevPoint.x).toDouble(),
+                    (candidateCenter.y - prevPoint.y).toDouble(),
+                ).toFloat()
+                if (dist > 0.01f) {
+                    stabilityDiagnostics.recordRelocation(
+                        eventId = eventId,
+                        displacementNormalized = dist,
+                        reason = "scene_cut_snap",
+                        playbackMs = currentMs,
+                    )
+                }
+            }
+            committedBodies[eventId] = CommittedBodyState(
+                sceneKey = sceneKey,
+                center = candidateCenter,
+                previousCenter = null,
+                lastRelocationMs = currentMs,
+                lastScore = candidateScore,
+                missingFaceStreak = 0,
+                lastTailTarget = null,
+            )
+            smoothedPositions[eventId] = candidateCenter
+            lastShotIds[eventId] = sceneKey
+            return candidateCenter
+        }
+
+        val displacement = hypot(
+            (candidateCenter.x - existing.center.x).toDouble(),
+            (candidateCenter.y - existing.center.y).toDouble(),
+        ).toFloat()
+
+        val criticalInvalid = isCriticallyInvalid(existing.center)
+        val sens = styleSettings.movementSensitivity.coerceIn(0f, 1f)
+        val deadzone = when {
+            styleSettings.reducedMotion -> 0.055f
+            forceResponsiveTracking -> (0.022f - sens * 0.010f).coerceAtLeast(0.012f)
+            else -> (0.048f - sens * 0.022f).coerceIn(0.024f, 0.050f)
+        }
+
+        // 1. Dead-zone: ignore minor sub-threshold drift when current position is valid
+        if (!criticalInvalid && displacement < deadzone) {
+            return existing.center
+        }
+
+        val elapsedSinceRelocation = abs(currentMs - existing.lastRelocationMs)
+        val cooldownMs = if (styleSettings.reducedMotion) 1_000L else 650L
+        val requiredMargin = if (styleSettings.reducedMotion) 32f else 24f
+
+        // 2. Score-margin hysteresis: only relocate for clear material improvement
+        if (!criticalInvalid) {
+            val committedScore = scoreCommitted(existing.center)
+            val improvement = committedScore - candidateScore
+            if (improvement < requiredMargin && !forceResponsiveTracking) {
+                return existing.center
+            }
+            // 3. Relocation cooldown: prevent frequent back-to-back repositioning
+            if (elapsedSinceRelocation < cooldownMs && !forceResponsiveTracking) {
+                return existing.center
+            }
+            // 4. A-B-A bounce blocker: never jump back to the previous anchor A inside 1.4s
+            val prevAnchor = existing.previousCenter
+            if (prevAnchor != null && elapsedSinceRelocation < ABA_GUARD_WINDOW_MS) {
+                val distToPrevAnchor = hypot(
+                    (candidateCenter.x - prevAnchor.x).toDouble(),
+                    (candidateCenter.y - prevAnchor.y).toDouble(),
+                ).toFloat()
+                if (distToPrevAnchor < 0.065f) {
+                    stabilityDiagnostics.recordOscillationPrevented(
+                        eventId = eventId,
+                        playbackMs = currentMs,
+                        reason = "aba_bounce_blocked",
+                    )
+                    return existing.center
+                }
+            }
+        }
+
+        val smoothed = applyTemporalSmoothing(
+            eventId = eventId,
+            shotId = sceneKey,
+            target = candidateCenter,
+            reducedMotion = styleSettings.reducedMotion,
+            forceResponsiveEdgeTracking = forceResponsiveTracking || criticalInvalid,
+            movementSensitivity = styleSettings.movementSensitivity,
+        )
+        val actualMove = hypot(
+            (smoothed.x - existing.center.x).toDouble(),
+            (smoothed.y - existing.center.y).toDouble(),
+        ).toFloat()
+
+        if (actualMove >= 0.008f) {
+            val prevAnchor = existing.previousCenter
+            if (prevAnchor != null && elapsedSinceRelocation < ABA_GUARD_WINDOW_MS) {
+                val distBackToA = hypot(
+                    (smoothed.x - prevAnchor.x).toDouble(),
+                    (smoothed.y - prevAnchor.y).toDouble(),
+                ).toFloat()
+                if (distBackToA < 0.055f) {
+                    stabilityDiagnostics.recordOscillationDetected(
+                        eventId = eventId,
+                        displacementNormalized = actualMove,
+                        playbackMs = currentMs,
+                    )
+                }
+            }
+            stabilityDiagnostics.recordRelocation(
+                eventId = eventId,
+                displacementNormalized = actualMove,
+                reason = if (criticalInvalid) "critical_face_or_overlap_avoidance" else if (forceResponsiveTracking) "speaker_movement" else "clear_margin_improvement",
+                playbackMs = currentMs,
+            )
+            committedBodies[eventId] = existing.copy(
+                center = smoothed,
+                previousCenter = if (actualMove >= 0.03f) existing.center else existing.previousCenter,
+                lastRelocationMs = if (actualMove >= 0.03f) currentMs else existing.lastRelocationMs,
+                lastScore = candidateScore,
+            )
+        }
+        return smoothed
+    }
+
+    /**
+     * Suppresses single-frame ML Kit face dropouts so directional tails do not flicker on/off
+     * during transient misses, while still dropping tails immediately on confirmed empty B-roll
+     * or real scene cuts.
+     */
+    private fun applyTailVisibilityHysteresis(
+        eventId: String,
+        sceneKey: String,
+        rawTailTarget: NormalizedPoint?,
+        confirmedEmptyFrame: Boolean,
+    ): NormalizedPoint? {
+        val state = committedBodies[eventId]
+        if (state == null || state.sceneKey != sceneKey) {
+            return rawTailTarget
+        }
+        if (rawTailTarget != null) {
+            if (state.lastTailTarget == null && state.missingFaceStreak > 0) {
+                stabilityDiagnostics.recordTailToggle()
+            }
+            committedBodies[eventId] = state.copy(
+                missingFaceStreak = 0,
+                lastTailTarget = rawTailTarget,
+            )
+            return rawTailTarget
+        }
+        if (confirmedEmptyFrame) {
+            if (state.lastTailTarget != null) {
+                stabilityDiagnostics.recordTailToggle()
+            }
+            committedBodies[eventId] = state.copy(
+                missingFaceStreak = LiveStageFaceTracker.CONFIRMED_EMPTY_FRAME_STREAK,
+                lastTailTarget = null,
+            )
+            return null
+        }
+        val nextStreak = state.missingFaceStreak + 1
+        if (state.lastTailTarget != null && nextStreak < LiveStageFaceTracker.CONFIRMED_EMPTY_FRAME_STREAK) {
+            stabilityDiagnostics.recordTrackingDropout()
+            committedBodies[eventId] = state.copy(missingFaceStreak = nextStreak)
+            return state.lastTailTarget
+        }
+        if (state.lastTailTarget != null) {
+            stabilityDiagnostics.recordTailToggle()
+        }
+        committedBodies[eventId] = state.copy(
+            missingFaceStreak = nextStreak,
+            lastTailTarget = null,
+        )
+        return null
+    }
+
     private fun applyTemporalSmoothing(
         eventId: String,
         shotId: String,
@@ -1060,14 +1357,13 @@ class BalloonLayoutEngine {
             (target.x - previousPoint.x).toDouble(),
             (target.y - previousPoint.y).toDouble(),
         ).toFloat()
-        // Hysteresis deadzone scales smoothly with movementSensitivity (0 = calmest, 1 = most responsive)
-        val baseDeadzone = 0.024f - (sens * 0.018f) // 0.024 at 0.0 -> 0.015 at 0.5 -> 0.006 at 1.0
+        val baseDeadzone = 0.024f - (sens * 0.018f)
         val deadzone = if (forceResponsiveEdgeTracking) (baseDeadzone * 0.35f).coerceAtLeast(0.003f) else baseDeadzone
         if (deltaDist < deadzone) {
             return previousPoint
         }
 
-        val baseAlpha = 0.14f + (sens * 0.24f) // 0.14 at 0.0 -> 0.26 at 0.5 -> 0.38 at 1.0
+        val baseAlpha = 0.14f + (sens * 0.24f)
         val alpha = if (forceResponsiveEdgeTracking) (baseAlpha + 0.24f).coerceAtMost(0.68f) else baseAlpha
         val smoothed = NormalizedPoint(
             x = previousPoint.x + (target.x - previousPoint.x) * alpha,
@@ -1075,6 +1371,10 @@ class BalloonLayoutEngine {
         )
         smoothedPositions[eventId] = smoothed
         return smoothed
+    }
+
+    companion object {
+        private const val ABA_GUARD_WINDOW_MS = 1_400L
     }
 
     private fun applyTailTargetSmoothing(

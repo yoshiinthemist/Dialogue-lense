@@ -4,18 +4,49 @@ import com.example.data.model.DialogueEvent
 import kotlin.math.abs
 import kotlin.math.roundToLong
 
+data class PlaybackClockDiagnostics(
+    val authoritativeMediaMs: Long = 0L,
+    val presentationClockMs: Long = 0L,
+    val lastCorrectionDeltaMs: Long = 0L,
+    val suppressedBackwardJitters: Int = 0,
+    val stallExtrapolationClamps: Int = 0,
+    val hardDiscontinuityResets: Int = 0,
+    val isMediaStalled: Boolean = false,
+)
+
 /**
- * High-precision monotonic playback clock synchronized against Media3 ExoPlayer position and
- * playback rate (for local media) or JS bridge position heartbeats (for embedded YouTube / Web streams).
- * Prevents 30Hz/220ms polling staircases and eliminates cumulative frame-drift at 1x–2x speeds.
+ * Stable, monotonic presentation clock synchronized against Media3 ExoPlayer position and
+ * playback rate (for local/direct media) or JS bridge position heartbeats (for YouTube / Web).
+ *
+ * DialogueLens 2.0 stability guarantees (Section 25):
+ * - Separates authoritative media position from presentation clock.
+ * - During uninterrupted forward playback, rejects tiny backward IPC/heartbeat corrections
+ *   (< [BACKWARD_DISCONTINUITY_THRESHOLD_MS]) so cues never flicker across start/end edges.
+ * - Bounds forward extrapolation when remote heartbeats stop ([MAX_REMOTE_EXTRAPOLATION_MS])
+ *   so stalls never push subtitles indefinitely ahead of frozen video.
+ * - Resets immediately on true seeks, pauses, speed changes, and genuine discontinuities.
  */
 class PlaybackClockAnchor {
     private var anchorPosMs: Long = 0L
     private var anchorNanoTime: Long = System.nanoTime()
+    private var lastPresentationMs: Long = 0L
+    private var authoritativeMediaMs: Long = 0L
     private var playbackSpeed: Float = 1.0f
     private var isPlaying: Boolean = false
     private var lastReportedExoPosMs: Long = -1L
     private var lastExoAdvanceNano: Long = System.nanoTime()
+    private var lastRemoteSampleNano: Long = System.nanoTime()
+    private var lastRemoteReportedMs: Long = -1L
+    private var isRemoteSource: Boolean = false
+    private var consecutiveStallPolls: Int = 0
+    private var clockLeadFreezeActive: Boolean = false
+
+    // Bounded telemetry counters for Studio Timing Diagnostics (Section 32)
+    private var lastCorrectionDeltaMs: Long = 0L
+    private var suppressedBackwardJitters: Int = 0
+    private var stallExtrapolationClamps: Int = 0
+    private var hardDiscontinuityResets: Int = 0
+    private var mediaStalled: Boolean = false
 
     fun reset(
         positionMs: Long = 0L,
@@ -23,12 +54,21 @@ class PlaybackClockAnchor {
         playing: Boolean = false,
         nowNs: Long = System.nanoTime(),
     ) {
-        anchorPosMs = positionMs.coerceAtLeast(0L)
+        val safePos = positionMs.coerceAtLeast(0L)
+        anchorPosMs = safePos
+        lastPresentationMs = safePos
+        authoritativeMediaMs = safePos
         anchorNanoTime = nowNs
         playbackSpeed = speed.coerceIn(0.25f, 4.0f)
         isPlaying = playing
-        lastReportedExoPosMs = anchorPosMs
+        lastReportedExoPosMs = safePos
         lastExoAdvanceNano = nowNs
+        lastRemoteSampleNano = nowNs
+        lastRemoteReportedMs = safePos
+        consecutiveStallPolls = 0
+        clockLeadFreezeActive = false
+        mediaStalled = false
+        lastCorrectionDeltaMs = 0L
     }
 
     fun updatePlaybackState(
@@ -37,12 +77,30 @@ class PlaybackClockAnchor {
         playing: Boolean,
         nowNs: Long = System.nanoTime(),
     ) {
-        anchorPosMs = positionMs.coerceAtLeast(0L)
-        anchorNanoTime = nowNs
-        playbackSpeed = speed.coerceIn(0.25f, 4.0f)
+        val safePos = positionMs.coerceAtLeast(0L)
+        val safeSpeed = speed.coerceIn(0.25f, 4.0f)
+        val speedChanged = abs(safeSpeed - playbackSpeed) > 0.01f
+        val playChanged = playing != isPlaying
+        val largeJump = abs(safePos - lastPresentationMs) > BACKWARD_DISCONTINUITY_THRESHOLD_MS
+
+        authoritativeMediaMs = safePos
+        isRemoteSource = false
+        clockLeadFreezeActive = false
+        if (!playing || playChanged || speedChanged || largeJump) {
+            anchorPosMs = safePos
+            lastPresentationMs = safePos
+            anchorNanoTime = nowNs
+            if (largeJump) hardDiscontinuityResets++
+        } else if (safePos >= lastPresentationMs) {
+            anchorPosMs = safePos
+            lastPresentationMs = safePos
+            anchorNanoTime = nowNs
+        }
+        playbackSpeed = safeSpeed
         isPlaying = playing
-        lastReportedExoPosMs = anchorPosMs
+        lastReportedExoPosMs = safePos
         lastExoAdvanceNano = nowNs
+        mediaStalled = false
     }
 
     /**
@@ -56,8 +114,11 @@ class PlaybackClockAnchor {
         maxDurationMs: Long = Long.MAX_VALUE,
         nowNs: Long = System.nanoTime(),
     ): Long {
-        val safeExo = exoPosMs.coerceIn(0L, maxDurationMs.coerceAtLeast(0L))
+        val upper = maxDurationMs.coerceAtLeast(0L)
+        val safeExo = exoPosMs.coerceIn(0L, upper)
         val safeSpeed = speed.coerceIn(0.25f, 4.0f)
+        isRemoteSource = false
+        authoritativeMediaMs = safeExo
 
         if (!playing) {
             updatePlaybackState(safeExo, safeSpeed, false, nowNs)
@@ -65,26 +126,55 @@ class PlaybackClockAnchor {
         }
 
         if (safeExo != lastReportedExoPosMs) {
+            val isSmallBackwardJitter = lastReportedExoPosMs >= 0L &&
+                safeExo < lastPresentationMs &&
+                (lastPresentationMs - safeExo) <= LOCAL_BACKWARD_JITTER_TOLERANCE_MS &&
+                abs(safeSpeed - playbackSpeed) <= 0.01f
+
             lastReportedExoPosMs = safeExo
             lastExoAdvanceNano = nowNs
-            anchorPosMs = safeExo
-            anchorNanoTime = nowNs
             playbackSpeed = safeSpeed
             isPlaying = true
+            mediaStalled = false
+
+            if (isSmallBackwardJitter) {
+                suppressedBackwardJitters++
+                lastCorrectionDeltaMs = safeExo - lastPresentationMs
+                anchorPosMs = lastPresentationMs
+                anchorNanoTime = nowNs
+                clockLeadFreezeActive = true
+                return lastPresentationMs.coerceIn(0L, upper)
+            }
+
+            clockLeadFreezeActive = false
+            if (abs(safeExo - lastPresentationMs) > BACKWARD_DISCONTINUITY_THRESHOLD_MS) {
+                hardDiscontinuityResets++
+            }
+            lastCorrectionDeltaMs = safeExo - lastPresentationMs
+            anchorPosMs = safeExo
+            lastPresentationMs = safeExo
+            anchorNanoTime = nowNs
             return safeExo
+        }
+
+        if (clockLeadFreezeActive) {
+            return lastPresentationMs.coerceIn(0L, upper)
         }
 
         // If ExoPlayer is actively playing and reported the exact same integer ms on a 16ms frame boundary,
         // extrapolate gently (capped at 48ms) until the next audio-clock tick arrives.
-        val plateauMs = ((nowNs - lastExoAdvanceNano) / 1_000_000.0 * safeSpeed)
+        val plateauMs = ((nowNs - lastExoAdvanceNano).coerceAtLeast(0L) / 1_000_000.0 * safeSpeed)
             .roundToLong()
             .coerceIn(0L, 48L)
-        return (safeExo + plateauMs).coerceIn(0L, maxDurationMs.coerceAtLeast(0L))
+        val next = maxOf(lastPresentationMs, safeExo + plateauMs).coerceIn(0L, upper)
+        lastPresentationMs = next
+        return next
     }
 
     /**
-     * Reconciles a remote WebView / YouTube player heartbeat (`positionMs`) against the predicted
-     * 60fps monotonic clock so web streams stay frame-accurate without jitter or backwards skipping.
+     * Reconciles a remote WebView / YouTube player heartbeat (`reportedPosMs`) against the predicted
+     * presentation clock so web streams stay frame-accurate with ZERO backward clock reversals
+     * during uninterrupted forward playback and bounded clamping during network stalls.
      */
     fun reconcileRemoteSample(
         reportedPosMs: Long,
@@ -94,15 +184,79 @@ class PlaybackClockAnchor {
     ) {
         val safePos = reportedPosMs.coerceAtLeast(0L)
         val safeSpeed = speed.coerceIn(0.25f, 4.0f)
+        val speedChanged = abs(safeSpeed - playbackSpeed) > 0.01f
         val predicted = sampleInterpolatedMs(nowNs = nowNs)
         val delta = safePos - predicted
+        val sincePrevSampleMs = ((nowNs - lastRemoteSampleNano).coerceAtLeast(0L) / 1_000_000L)
 
-        if (!playing || !isPlaying || abs(delta) > 220L || safePos < anchorPosMs - 40L) {
-            anchorPosMs = safePos
-            anchorNanoTime = nowNs
+        isRemoteSource = true
+        authoritativeMediaMs = safePos
+        lastCorrectionDeltaMs = delta
+
+        // Detect genuine remote media stall: playing==true, heartbeats arriving, but reportedPosMs unchanged
+        if (playing && isPlaying && lastRemoteReportedMs >= 0L && abs(safePos - lastRemoteReportedMs) <= 2L) {
+            if (sincePrevSampleMs >= 100L) {
+                consecutiveStallPolls++
+            }
+            if (consecutiveStallPolls >= 3) {
+                mediaStalled = true
+                clockLeadFreezeActive = false
+                // Freeze cleanly at current monotonic presentation time without stepping backward
+                val heldPos = maxOf(safePos, lastPresentationMs)
+                anchorPosMs = heldPos
+                lastPresentationMs = heldPos
+                anchorNanoTime = nowNs
+                lastRemoteSampleNano = nowNs
+                playbackSpeed = safeSpeed
+                return
+            }
         } else {
-            // Smooth micro-correction absorbs ~50-120ms IPC latency without causing subtitle skips
-            anchorPosMs = (predicted + (delta * 0.55).roundToLong()).coerceAtLeast(0L)
+            consecutiveStallPolls = 0
+            mediaStalled = false
+        }
+        lastRemoteReportedMs = safePos
+        lastRemoteSampleNano = nowNs
+
+        if (!playing || !isPlaying || speedChanged) {
+            clockLeadFreezeActive = false
+            anchorPosMs = safePos
+            lastPresentationMs = safePos
+            anchorNanoTime = nowNs
+            playbackSpeed = safeSpeed
+            isPlaying = playing
+            return
+        }
+
+        // Genuine discontinuity (real seek, scrub, or large network jump) -> hard reset immediately
+        val isHardForwardJump = delta > FORWARD_DISCONTINUITY_THRESHOLD_MS
+        val isHardBackwardJump = safePos < lastPresentationMs - BACKWARD_DISCONTINUITY_THRESHOLD_MS
+        if (isHardForwardJump || isHardBackwardJump) {
+            clockLeadFreezeActive = false
+            anchorPosMs = safePos
+            lastPresentationMs = safePos
+            anchorNanoTime = nowNs
+            hardDiscontinuityResets++
+            playbackSpeed = safeSpeed
+            isPlaying = playing
+            return
+        }
+
+        if (delta < 0L) {
+            // Strict forward monotonicity during uninterrupted playback (Operation Golden Video):
+            // NEVER step lastPresentationMs backward for minor IPC/heartbeat lag (< BACKWARD_DISCONTINUITY_THRESHOLD_MS).
+            // Instead hold the presentation clock stationary until authoritative media catches up.
+            suppressedBackwardJitters++
+            val leadAhead = (lastPresentationMs - safePos).coerceAtLeast(0L)
+            anchorPosMs = lastPresentationMs
+            anchorNanoTime = nowNs
+            clockLeadFreezeActive = leadAhead > 20L
+        } else {
+            // Smooth forward convergence (absorbs WebView IPC latency monotonically)
+            clockLeadFreezeActive = false
+            val step = (delta * 0.55).roundToLong()
+            val next = maxOf(lastPresentationMs, predicted + step)
+            anchorPosMs = next
+            lastPresentationMs = next
             anchorNanoTime = nowNs
         }
         playbackSpeed = safeSpeed
@@ -114,9 +268,46 @@ class PlaybackClockAnchor {
         nowNs: Long = System.nanoTime(),
     ): Long {
         val upper = maxDurationMs.coerceAtLeast(0L)
-        if (!isPlaying) return anchorPosMs.coerceIn(0L, upper)
-        val elapsedMs = ((nowNs - anchorNanoTime).coerceAtLeast(0L) / 1_000_000.0 * playbackSpeed).roundToLong()
-        return (anchorPosMs + elapsedMs).coerceIn(0L, upper)
+        if (!isPlaying || mediaStalled || clockLeadFreezeActive) {
+            return lastPresentationMs.coerceIn(0L, upper)
+        }
+        val rawWallElapsedMs = ((nowNs - anchorNanoTime).coerceAtLeast(0L) / 1_000_000.0)
+        val sinceHeartbeatMs = if (isRemoteSource) {
+            ((nowNs - lastRemoteSampleNano).coerceAtLeast(0L) / 1_000_000.0)
+        } else {
+            0.0
+        }
+        val clampedWallElapsedMs = if (isRemoteSource &&
+            (rawWallElapsedMs > MAX_REMOTE_EXTRAPOLATION_MS || sinceHeartbeatMs > MAX_REMOTE_EXTRAPOLATION_MS)
+        ) {
+            stallExtrapolationClamps++
+            mediaStalled = true
+            minOf(rawWallElapsedMs, MAX_REMOTE_EXTRAPOLATION_MS.toDouble())
+        } else {
+            rawWallElapsedMs
+        }
+        val elapsedMediaMs = (clampedWallElapsedMs * playbackSpeed).roundToLong()
+        val next = maxOf(lastPresentationMs, anchorPosMs + elapsedMediaMs).coerceIn(0L, upper)
+        lastPresentationMs = next
+        return next
+    }
+
+    fun diagnostics(): PlaybackClockDiagnostics = PlaybackClockDiagnostics(
+        authoritativeMediaMs = authoritativeMediaMs,
+        presentationClockMs = lastPresentationMs,
+        lastCorrectionDeltaMs = lastCorrectionDeltaMs,
+        suppressedBackwardJitters = suppressedBackwardJitters,
+        stallExtrapolationClamps = stallExtrapolationClamps,
+        hardDiscontinuityResets = hardDiscontinuityResets,
+        isMediaStalled = mediaStalled,
+    )
+
+    companion object {
+        const val FORWARD_DISCONTINUITY_THRESHOLD_MS = 420L
+        const val BACKWARD_DISCONTINUITY_THRESHOLD_MS = 380L
+        const val LOCAL_BACKWARD_JITTER_TOLERANCE_MS = 85L
+        const val MAX_FORWARD_HOLD_MS = 260L
+        const val MAX_REMOTE_EXTRAPOLATION_MS = 320L
     }
 }
 

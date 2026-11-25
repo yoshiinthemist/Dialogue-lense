@@ -725,9 +725,14 @@ class SubtitlePreGenerator(
                         )
                     }
                     val paced = SubtitleParser.applyReadingPacingGuardrails(windowEvents)
-                    val mergeReport = LookaheadWindowPlanner.mergeWindowDialogueEventsWithReport(
+                    val antiEchoed = LookaheadWindowPlanner.filterEchoedOpeningCues(
                         existing = workingProj.dialogueEvents,
                         incoming = paced,
+                        windowStartMs = sliceStartMs,
+                    )
+                    val mergeReport = LookaheadWindowPlanner.mergeWindowDialogueEventsWithReport(
+                        existing = workingProj.dialogueEvents,
+                        incoming = antiEchoed,
                         windowStartMs = sliceStartMs,
                         windowEndMs = sliceEndMs,
                     )
@@ -756,14 +761,26 @@ class SubtitlePreGenerator(
                 completed.verifiedDialogueRanges.forEach { (vs, ve) ->
                     val sMs = vs * 1000L
                     val eMs = minOf(workingProj.videoSource.durationMs, ve * 1000L)
-                    val count = completed.cues.count { it.startMs in sMs until eMs }
-                    ledger.recordOutcome(
-                        startMs = sMs,
-                        endMs = eMs,
-                        status = CoverageStatus.VERIFIED_DIALOGUE,
-                        source = SubtitleSourceKind.AI_DRAFT,
-                        dialogueCount = count,
-                    )
+                    val count = workingProj.dialogueEvents.count { it.startTimeMs in sMs until eMs }
+                    if (count > 0) {
+                        ledger.recordOutcome(
+                            startMs = sMs,
+                            endMs = eMs,
+                            status = CoverageStatus.VERIFIED_DIALOGUE,
+                            source = SubtitleSourceKind.AI_DRAFT,
+                            dialogueCount = count,
+                        )
+                    } else {
+                        ledger.recordOutcome(
+                            startMs = sMs,
+                            endMs = eMs,
+                            status = CoverageStatus.FAILED,
+                            source = SubtitleSourceKind.AI_DRAFT,
+                            dialogueCount = 0,
+                            failureReason = "ECHO_OR_EMPTY_SLICE_REJECTED",
+                            incrementRetry = true,
+                        )
+                    }
                 }
                 completed.verifiedSilentRanges.forEach { (vs, ve) ->
                     ledger.recordOutcome(
@@ -788,6 +805,26 @@ class SubtitlePreGenerator(
                         incrementRetry = true,
                     )
                 }
+                ledger.intervalsSnapshot()
+                    .filter { interval ->
+                        interval.status == CoverageStatus.IN_PROGRESS &&
+                            interval.startMs < sliceEndMs &&
+                            interval.endMs > sliceStartMs
+                    }
+                    .forEach { stranded ->
+                        val overlapStart = maxOf(stranded.startMs, sliceStartMs)
+                        val overlapEnd = minOf(stranded.endMs, sliceEndMs)
+                        if (overlapEnd > overlapStart) {
+                            ledger.recordOutcome(
+                                startMs = overlapStart,
+                                endMs = overlapEnd,
+                                status = CoverageStatus.FAILED,
+                                source = SubtitleSourceKind.AI_DRAFT,
+                                failureReason = "UNCOMMITTED_WINDOW_SLICE_RECOVERABLE",
+                                incrementRetry = true,
+                            )
+                        }
+                    }
                 // Defensive guard: if slice still remains IN_PROGRESS (no verified/failed ranges emitted), mark FAILED
                 val stillInProgress = ledger.intervalsSnapshot().any {
                     it.status == CoverageStatus.IN_PROGRESS &&

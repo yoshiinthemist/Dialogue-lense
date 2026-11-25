@@ -219,6 +219,8 @@ class HierarchicalContextEngine {
         val isCutFrame = snapshot.visualCutDetected
         val hasFaces = snapshot.faces.isNotEmpty()
         val coordinatesNowValid = hasFaces && (!isCutFrame || snapshot.cutDistance < 0.35f)
+        val confirmedEmptyFrame = snapshot.hasLiveVisionSignal && !hasFaces &&
+            (isCutFrame || snapshot.emptyFrameConsecutiveCount >= LiveStageFaceTracker.CONFIRMED_EMPTY_FRAME_STREAK)
 
         sceneMemory = prev.copy(
             sceneEpoch = nextEpoch,
@@ -226,7 +228,7 @@ class HierarchicalContextEngine {
             lastVisualCutMs = if (isCutFrame) playbackMs else prev.lastVisualCutMs,
             hasLiveVisionSignal = snapshot.hasLiveVisionSignal,
             visibleFaces = snapshot.faces,
-            liveFrameObservedEmpty = snapshot.hasLiveVisionSignal && !hasFaces,
+            liveFrameObservedEmpty = confirmedEmptyFrame,
             coordinatesValidated = coordinatesNowValid,
             isReactionOrCutaway = false,
         )

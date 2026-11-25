@@ -133,6 +133,7 @@ fun SpeechBalloonView(
     faceExclusionRects: List<NormalizedRect> = emptyList(),
     occupiedBubbleRects: List<Rect> = emptyList(),
     onPixelBoundsResolved: (Rect) -> Unit = {},
+    onMeasuredNormalizedSize: (Float, Float) -> Unit = { _, _ -> },
     onClick: () -> Unit,
     onDragCommit: (NormalizedPoint) -> Unit,
     modifier: Modifier = Modifier,
@@ -157,6 +158,7 @@ fun SpeechBalloonView(
     val activePreset = if (style.highContrastMode) BubbleVisualStyle.STREAMING_CLEAN else style.visualStyle
     val isManga = activePreset == BubbleVisualStyle.MANGA_INK
     val isCinemaSubtle = activePreset == BubbleVisualStyle.CINEMA_SUBTLE
+    val isReadingComfort = activePreset == BubbleVisualStyle.READING_COMFORT
 
     val isSpecialNonSpoken = event.dialogueType == DialogueType.NARRATION ||
         event.dialogueType == DialogueType.VOICE_OVER ||
@@ -214,7 +216,8 @@ fun SpeechBalloonView(
     val baseLeftPx = (desiredCenterX - actualW * 0.5f).coerceIn(safeMarginX, maxLeftPx)
     val baseTopPx = (desiredCenterY - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
 
-    // Real-pixel face & sibling-bubble repulsion guarantee: scan open 2D space freely so wrapped lines never clip faces or neighbors
+    // DialogueLens 2.0 Single-Authority Positioning: trust BalloonLayoutEngine's committed rect;
+    // only run emergency pixel escape if an actual severe face or sibling overlap occurs.
     val (bubbleLeftPx, bubbleTopPx) = if (
         measuredSize != IntSize.Zero &&
         (faceExclusionRects.isNotEmpty() || occupiedBubbleRects.isNotEmpty()) &&
@@ -243,7 +246,7 @@ fun SpeechBalloonView(
     val actualCenterX = bubbleLeftPx + actualW * 0.5f
     val actualCenterY = bubbleTopPx + actualH * 0.5f
 
-    LaunchedEffect(event.id, measuredSize, bubbleLeftPx, bubbleTopPx) {
+    LaunchedEffect(event.id, measuredSize, bubbleLeftPx, bubbleTopPx, containerWidthPx, containerHeightPx) {
         if (measuredSize != IntSize.Zero) {
             onPixelBoundsResolved(
                 Rect(
@@ -253,10 +256,17 @@ fun SpeechBalloonView(
                     bottom = bubbleTopPx + actualH,
                 )
             )
+            if (containerWidthPx > 0f && containerHeightPx > 0f) {
+                onMeasuredNormalizedSize(
+                    (actualW / containerWidthPx).coerceIn(0.06f, 0.88f),
+                    (actualH / containerHeightPx).coerceIn(0.04f, 0.48f),
+                )
+            }
         }
     }
 
     val showPointerTail = style.showTail &&
+        !isReadingComfort &&
         !isSpecialNonSpoken &&
         !placed.isOffScreenEdge &&
         !placed.isAmbiguousFallback &&
@@ -417,8 +427,11 @@ private fun UnifiedBalloonBody(
 
     val colorAnimSpec = if (style.reducedMotion) snap<Color>() else tween<Color>(durationMillis = 220)
 
+    val isReadingComfort = style.visualStyle == BubbleVisualStyle.READING_COMFORT && !style.highContrastMode
+
     val rawFillColor = when {
         style.highContrastMode -> BalloonHighContrastSurface.copy(alpha = 0.98f)
+        isReadingComfort -> Color(0xFF151C24).copy(alpha = style.balloonOpacity.coerceAtLeast(0.92f))
         isSilentTsubuyaki -> CinemaWhisperScrim.copy(alpha = (adaptiveOpacity * 0.88f).coerceIn(0.62f, 0.86f))
         placed.isAmbiguousFallback -> Color(0xFF1E293B).copy(alpha = 0.92f)
         isCinemaSubtle -> when {
@@ -445,6 +458,7 @@ private fun UnifiedBalloonBody(
 
     val textColor = when {
         style.highContrastMode -> BalloonHighContrastInk
+        isReadingComfort -> Color(0xFFF3F1EC)
         isSilentTsubuyaki -> Color(0xFFE2E8F0)
         placed.isAmbiguousFallback -> Color(0xFFF8FAFC)
         isCinemaSubtle -> Color(0xFFF8FAFC)
@@ -455,6 +469,7 @@ private fun UnifiedBalloonBody(
 
     val subTextColor = when {
         style.highContrastMode -> Color(0xFFE2E8F0)
+        isReadingComfort -> Color(0xFFCBD5E1)
         isCinemaSubtle || isSilentTsubuyaki || placed.isAmbiguousFallback -> Color(0xFFCBD5E1)
         isManga -> MangaSubtleInk
         textColor == BalloonLightInk -> BalloonLightSubtleInk
@@ -467,6 +482,7 @@ private fun UnifiedBalloonBody(
         isSelected -> MaterialTheme.colorScheme.primary
         isUnknownSpeaker -> UnknownSpeakerGray.copy(alpha = if (isEditMode) 0.96f else 0.88f)
         style.highContrastMode -> BalloonHighContrastBorder
+        isReadingComfort -> speakerAccent.copy(alpha = 0.82f)
         isNonSpeakerBubble -> NonSpeakerBubbleWhite.copy(
             alpha = when {
                 isManga -> 0.94f
@@ -485,6 +501,7 @@ private fun UnifiedBalloonBody(
     )
 
     val innerPadH = when {
+        isReadingComfort -> 14.dp
         isSilentTsubuyaki -> 12.dp
         isHighEnergyShout -> 13.dp
         isCinemaSubtle -> 12.dp
@@ -492,6 +509,7 @@ private fun UnifiedBalloonBody(
         else -> 10.dp
     }
     val innerPadV = when {
+        isReadingComfort -> 8.dp
         isSilentTsubuyaki -> 5.dp
         isHighEnergyShout -> 7.dp
         isCinemaSubtle -> 6.5.dp
@@ -1593,9 +1611,13 @@ private fun resolveFaceSafePixelPosition(
         return total
     }
 
-    if (sumOverlap(facePixels, baseLeftPx, baseTopPx) <= 1f &&
-        sumOverlap(siblingPixels, baseLeftPx, baseTopPx) <= 1f
-    ) {
+    // Emergency-only gate (DialogueLens 2.0 Section 21C):
+    // BalloonLayoutEngine is the single authoritative layout engine; only escape here if a
+    // measured bubble severely overlaps a live face (>14% bubble area) or sibling (>18% bubble area).
+    val bubbleArea = (actualW * actualH).coerceAtLeast(1f)
+    val baseFaceOverlapFrac = sumOverlap(facePixels, baseLeftPx, baseTopPx) / bubbleArea
+    val baseSiblingOverlapFrac = sumOverlap(siblingPixels, baseLeftPx, baseTopPx) / bubbleArea
+    if (baseFaceOverlapFrac <= 0.14f && baseSiblingOverlapFrac <= 0.18f) {
         return baseLeftPx to baseTopPx
     }
 

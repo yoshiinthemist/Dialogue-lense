@@ -81,6 +81,7 @@ class ProjectStore(private val context: Context) {
         val CHARACTER_COLOR_MEMORY = stringPreferencesKey("character_color_memory_json")
         val GLOSSARY_MEMORY = stringPreferencesKey("series_glossary_memory_json")
         val QUOTA_SAVER_MODE = stringPreferencesKey("quota_saver_mode")
+        val HAS_COMPLETED_ONBOARDING = booleanPreferencesKey("has_completed_onboarding_v2")
     }
 
     private val defaultStyle = BalloonStyleSettings()
@@ -133,6 +134,16 @@ class ProjectStore(private val context: Context) {
     val quotaSaverModeFlow: Flow<QuotaSaverMode> = context.settingsDataStore.data.map { prefs ->
         val raw = prefs[Keys.QUOTA_SAVER_MODE]
         QuotaSaverMode.entries.firstOrNull { it.name == raw } ?: QuotaSaverMode.PRO_ACCURACY
+    }
+
+    val hasCompletedOnboardingFlow: Flow<Boolean> = context.settingsDataStore.data.map { prefs ->
+        prefs[Keys.HAS_COMPLETED_ONBOARDING] ?: false
+    }
+
+    suspend fun saveOnboardingCompleted(completed: Boolean) {
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.HAS_COMPLETED_ONBOARDING] = completed
+        }
     }
 
     suspend fun saveQuotaSaverMode(mode: QuotaSaverMode) {
