@@ -241,6 +241,10 @@ class PlaybackSmokeTest {
             val captions = fixture("two-lines.srt")
             onPlayer { attachSubtitleFileToCurrentProject(captions, "two-lines.srt") }
             waitForPlayer("file attached to direct stream") { uiState.value.coverageSummary.isFullyVerified }
+            onPlayer {
+                assertEquals("The sidecar must cover the observed transport duration",
+                    exoPlayer.duration, uiState.value.coverageSummary.totalDurationMs)
+            }
             onPlayer { seekTo(7_800L); togglePlayPause() }
             waitForPlayer("direct HTTP playback and matching second cue") {
                 exoPlayer.isPlaying && exoPlayer.currentPosition in 8_000L..9_400L &&

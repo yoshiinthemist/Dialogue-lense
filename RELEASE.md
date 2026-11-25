@@ -1,10 +1,10 @@
 # Building DialogueLens for Android
 
-DialogueLens 2.0.0 uses version code 29 and application ID `com.aistudio.dialoguelens.vkpzmx`. The Gradle wrapper pins Gradle 9.3.1 and verifies its distribution checksum. Use JDK 21 and Android SDK platform 36.1 with build tools 36.0.0.
+DialogueLens 2.0.0 uses version code 30 and application ID `com.aistudio.dialoguelens.vkpzmx`. The Gradle wrapper pins Gradle 9.3.1 and verifies its distribution checksum. Use JDK 21 and Android SDK platform 36.1 with build tools 36.0.0.
 
 ## Build the Play update in the existing Google AI Studio project
 
-This project is developed in Google AI Studio and synced to GitHub. After the verified pull request is merged, open the existing DialogueLens app in Studio, pull the changes from its connected GitHub repository and check that `app/build.gradle.kts` shows version `2.0.0` and code `29`. The original Studio project holds the app's signing identity and Firebase integration.
+This project is developed in Google AI Studio and synced to GitHub. After the verified pull request is merged, open the existing DialogueLens app in Studio, pull the changes from its connected GitHub repository and check that `app/build.gradle.kts` shows version `2.0.0` and code `30`. The original Studio project holds the app's signing identity and Firebase integration.
 
 Use **Settings → Publish → Publish to Play Store** in Studio to send the update to internal testing. Install it over the current Play version, run the media checks below and confirm that saved projects survive. Production promotion happens in Play Console after the internal checks pass.
 

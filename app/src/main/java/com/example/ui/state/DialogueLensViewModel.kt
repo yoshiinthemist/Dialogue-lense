@@ -4,6 +4,7 @@ import android.app.Application
 import android.net.Uri
 import android.util.Base64
 import android.util.Log
+import androidx.annotation.MainThread
 import com.example.domain.analysis.AudioAnalyzer
 import com.example.domain.analysis.AutoSelfHealDetector
 import com.example.domain.analysis.CoverageSummary
@@ -963,15 +964,33 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         else -> observedDurationMs
     }
 
+    private fun recordViewerDuration(project: DialogueLensProject, duration: Long) {
+        if (duration <= 0L || duration == observedDurationMs) return
+        observedDurationMs = duration
+        coverageLedger.reconcileMediaDuration(duration, project.dialogueEvents, project.subtitleSource)
+        _uiState.update { current ->
+            current.copy(project = current.project.copy(
+                videoSource = current.project.videoSource.copy(durationMs = duration),
+                coverageIntervals = coverageLedger.intervalsSnapshot(),
+            ))
+        }
+        syncCoverageUiState()
+    }
+
     /** The only source of app-issued viewer play/pause commands. */
     private fun reconcileReadiness() {
         val state = _uiState.value
         val kind = state.project.videoSource.kind
+        val duration = knownDuration(state)
+        if (kind == VideoSourceKind.LOCAL_MP4 && isActiveLocalViewer() && duration != null &&
+            exoPlayer.currentMediaItem?.localConfiguration?.uri?.toString() == state.project.videoSource.uriString) {
+            recordViewerDuration(state.project, duration)
+        }
         val position = readiness.pendingTargetMs ?: state.currentTimeMs
         val lead = coverageLedger.verifiedLeadMs(position)
         val result = readiness.evaluate(
             positionMs = position,
-            durationMs = knownDuration(state),
+            durationMs = duration,
             speed = state.playbackSpeed,
             verifiedLeadMs = lead,
             needsDialogue = kind != VideoSourceKind.DEMO_SCENARIO && state.displayMode != CaptionDisplayMode.OFF,
@@ -997,7 +1016,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             cur.copy(
                 playbackPhase = result.phase, readinessSnapshot = readiness.snapshot(), viewerWantsPlay = readiness.wantsPlay,
                 playbackGeneration = readiness.generation, seekUnacknowledged = readiness.pendingTargetMs != null,
-                verifiedLeadMs = lead, resumeTargetMs = result.minimumLeadMs, playbackDurationMs = knownDuration(state), playerCanSeek = canSeek,
+                verifiedLeadMs = lead, resumeTargetMs = result.minimumLeadMs, playbackDurationMs = duration, playerCanSeek = canSeek,
                 isScoutCatchUpBuffering = holding,
                 isPlaying = when {
                     cmd == false -> false
@@ -1145,17 +1164,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         if (!appVisible || state.project.id != projectId || (kind != VideoSourceKind.YOUTUBE_COMPLIANT && kind != VideoSourceKind.WEB_STREAM)) return
         val playSeq = state.streamPlayRequest?.first ?: 0
         val pos = sample.positionMs.coerceAtLeast(0L)
-        if (sample.durationMs > 0L && sample.durationMs != observedDurationMs) {
-            observedDurationMs = sample.durationMs
-            val duration = sample.durationMs
-            val project = state.project
-            if (project.subtitleSource in setOf(SubtitleSourceKind.UPLOADED_FILE, SubtitleSourceKind.EMBEDDED_TRACK)
-                && project.dialogueEvents.isNotEmpty()) {
-                coverageLedger.markAuthoritativeTrack(duration, project.dialogueEvents, project.subtitleSource)
-            } else coverageLedger.updateDuration(duration)
-            _uiState.update { it.copy(project = it.project.copy(videoSource = it.project.videoSource.copy(durationMs = duration))) }
-            syncCoverageUiState()
-        }
+        recordViewerDuration(state.project, sample.durationMs)
         val settled = sample.transport in setOf(MediaTransport.PAUSED, MediaTransport.PLAYING, MediaTransport.ENDED)
         val seeking = readiness.pendingTargetMs != null
         if (sample.playSequence != playSeq || !readiness.acknowledge(sample.seekSequence, pos, settled)) return
@@ -2622,12 +2631,15 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 scoutFailedSliceCount = 0,
                 coverageSummary = CoverageSummary(),
                 transcriptDiagnostics = TranscriptDiagnostics(),
-                statusBanner = "Loaded interactive 2-speaker Demo Scenario",
+                mediaCapabilities = MediaSourceAdapterRegistry.default.capabilitiesFor(demo.videoSource),
+                statusBanner = null,
             )
         }
+        reconcileReadiness()
         recomputeBalloons()
     }
 
+    @MainThread
     fun createProjectFromMedia(
         videoUri: Uri,
         videoTitle: String,
@@ -2735,9 +2747,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     emptyList()
                 }
 
+                val displayName = videoTitle.ifBlank {
+                    if (videoUri.scheme == "content") projectStore.documentName(videoUri, "Local video") else "Uploaded Video"
+                }
                 val newProject = DialogueLensProject(
                     id = "proj_${System.currentTimeMillis()}",
-                    title = videoTitle.ifBlank { "Uploaded Video" },
+                    title = displayName,
                     createdAtEpochMs = System.currentTimeMillis(),
                     sourceLanguage = sourceLanguage,
                     targetLanguage = targetLanguage,
@@ -2746,7 +2761,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     qualityMode = qualityMode,
                     videoSource = VideoSource(
                         uriString = videoUri.toString(),
-                        displayName = videoTitle,
+                        displayName = displayName,
                         kind = VideoSourceKind.LOCAL_MP4,
                         durationMs = durationMs,
                         width = metadata.width,
@@ -3936,14 +3951,16 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    fun attachSubtitleFileToCurrentProject(uri: Uri, fileName: String) {
+    fun attachSubtitleFileToCurrentProject(uri: Uri, fileName: String = "") {
         val sessionToken = activeSessionToken.get()
         viewModelScope.launch {
             try {
+                val displayName = fileName.ifBlank { projectStore.documentName(uri, "subtitles.srt") }
                 val raw = projectStore.readTextFromUri(uri).getOrThrow()
-                val cues = SubtitleParser.parse(raw, fileName)
+                if (!isCurrentSession(sessionToken)) return@launch
+                val cues = SubtitleParser.parse(raw, displayName)
                 if (cues.isEmpty()) {
-                    _uiState.update { it.copy(statusBanner = "No valid SRT/VTT/ASS cues found in $fileName") }
+                    _uiState.update { it.copy(statusBanner = "No valid SRT/VTT/ASS cues found in $displayName") }
                     return@launch
                 }
                 if (!isCurrentSession(sessionToken)) return@launch
@@ -3977,10 +3994,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     existingSpeakers = current.speakers,
                     rememberedCharacterColors = _uiState.value.characterColorMemory,
                 )
-                val effectiveDur = maxOf(
+                val effectiveDur = knownDuration(_uiState.value) ?: maxOf(
                     current.videoSource.durationMs,
                     attributed.maxOfOrNull { it.endTimeMs } ?: 0L,
-                ).coerceAtLeast(1_000L)
+                )
                 coverageLedger.markAuthoritativeTrack(
                     durationMs = effectiveDur,
                     events = attributed,
@@ -3995,7 +4012,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 )
                 updateProject(
                     updated,
-                    banner = "Loaded ${cues.size} authoritative cues from $fileName",
+                    banner = "Loaded ${cues.size} authoritative cues from $displayName",
                 )
                 syncCoverageUiState()
                 _uiState.update {
@@ -4005,10 +4022,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         scoutCaptionState = ScoutCaptionState.Ready("Attached", attributed.size, speakers.size),
                     )
                 }
+                reconcileReadiness()
                 if (updated.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT) {
                     persistYouTubeVideoCache(updated, coverageLedger.continuousVerifiedUpToMs(), sessionToken)
                 }
             } catch (e: Exception) {
+                if (!isCurrentSession(sessionToken)) return@launch
                 Log.e(TAG, "Failed attaching subtitle file", e)
                 _uiState.update {
                     it.copy(analysisStatus = AnalysisStatus.Error(e.localizedMessage ?: "Subtitle load failed."))

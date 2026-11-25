@@ -195,6 +195,18 @@ class TranscriptCoverageLedger(
         }
     }
 
+    /** The decoder can learn the runtime after file import or after the last timed subtitle.
+     * A complete track covers its quiet tail. Partial and generated tracks still require evidence there.
+     */
+    fun reconcileMediaDuration(durationMs: Long, events: List<DialogueEvent>, source: SubtitleSourceKind) {
+        if (durationMs <= 0L) return
+        if (events.isNotEmpty() && (source == SubtitleSourceKind.UPLOADED_FILE || source == SubtitleSourceKind.EMBEDDED_TRACK)) {
+            markAuthoritativeTrack(durationMs, events, source)
+        } else {
+            updateDuration(durationMs)
+        }
+    }
+
     fun updateActiveSource(source: SubtitleSourceKind) {
         synchronized(lock) {
             if (sourcePriority(source) >= sourcePriority(activeSource) || intervals.none { it.verified }) {

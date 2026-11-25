@@ -1,8 +1,6 @@
 package com.example.ui.setup
 
 import android.content.Context
-import android.net.Uri
-import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -29,18 +27,7 @@ import com.example.domain.media.MediaProviderKind
 import com.example.domain.media.MediaSourceAdapterRegistry
 import com.example.ui.player.formatBeaconTimestamp
 import com.example.ui.state.DialogueLensViewModel
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import com.example.ui.theme.LensMint
-
-internal fun Context.documentName(uri: Uri, fallback: String): String {
-    return runCatching {
-        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) cursor.getString(0) else null
-        }
-    }.getOrNull() ?: fallback
-}
 
 @Composable
 internal fun WatchHome(
@@ -62,11 +49,9 @@ internal fun WatchHome(
     val supported = resolved?.isSupported == true && resolved.providerKind in setOf(
         MediaProviderKind.YOUTUBE_EMBED, MediaProviderKind.HTML5_WEB_EMBED, MediaProviderKind.DIRECT_MEDIA_URL,
     )
-    val scope = rememberCoroutineScope()
     val localVideo = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) scope.launch {
-            val title = withContext(Dispatchers.IO) { context.documentName(uri, "Local video") }
-            viewModel.createProjectFromMedia(uri, title, null, "", "Auto-Detect", language,
+        if (uri != null) {
+            viewModel.createProjectFromMedia(uri, "", null, "", "Auto-Detect", language,
                 TranslationMode.NATURAL, SubtitleSourceKind.EMBEDDED_TRACK, ProcessingQualityMode.BALANCED)
         }
     }

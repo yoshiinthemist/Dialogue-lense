@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
@@ -368,6 +369,19 @@ class ProjectStore(private val context: Context) {
                 throw t
             }
         }
+    }
+
+    suspend fun documentName(uri: Uri, fallback: String): String = withContext(Dispatchers.IO) {
+        val name = try {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+        name?.takeIf { it.isNotBlank() } ?: fallback
     }
 
     suspend fun readTextFromUri(uri: Uri): Result<String> = withContext(Dispatchers.IO) {

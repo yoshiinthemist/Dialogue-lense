@@ -16,6 +16,7 @@ import java.io.File
 import org.junit.Assert.assertTrue
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -32,6 +33,13 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class WatchHealingUiTest {
     @get:Rule val ui = createAndroidComposeRule<MainActivity>()
+
+    private fun tapPause() {
+        if (ui.onAllNodesWithText("Show controls").fetchSemanticsNodes().isNotEmpty()) {
+            ui.onNodeWithText("Show controls").assertIsDisplayed().performClick()
+        }
+        ui.onNodeWithContentDescription("Pause").assertIsDisplayed().performClick()
+    }
 
     @Test
     fun tourIsOptionalSkippableAndReplayable() {
@@ -81,9 +89,9 @@ class WatchHealingUiTest {
             if (instrumentation.targetContext.resources.configuration.screenHeightDp < 500) {
                 assertTrue("Landscape controls must lie within the video stage", videoBox.contains(transport.fetchSemanticsNode().boundsInRoot.center))
             }
-            transport.performClick()
+            ui.onNodeWithContentDescription("Play").assertIsDisplayed().performClick()
             ui.waitUntil(10_000) { model.uiState.value.isPlaying && model.uiState.value.currentTimeMs > 350L }
-            transport.performClick()
+            tapPause()
             ui.waitUntil(5_000) { model.uiState.value.playbackPhase == PlaybackPhase.USER_PAUSED }
             ui.onNodeWithContentDescription("Fullscreen").performClick()
             ui.onNodeWithContentDescription("Exit fullscreen").assertIsDisplayed().performClick()
@@ -100,10 +108,14 @@ class WatchHealingUiTest {
         ui.onNodeWithText("Try the demo").performClick()
         ui.onNodeWithTag("heal_this_moment_button").assertDoesNotExist()
 
-        ui.onNodeWithTag("toggle_play_pause_button").performClick()
-        ui.waitUntil(5_000) { model.uiState.value.viewerWantsPlay }
+        val start = model.uiState.value.currentTimeMs
+        ui.onNodeWithContentDescription("Play").assertIsDisplayed().performClick()
+        ui.waitUntil(5_000) {
+            val state = model.uiState.value
+            state.viewerWantsPlay && state.isPlaying && state.currentTimeMs > start
+        }
         ui.onNodeWithTag("heal_this_moment_button").assertDoesNotExist()
-        ui.onNodeWithTag("toggle_play_pause_button").performClick()
+        tapPause()
         ui.waitUntil(5_000) { model.uiState.value.playbackPhase == PlaybackPhase.USER_PAUSED }
         val pausedAt = model.uiState.value.currentTimeMs
         ui.onNodeWithTag("heal_this_moment_button").assertIsDisplayed().performClick()

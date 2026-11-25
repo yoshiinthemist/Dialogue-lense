@@ -66,8 +66,6 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import com.example.ui.setup.MediaLibrary
 import com.example.ui.setup.WatchHome
-import kotlinx.coroutines.launch
-import com.example.ui.setup.documentName
 import com.example.ui.setup.TARGET_LANGUAGES
 import com.example.ui.player.WatchControls
 import com.example.ui.player.PlaybackNotice
@@ -154,7 +152,6 @@ fun DialogueLensScreen(
     val accessibility = androidx.compose.ui.platform.LocalAccessibilityManager.current
     val snackbar = remember { androidx.compose.material3.SnackbarHostState() }
     val context = androidx.compose.ui.platform.LocalContext.current
-    val appScope = androidx.compose.runtime.rememberCoroutineScope()
     val view = androidx.compose.ui.platform.LocalView.current
     DisposableEffect(fullscreen, view) {
         val window = (context as? android.app.Activity)?.window
@@ -165,13 +162,18 @@ fun DialogueLensScreen(
         }
         onDispose { if (fullscreen) bars?.show(androidx.core.view.WindowInsetsCompat.Type.systemBars()) }
     }
+    var captionPickerSession by rememberSaveable { mutableStateOf<Long?>(null) }
     val attachCaptions = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) appScope.launch {
-            val name = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { context.documentName(uri, "subtitles.srt") }
-            viewModel.attachSubtitleFileToCurrentProject(uri, name)
+        val selectedSession = captionPickerSession
+        captionPickerSession = null
+        if (uri != null && selectedSession == viewModel.uiState.value.playbackSessionId) {
+            viewModel.attachSubtitleFileToCurrentProject(uri)
         }
     }
-    fun attach() = attachCaptions.launch(arrayOf("text/*", "application/x-subrip", "application/octet-stream", "*/*"))
+    fun attach() {
+        captionPickerSession = viewModel.uiState.value.playbackSessionId
+        attachCaptions.launch(arrayOf("text/*", "application/x-subrip", "application/octet-stream", "*/*"))
+    }
     LaunchedEffect(state.project.id) {
         showIntake = false
         showAdvancedImport = false
@@ -405,7 +407,7 @@ fun DialogueLensScreen(
                 }
             }
             Scaffold(modifier = Modifier.weight(1f), contentWindowInsets = WindowInsets.safeDrawing,
-                containerColor = CinemaObsidian, snackbarHost = { SnackbarHost(snackbar) },
+                containerColor = CinemaObsidian, snackbarHost = { if (!playbackVisible) SnackbarHost(snackbar) },
                 bottomBar = {
                     if (!useRail && !fullscreen) NavigationBar(containerColor = CinemaSurface, modifier = Modifier.testTag("compact_navigation_bar")) {
                         tabs.forEach { (tab, label, icon) ->
@@ -540,6 +542,9 @@ fun DialogueLensScreen(
                                     Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth(), contentAlignment = Alignment.Center) {
                                         transportControls()
                                     }
+                                }
+                                if (playbackVisible) {
+                                    SnackbarHost(snackbar, Modifier.align(Alignment.TopCenter))
                                 }
                             }
                             if (stageVisible && !nativeOverlay) transportControls()
