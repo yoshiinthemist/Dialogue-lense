@@ -1,7 +1,6 @@
 package com.example.ui.setup
 
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -30,15 +29,12 @@ import com.example.domain.media.MediaProviderKind
 import com.example.domain.media.MediaSourceAdapterRegistry
 import com.example.ui.player.formatBeaconTimestamp
 import com.example.ui.state.DialogueLensViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.example.ui.theme.LensMint
 
-/** Keep a document grant when the provider permits it, so a saved project can be reopened. */
-internal fun Context.retainDocument(uri: Uri, fallback: String): String {
-    try {
-        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    } catch (_: SecurityException) {
-        // Some document providers grant session-only access.
-    }
+internal fun Context.documentName(uri: Uri, fallback: String): String {
     return runCatching {
         contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) cursor.getString(0) else null
@@ -56,18 +52,20 @@ internal fun WatchHome(
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("dialoguelens_intake", Context.MODE_PRIVATE) }
-    var language by rememberSaveable { mutableStateOf(prefs.getString("target_language", "English") ?: "English") }
+    var language by remember { mutableStateOf(prefs.getString("target_language", "English") ?: "English") }
     var chooseLanguage by remember { mutableStateOf(false) }
     var url by rememberSaveable { mutableStateOf("") }
     val resolved = remember(url) { MediaSourceAdapterRegistry.default.resolveInput(url.trim()) }
     val supported = resolved?.isSupported == true && resolved.providerKind in setOf(
         MediaProviderKind.YOUTUBE_EMBED, MediaProviderKind.HTML5_WEB_EMBED, MediaProviderKind.DIRECT_MEDIA_URL,
     )
+    val scope = rememberCoroutineScope()
     val localVideo = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) viewModel.createProjectFromMedia(
-            uri, context.retainDocument(uri, "Local video"), null, "", "Auto-Detect", language,
-            TranslationMode.NATURAL, SubtitleSourceKind.EMBEDDED_TRACK, ProcessingQualityMode.BALANCED,
-        )
+        if (uri != null) scope.launch {
+            val title = withContext(Dispatchers.IO) { context.documentName(uri, "Local video") }
+            viewModel.createProjectFromMedia(uri, title, null, "", "Auto-Detect", language,
+                TranslationMode.NATURAL, SubtitleSourceKind.EMBEDDED_TRACK, ProcessingQualityMode.BALANCED)
+        }
     }
     val recent = remember(projects) { projects.sortedByDescending { maxOf(it.lastWatchedAtEpochMs, it.createdAtEpochMs) } }
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
@@ -103,6 +101,12 @@ internal fun WatchHome(
             item {
                 Text("What do you want to watch?", style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+            }
+            if (!viewModel.uiState.value.cloudDialogueConfigured) {
+                item {
+                    Text("This build uses native or attached subtitles. For a video without captions, attach an SRT or VTT file in Import settings.",
+                        style = MaterialTheme.typography.bodyMedium)
+                }
             }
             item {
                 OutlinedTextField(value = url, onValueChange = { url = it }, singleLine = true,
@@ -245,11 +249,15 @@ private fun ProjectRow(project: DialogueLensProject, onOpen: () -> Unit, actions
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(project.title, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 val position = project.lastPlaybackPositionMs
+                val verifiedLead = remember(project.coverageIntervals, project.videoSource.durationMs, position) {
+                    com.example.domain.analysis.TranscriptCoverageLedger(project.videoSource.durationMs, project.coverageIntervals).verifiedLeadMs(position)
+                }
                 val details = buildList {
                     add(project.targetLanguage)
                     if (position > 0) add("Resume at ${formatBeaconTimestamp(position)}")
                     val attention = project.healBeacons.count { it.status == HealBeaconStatus.NEEDS_ATTENTION }
                     if (attention > 0) add("$attention to review")
+                    if (verifiedLead > 0L) add("${formatBeaconTimestamp(verifiedLead)} of dialogue prepared ahead")
                     else if (project.dialogueEvents.isNotEmpty()) add("${project.dialogueEvents.size} saved lines")
                 }
                 Text(details.joinToString(" · "), style = MaterialTheme.typography.bodySmall)

@@ -81,7 +81,6 @@ import com.example.ui.theme.CinemaElevated
 import com.example.ui.theme.CinemaObsidian
 import com.example.ui.theme.CinemaSurface
 import com.example.ui.theme.ConfidenceHighColor
-import com.example.ui.theme.ConfidenceLowColor
 import com.example.ui.theme.ConfidenceMediumColor
 import com.example.ui.theme.LensAmber
 import com.example.ui.theme.LensMint

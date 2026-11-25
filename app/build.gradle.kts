@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import com.google.gms.googleservices.GoogleServicesTask
 
 plugins {
   alias(libs.plugins.android.application)
@@ -79,6 +80,20 @@ secrets {
 }
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
+
+// Public CI exercises offline features. Release packages must ship the registered Firebase app.
+tasks.withType<GoogleServicesTask>().configureEach {
+  if (name == "processReleaseGoogleServices") {
+    missingGoogleServicesStrategy.set(MissingGoogleServicesStrategy.ERROR)
+    // The plugin omits its missing-config policy from the cache key. Isolate release
+    // output so a cached offline debug build cannot satisfy this release task.
+    inputs.property("requiresRegisteredFirebaseApp", true)
+    doFirst {
+      val configs = (this as GoogleServicesTask).googleServicesJsonFiles.get()
+      check(configs.any { it.isFile }) { "Release requires the registered app/google-services.json." }
+    }
+  }
+}
 
 // Some unused dependencies are commented out below instead of being removed.
 // This makes it easy to add them back in the future if needed.

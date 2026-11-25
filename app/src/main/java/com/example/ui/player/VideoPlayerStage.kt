@@ -1,6 +1,5 @@
 package com.example.ui.player
 
-import com.example.domain.analysis.MediaTransport
 import com.example.domain.analysis.ViewerTransportSample
 
 import androidx.annotation.OptIn
@@ -29,18 +28,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AutoAwesome
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Face
-import androidx.compose.material.icons.filled.GraphicEq
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Subtitles
-import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -50,7 +41,6 @@ import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
@@ -113,22 +103,18 @@ import com.example.data.model.NormalizedRect
 import com.example.data.model.VideoSourceKind
 import com.example.data.model.isBubbleSpeakerUnknown
 import com.example.data.project.DemoScenarioFactory
-import com.example.data.subtitle.SubtitleParser
 import com.example.domain.analysis.LiveFaceObservation
 import com.example.domain.analysis.LiveStageFaceTracker
 import com.example.domain.analysis.LiveStageFrameSnapshot
-import com.example.domain.analysis.LookaheadWindowPlanner
 import com.example.domain.analysis.SniffedWebMediaStream
 import com.example.domain.analysis.WebNavCommand
 import com.example.domain.analysis.WebNavigationState
 import com.example.domain.layout.PlacedBalloon
-import com.example.ui.state.ScoutCaptionState
 import com.example.ui.state.SpeakerGlossaryToast
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import com.example.ui.theme.CinemaObsidian
 import com.example.ui.theme.LensAmber
-import com.example.ui.theme.LensMint
 import com.example.ui.theme.LensSky
 import com.example.ui.theme.SpeakerAccentPalette
 import com.example.ui.theme.UnknownSpeakerGray
@@ -151,45 +137,26 @@ fun VideoPlayerStage(
     streamPlayRequest: Pair<Int, Boolean>? = null,
     youtubeSeekRequest: Pair<Int, Long>?,
     dualInstanceEnabled: Boolean = true,
-    hasPendingPlayIntro: Boolean = false,
     isCinemaIntroActive: Boolean = false,
-    introRemainingMs: Long = 0L,
-    introTotalDurationMs: Long = LookaheadWindowPlanner.INTRO_DURATION_MS,
-    requiredOpeningWindows: Int = 1,
-    isOpeningSpeakersReady: Boolean = false,
-    isScoutCatchUpBuffering: Boolean = false,
-    onDismissCatchUpBuffering: () -> Unit = {},
-    scoutTimeMs: Long = 0L,
-    scoutedUpToMs: Long = 0L,
-    scoutStatusText: String = "",
-    scoutCaptionState: ScoutCaptionState = ScoutCaptionState.Idle,
     activeSpeakerToast: SpeakerGlossaryToast? = null,
     onDismissSpeakerToast: () -> Unit = {},
     onOpenCastGlossary: () -> Unit = {},
     scoutPlayRequest: Pair<Int, Boolean>? = null,
     scoutSeekRequest: Pair<Int, Long>? = null,
     showScoutMonitorPip: Boolean = true,
-    onToggleScoutMonitorPip: () -> Unit = {},
-    onSkipIntro: () -> Unit = {},
-    onRetryYouTubeAiTranscript: () -> Unit = {},
-    onOpenAttachCaptions: () -> Unit = {},
-    onSwitchToZeroCloudMode: () -> Unit = {},
     displayMode: CaptionDisplayMode,
     placedBalloons: List<PlacedBalloon>,
-    scoutCompletedWindows: Int = 0,
-    scoutTotalWindows: Int = 0,
     onLiveFacesDetected: (Long, List<LiveFaceObservation>) -> Unit = { _, _ -> },
     isEditMode: Boolean,
     selectedEventId: String?,
-    onTogglePlayPause: () -> Unit,
-    onStageTap: () -> Unit = onTogglePlayPause,
+    onStageTap: () -> Unit,
     onViewerTransport: ((ViewerTransportSample) -> Unit)? = null,
     onYouTubePlaybackState: (Long, Long, Boolean) -> Unit,
     onYouTubeCaptionTrackStatus: (Int, String) -> Unit = { _, _ -> },
     onYouTubeEmbedFallback: (Int) -> Unit = {},
     onYouTubeTimedTextCaptured: (String, String, String?, String?) -> Unit = { _, _, _, _ -> },
     onWebStreamPlaybackState: (Long, Long, Boolean) -> Unit = { _, _, _ -> },
-    onWebStreamCapturedCaptions: (String) -> Unit = {},
+    onWebStreamCapturedCaptions: (String, Boolean) -> Unit = { _, _ -> },
     onWebStreamPageMetadata: (String, String, String) -> Unit = { _, _, _ -> },
     viewerWebNavCommand: WebNavCommand? = null,
     onViewerWebNavChanged: (WebNavigationState) -> Unit = {},
@@ -197,7 +164,6 @@ fun VideoPlayerStage(
     onScoutWebNavChanged: (WebNavigationState) -> Unit = {},
     scoutSessionHolder: WebStreamSessionHolder? = null,
     showScoutBrowserModal: Boolean = false,
-    onScoutYouTubePlaybackState: (Long, Long, Boolean) -> Unit = { _, _, _ -> },
     onScoutWebStreamPlaybackState: (Long, Long, Boolean) -> Unit = { _, _, _ -> },
     onScoutWebStreamDirectMediaUrl: (String) -> Unit = {},
     onWebStreamSniffedMediaStream: (SniffedWebMediaStream) -> Unit = {},
@@ -215,6 +181,7 @@ fun VideoPlayerStage(
     onQuickHealMoment: (() -> Unit)? = null,
     onLiveFrameSnapshot: ((Long, LiveStageFrameSnapshot) -> Unit)? = null,
     playbackGeneration: Int = 0,
+    onBodyRelocations: (Int) -> Unit = {},
     onDismissQuickPicker: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -775,18 +742,29 @@ fun VideoPlayerStage(
             val safeWidth = widthPx.coerceAtLeast(1f)
             val safeHeight = heightPx.coerceAtLeast(1f)
             val obstacles = activeFaceExclusions + project.textExclusionZones + activeShot?.focalExclusionZones.orEmpty()
-            val positions = remember(coordinator, visibleBodies, measured, obstacles, density) {
+            // Sample sustained speaker motion separately from cue timing and text measurement.
+            val motionSample = if (visibleBodies.any { it.tailTarget != null && it.locationConfidence >= 0.8f }) {
+                currentTimeMs / 150L
+            } else 0L
+            val positions = remember(coordinator, visibleBodies, measured, obstacles, density, motionSample) {
                 coordinator.place(
                     proposals = visibleBodies,
                     sizes = measured.mapValues { NormalizedPoint(it.value.width / safeWidth, it.value.height / safeHeight) },
                     obstacles = obstacles,
                     marginX = with(density) { 10.dp.toPx() } / safeWidth,
                     marginY = with(density) { 8.dp.toPx() } / safeHeight,
+                    presentationMs = currentTimeMs,
                 )
             }
             val visibleIds = remember(visibleBodies) { visibleBodies.mapTo(mutableSetOf()) { it.event.id } }
             LaunchedEffect(visibleIds) { sizes.keys.toList().filterNot(visibleIds::contains).forEach { sizes.remove(it) } }
+            val reportedMoves = remember(coordinator) { intArrayOf(0) }
             SideEffect {
+                val moves = coordinator.relocations
+                if (moves > reportedMoves[0]) {
+                    onBodyRelocations(moves - reportedMoves[0])
+                    reportedMoves[0] = moves
+                }
                 val classic = displayMode == CaptionDisplayMode.CLASSIC || displayMode == CaptionDisplayMode.BOTH
                 captureMasks = positions.values.toList() + if (classic && placedBalloons.isNotEmpty())
                     listOf(NormalizedRect(0f, 0.72f, 1f, 1f)) else emptyList()

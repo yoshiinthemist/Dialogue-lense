@@ -549,6 +549,19 @@ fun ProjectAndPrivacySheet(
     onDeleteCurrentProject: () -> Unit,
     onWipeAllProjects: () -> Unit,
 ) {
+    var removal by remember { mutableStateOf<String?>(null) }
+    removal?.let { action ->
+        val all = action == "all"
+        androidx.compose.material3.AlertDialog(onDismissRequest = { removal = null },
+            title = { Text(if (all) "Remove all saved projects?" else "Remove ${currentProject.title}?") },
+            text = { Text("Saved edits and repair history for ${if (all) "these projects" else "this project"} will be deleted.") },
+            dismissButton = { TextButton(onClick = { removal = null }) { Text("Cancel") } },
+            confirmButton = { TextButton(onClick = {
+                removal = null
+                if (all) onWipeAllProjects() else onDeleteCurrentProject()
+                onDismiss()
+            }) { Text("Remove") } })
+    }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -583,17 +596,17 @@ fun ProjectAndPrivacySheet(
                         Text("Where Processing Happens", style = MaterialTheme.typography.titleSmall, color = LensMint)
                     }
                     Text(
-                        text = "• On-Device Vision: Video decoding, frame sampling, shot-cut detection, and ML Kit face/mouth tracking run locally on your Android device. Raw video frames are never uploaded.",
+                        text = "Playback, face tracking and speech balloon placement run on your device.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
-                        text = "• Cloud Translation: Only subtitle dialogue text lines are sent via Firebase AI Logic (Gemini) for context-aware translation and conversational turn hints.",
+                        text = "With cloud analysis enabled, DialogueLens can send dialogue, audio clips, selected video frames, YouTube links and speaker context to Google’s Gemini service for transcription, translation and speaker matching.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
-                        text = "• Ephemeral Local Identities: Speaker labels (Speaker A–D) and face tracks stay inside this project file only. No persistent biometric identity database is ever stored, and uploaded media is never used for model training.",
+                        text = "Saved projects include dialogue, speaker labels, timing and corrections. Project exports include those details. Zero Cloud keeps dialogue analysis on your device. Online video still connects to its provider.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -731,10 +744,7 @@ fun ProjectAndPrivacySheet(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 OutlinedButton(
-                    onClick = {
-                        onDeleteCurrentProject()
-                        onDismiss()
-                    },
+                    onClick = { removal = "current" },
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
                     modifier = Modifier
                         .weight(1f)
@@ -746,13 +756,10 @@ fun ProjectAndPrivacySheet(
                 }
 
                 TextButton(
-                    onClick = {
-                        onWipeAllProjects()
-                        onDismiss()
-                    },
+                    onClick = { removal = "all" },
                     modifier = Modifier.weight(1f),
                 ) {
-                    Text("Wipe All Local Data", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                    Text("Remove all saved projects", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
                 }
             }
         }

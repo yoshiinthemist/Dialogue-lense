@@ -1,5 +1,9 @@
 package com.example.ui.player
 
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.horizontalScroll
@@ -40,20 +44,53 @@ internal fun WatchControls(
     onCast: () -> Unit,
     onOpenVideo: () -> Unit,
     onMenuVisible: (Boolean) -> Unit,
+    compact: Boolean,
+    onHide: () -> Unit,
 ) {
     var menu by remember(state.project.id) { mutableStateOf<String?>(null) }
     LaunchedEffect(menu) { onMenuVisible(menu != null) }
     val duration = state.playbackDurationMs ?: 0L
-    val seekable = state.mediaCapabilities.supportsSeeking && duration > 0
+    val seekable = state.mediaCapabilities.supportsSeeking && state.playerCanSeek && duration > 0
     var scrub by remember(state.project.id, state.playbackGeneration) { mutableStateOf<Float?>(null) }
     val context = androidx.compose.ui.platform.LocalContext.current
     val current = state.currentTimeMs
     val fraction = scrub ?: (current.toDouble() / duration.coerceAtLeast(1)).toFloat().coerceIn(0f, 1f)
     val manualMarks = remember(state.project.healBeacons) { state.project.healBeacons.filterNot { it.autoTriggered }.sortedBy { it.timestampMs } }
-    Surface(color = CinemaSurface, modifier = Modifier.fillMaxWidth()) {
+    val canMark = state.playbackPhase == PlaybackPhase.USER_PAUSED && !state.isEditMode &&
+        state.quickPickerEventId == null && state.mediaCapabilities.supportsHealBeacon
+    Surface(color = CinemaSurface.copy(alpha = if (compact) .96f else 1f), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
             if (seekable) {
-                Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxWidth()) {
+                Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxWidth()
+                    .pointerInput(manualMarks, duration) {
+                        if (manualMarks.isEmpty()) return@pointerInput
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            val inset = 10.dp.toPx()
+                            val width = (size.width - inset * 2).coerceAtLeast(1f)
+                            val mark = manualMarks.minByOrNull {
+                                kotlin.math.abs(inset + it.timestampMs.toDouble() / duration * width - down.position.x)
+                            } ?: return@awaitEachGesture
+                            val markerX = inset + mark.timestampMs.toDouble() / duration * width
+                            if (kotlin.math.abs(markerX - down.position.x) > 9.dp.toPx() ||
+                                kotlin.math.abs(down.position.y - size.height / 2f) > 12.dp.toPx()) return@awaitEachGesture
+                            down.consume()
+                            var moved = false
+                            do {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val touch = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if ((touch.position - down.position).getDistance() >= viewConfiguration.touchSlop) moved = true
+                                if (moved) scrub = ((touch.position.x - inset) / width).coerceIn(0f, 1f)
+                                touch.consume()
+                                if (!touch.pressed) {
+                                    if (moved) scrub?.let { viewModel.seekTo((it * duration).toLong()) }
+                                    else viewModel.inspectHealBeacon(mark.id)
+                                    scrub = null
+                                    break
+                                }
+                            } while (true)
+                        }
+                    }) {
                     Canvas(Modifier.fillMaxWidth().padding(horizontal = 10.dp).height(18.dp)) {
                         fun x(time: Long) = (time.toDouble() / duration).toFloat().coerceIn(0f, 1f) * size.width
                         val center = size.height / 2f
@@ -72,7 +109,9 @@ internal fun WatchControls(
                             when (it.status) {
                                 HealBeaconStatus.HEALED -> drawCircle(LensMint, r, Offset(marker, center + 2 * r))
                                 HealBeaconStatus.NEEDS_ATTENTION -> drawRect(LensAmber, Offset(marker - r, center + r), Size(2*r, 2*r))
-                                else -> drawPath(Path().apply {
+                                HealBeaconStatus.HEALING -> drawCircle(LensAmethyst, r, Offset(marker, center + 2 * r))
+                                HealBeaconStatus.UNDONE -> drawLine(InkSecondary, Offset(marker - r, center + r), Offset(marker + r, center + 3*r), 1.dp.toPx())
+                                HealBeaconStatus.MARKED -> drawPath(Path().apply {
                                     moveTo(marker, center); lineTo(marker-r, center+2*r); lineTo(marker+r, center+2*r); close()
                                 }, LensAmethyst)
                             }
@@ -84,7 +123,7 @@ internal fun WatchControls(
                         modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Playback position" }.testTag("timeline_seek_slider"))
                 }
             }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            if (!compact) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(formatBeaconTimestamp(if (scrub != null) (fraction * duration).toLong() else current), style = MaterialTheme.typography.labelMedium)
                 state.activeChapter?.let { Text(it.title, maxLines = 1, modifier = Modifier.weight(1f).padding(horizontal = 12.dp), style = MaterialTheme.typography.labelMedium) }
                 Text(if (duration > 0) formatBeaconTimestamp(duration) else "Duration unknown", style = MaterialTheme.typography.labelMedium)
@@ -118,6 +157,7 @@ internal fun WatchControls(
                 Box {
                     IconButton(onClick = { menu = "more" }) { Icon(Icons.Filled.MoreVert, "More playback options") }
                     DropdownMenu(menu == "more", { menu = null }) {
+                        DropdownMenuItem({ Text("Hide controls") }, { menu = null; onHide() })
                         DropdownMenuItem({ Text("Playback speed · ${state.playbackSpeed}×") }, { menu = null; viewModel.cyclePlaybackSpeed() })
                         DropdownMenuItem({ Text("Characters") }, { menu = null; onCast() })
                         if (manualMarks.isNotEmpty()) DropdownMenuItem({ Text("Marked moments (${manualMarks.size})") }, { menu = "marks" })
@@ -145,8 +185,12 @@ internal fun WatchControls(
                         }
                     }
                 }
+                if (compact) {
+                    Text(formatBeaconTimestamp(current), style = MaterialTheme.typography.labelMedium)
+                    if (canMark) HealThisMomentPill({ viewModel.markHealBeaconAtCurrentTime() }, isCompact = true)
+                }
             }
-            if (state.playbackPhase == PlaybackPhase.USER_PAUSED && !state.isEditMode && state.quickPickerEventId == null && state.mediaCapabilities.supportsHealBeacon) {
+            if (!compact && canMark) {
                 HealThisMomentPill({ viewModel.markHealBeaconAtCurrentTime() }, isCompact = true)
             }
         }

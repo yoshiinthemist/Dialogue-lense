@@ -1,5 +1,7 @@
 package com.example.ui.player
 
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -231,6 +233,45 @@ fun formatBeaconTimestamp(ms: Long): String {
     }
 }
 
+@Composable
+fun RepairComparison(beacon: HealBeacon) {
+    val changes = beacon.postHealSnapshotEvents
+    if (changes.isEmpty()) return
+    var index by remember(beacon.id, changes) { mutableStateOf(-1) }
+    TextButton(onClick = { index = if (index >= 0) -1 else 0 }) {
+        Text(if (index >= 0) "Close comparison" else "Review changes (${changes.size})")
+    }
+    val after = changes.getOrNull(index) ?: return
+    val before = beacon.preHealSnapshotEvents.firstOrNull { it.id == after.id }
+    val newText = after.translatedText.ifBlank { after.sourceText }
+    val oldText = before?.translatedText?.ifBlank { before.sourceText }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("Line ${index + 1} of ${changes.size} · ${formatBeaconTimestamp(after.startTimeMs)}",
+            style = MaterialTheme.typography.labelMedium)
+        when {
+            before == null -> Text("Added dialogue")
+            oldText != newText -> {
+                Text("Before", style = MaterialTheme.typography.labelSmall)
+                Text(oldText.orEmpty())
+                Text("After", style = MaterialTheme.typography.labelSmall)
+            }
+            else -> {
+                val details = buildList {
+                    if (before.startTimeMs != after.startTimeMs || before.endTimeMs != after.endTimeMs) add("Timing adjusted")
+                    if (before.speakerId != after.speakerId) add("Speaker reassigned")
+                    if (before.anchorPosition != after.anchorPosition || before.placementMode != after.placementMode) add("Position adjusted")
+                }
+                if (details.isNotEmpty()) Text(details.joinToString(" · "), style = MaterialTheme.typography.labelMedium)
+            }
+        }
+        Text(newText)
+        if (changes.size > 1) Row {
+            TextButton(enabled = index > 0, onClick = { index-- }) { Text("Previous line") }
+            TextButton(enabled = index < changes.lastIndex, onClick = { index++ }) { Text("Next line") }
+        }
+    }
+}
+
 /**
  * Contextual Bottom Sheet for inspecting, jumping to, retrying with an expanded scope, undoing,
  * or dismissing a single Heal Beacon.
@@ -260,6 +301,7 @@ fun HealBeaconDetailSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 8.dp)
                 .padding(bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -321,6 +363,8 @@ fun HealBeaconDetailSheet(
                     }
                 }
             }
+
+            RepairComparison(beacon)
 
             if (beacon.statusNote.isNotBlank()) {
                 Surface(

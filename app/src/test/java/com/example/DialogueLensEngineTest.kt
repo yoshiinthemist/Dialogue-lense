@@ -1075,11 +1075,13 @@ class DialogueLensEngineTest {
                 slot = "A",
                 displayName = "Maya",
                 isRolePlaceholder = false,
+                isVisuallyConfirmed = true,
             ),
             com.example.data.ai.AiCastSlotAssignment(
                 slot = "B",
                 displayName = "Hot Dog Vendor",
                 isRolePlaceholder = true,
+                isVisuallyConfirmed = true,
             ),
         )
 
@@ -1458,6 +1460,7 @@ class DialogueLensEngineTest {
                 slot = "A",
                 displayName = "Hot Dog Vendor",
                 isRolePlaceholder = true,
+                isVisuallyConfirmed = true,
                 rationale = "Standing behind street cart in apron",
                 visualVoiceNotes = "Red baseball cap, warm baritone voice",
             ),
@@ -1465,6 +1468,7 @@ class DialogueLensEngineTest {
                 slot = "H",
                 displayName = "Conductor",
                 isRolePlaceholder = true,
+                isVisuallyConfirmed = true,
                 rationale = "Checks tickets in carriage",
                 visualVoiceNotes = "Navy uniform, crisp tenor",
             ),
@@ -1495,6 +1499,7 @@ class DialogueLensEngineTest {
                 slot = "A",
                 displayName = "Marcus",
                 isRolePlaceholder = false,
+                isVisuallyConfirmed = true,
                 rationale = "Addressed by name: 'Thanks Marcus!'",
                 visualVoiceNotes = "Red baseball cap, warm baritone voice",
             )
@@ -2481,63 +2486,53 @@ class DialogueLensEngineTest {
     }
 
     @Test
-    fun bestModelFirstSkipsUpfrontFreeCcSearchAndCascadesToLiteThenFreeCcWhenCreditsDry() {
-        // 1. Default Best Model mode prioritizes Gemini 3.8 Flash and skips the 8-10s upfront free CC search
-        val defaultTier = com.example.domain.analysis.LookaheadWindowPlanner.initialExecutionTier(
-            quotaSaverMode = com.example.data.model.QuotaSaverMode.PRO_ACCURACY,
-            quotaCircuitBreakerTripped = false,
-        )
-        assertEquals(com.example.domain.analysis.ScoutExecutionTier.BEST_AI, defaultTier)
-        assertEquals("gemini-3.8-flash", defaultTier.modelId)
-        assertFalse(defaultTier.preferLite)
-        assertTrue(
-            com.example.domain.analysis.LookaheadWindowPlanner.shouldSkipUpfrontFreeCaptionSearch(
-                quotaSaverMode = com.example.data.model.QuotaSaverMode.PRO_ACCURACY,
-                quotaCircuitBreakerTripped = false,
-            )
-        )
+    fun nativeCaptionPolicyPreservesSourceBeforeSelectingAnAvailableFallbackTier() {
+        val planner = com.example.domain.analysis.LookaheadWindowPlanner
+        val pro = com.example.data.model.QuotaSaverMode.PRO_ACCURACY
+        val free = com.example.data.model.QuotaSaverMode.ZERO_CLOUD
+        val draft = com.example.data.model.SubtitleSourceKind.AI_DRAFT
+        val embedded = com.example.data.model.SubtitleSourceKind.EMBEDDED_TRACK
+        val cue = DemoScenarioFactory.createDemoProject().dialogueEvents.first()
+        assertTrue(planner.needsNativeTrack(draft, emptyList(), fullyVerified = false))
+        assertTrue(planner.needsNativeTrack(draft, listOf(cue), fullyVerified = false))
+        assertFalse(planner.needsNativeTrack(draft, listOf(cue), fullyVerified = true))
+        assertFalse(planner.needsNativeTrack(embedded, listOf(cue), fullyVerified = false))
+        assertTrue(planner.needsNativeTrack(embedded, emptyList(), fullyVerified = false))
+        assertEquals(pro, planner.effectiveQuotaMode(pro, cloudConfigured = true))
+        assertEquals(free, planner.effectiveQuotaMode(pro, cloudConfigured = false))
+        assertEquals(free, planner.effectiveQuotaMode(free, cloudConfigured = true))
+        val tier = planner.initialExecutionTier(pro, quotaCircuitBreakerTripped = false)
+        assertEquals(com.example.domain.analysis.ScoutExecutionTier.BEST_AI, tier)
+        val lite = planner.nextFallbackTierOnQuotaError(tier)
+        assertEquals(com.example.domain.analysis.ScoutExecutionTier.LITE_AI, lite)
+        assertEquals(com.example.domain.analysis.ScoutExecutionTier.FREE_LOCAL, planner.nextFallbackTierOnQuotaError(lite))
+    }
 
-        // 2. Credit-dry cascade steps down cleanly: BEST_AI -> LITE_AI -> FREE_LOCAL
-        val step1Fallback = com.example.domain.analysis.LookaheadWindowPlanner.nextFallbackTierOnQuotaError(defaultTier)
-        assertEquals(com.example.domain.analysis.ScoutExecutionTier.LITE_AI, step1Fallback)
-        assertEquals("gemini-3.5-flash-lite", step1Fallback.modelId)
-        assertTrue(step1Fallback.preferLite)
+    @Test
+    fun nativeCaptionsKeepVerifiedCuesAndManualCorrectionsWithTheirOriginalIds() {
+        val template = DemoScenarioFactory.createDemoProject().dialogueEvents.first()
+        fun line(id: String, start: Long, locked: Boolean = false) =
+            template.copy(id = id, startTimeMs = start, endTimeMs = start + 500L, lockedByUser = locked)
+        val old = listOf(line("verified", 0L), line("locked", 600L, true), line("edited", 1_200L), line("draft", 1_800L))
+        val native = old.map { it.copy(id = "cc-" + it.id) } + line("new", 3_000L)
+        val merged = com.example.domain.analysis.LookaheadWindowPlanner.mergeNativeTrack(
+            old, native, listOf(com.example.data.model.CoverageInterval(0L, 500L, com.example.data.model.CoverageStatus.VERIFIED_DIALOGUE)),
+            setOf("edited"),
+        )
+        assertEquals(listOf("verified", "locked", "edited", "cc-draft", "new"), merged.map { it.id })
+    }
 
-        val step2Fallback = com.example.domain.analysis.LookaheadWindowPlanner.nextFallbackTierOnQuotaError(step1Fallback)
-        assertEquals(com.example.domain.analysis.ScoutExecutionTier.FREE_LOCAL, step2Fallback)
-        assertEquals(null, step2Fallback.modelId)
-
-        // 3. Only when credits run dry (circuit breaker tripped) or Free CC Only is chosen do we run free CC search
-        assertFalse(
-            com.example.domain.analysis.LookaheadWindowPlanner.shouldSkipUpfrontFreeCaptionSearch(
-                quotaSaverMode = com.example.data.model.QuotaSaverMode.PRO_ACCURACY,
-                quotaCircuitBreakerTripped = true,
-            )
-        )
-        assertFalse(
-            com.example.domain.analysis.LookaheadWindowPlanner.shouldSkipUpfrontFreeCaptionSearch(
-                quotaSaverMode = com.example.data.model.QuotaSaverMode.ZERO_CLOUD,
-                quotaCircuitBreakerTripped = false,
-            )
-        )
-
-        // 4. Passive WebView CC must not overwrite Gemini 3.8 Flash unless credits are exhausted or Free CC Only is selected
-        assertFalse(
-            com.example.domain.analysis.LookaheadWindowPlanner.shouldAllowPassiveWebTimedTextOverride(
-                quotaSaverMode = com.example.data.model.QuotaSaverMode.PRO_ACCURACY,
-                quotaCircuitBreakerTripped = false,
-                subtitleSource = com.example.data.model.SubtitleSourceKind.BUILT_IN_DEMO,
-                events = emptyList(),
-            )
-        )
-        assertTrue(
-            com.example.domain.analysis.LookaheadWindowPlanner.shouldAllowPassiveWebTimedTextOverride(
-                quotaSaverMode = com.example.data.model.QuotaSaverMode.PRO_ACCURACY,
-                quotaCircuitBreakerTripped = true,
-                subtitleSource = com.example.data.model.SubtitleSourceKind.BUILT_IN_DEMO,
-                events = emptyList(),
-            )
-        )
+    @Test
+    fun captionAccessHonorsRestrictionsAndBindsFullTracksToTheirVideo() {
+        val fetcher = com.example.data.subtitle.YouTubeCaptionFetcher
+        val result = fetcher.extractMetaFromPlayerMap(mapOf("playabilityStatus" to mapOf("status" to "LOGIN_REQUIRED")))
+        assertTrue(result.restricted)
+        assertTrue(result.tracks.isEmpty())
+        val full = "https://www.youtube.com/api/timedtext?v=abc&lang=en"
+        assertTrue(fetcher.isWholeTrackForVideo(full, "abc"))
+        assertFalse(fetcher.isWholeTrackForVideo(full, "other"))
+        assertFalse(fetcher.isWholeTrackForVideo(full + "&sq=1", "abc"))
+        assertFalse(fetcher.isPublicCaptionUrl("https://youtube.com.user.example/api/timedtext"))
     }
 
     @Test
@@ -3221,6 +3216,7 @@ class DialogueLensEngineTest {
                 id = "spk_a",
                 defaultLabel = "Speaker A",
                 customName = "Roy Wood Jr.",
+                visualVoiceNotes = "Host at center desk, low voice",
                 accentIndex = 0,
                 isIdentityConfirmed = true,
             ),
@@ -3242,6 +3238,7 @@ class DialogueLensEngineTest {
             com.example.data.ai.AiCastSlotAssignment(
                 slot = "B",
                 displayName = "Roy Wood Jr.",
+                visualVoiceNotes = "Host at center desk, low voice",
                 isRolePlaceholder = false,
                 isVisuallyConfirmed = true,
             ),

@@ -5,6 +5,7 @@ import com.example.data.model.NormalizedPoint
 import com.example.data.model.NormalizedRect
 import com.example.data.model.PlacementMode
 import kotlin.math.abs
+import kotlin.math.hypot
 
 /** Final positions in stage coordinates. Trackers provide proposals; only this pass places measured bodies. */
 internal class MeasuredBalloonLayout {
@@ -13,6 +14,8 @@ internal class MeasuredBalloonLayout {
         val speakerId: String?,
         val mode: PlacementMode,
         val rect: NormalizedRect,
+        val committedTail: NormalizedPoint?,
+        val movementSinceMs: Long?,
     )
     private val positions = mutableMapOf<String, Commitment>()
     var relocations = 0
@@ -24,6 +27,7 @@ internal class MeasuredBalloonLayout {
         obstacles: List<NormalizedRect>,
         marginX: Float,
         marginY: Float,
+        presentationMs: Long = 0L,
     ): Map<String, NormalizedRect> {
         val active = proposals.mapTo(mutableSetOf()) { it.event.id }
         positions.keys.retainAll(active)
@@ -48,19 +52,29 @@ internal class MeasuredBalloonLayout {
                 return NormalizedRect(left, top, left + w, top + h)
             }
             val desired = body(balloon.rect.centerX, balloon.rect.centerY)
-            val previous = positions[id]?.takeIf {
+            val prior = positions[id]?.takeIf {
                 it.scene == balloon.layoutSceneKey && it.speakerId == balloon.event.speakerId &&
                     it.mode == balloon.event.placementMode
-            }?.rect?.let {
+            }
+            val previous = prior?.rect?.let {
                 if (abs(it.width - w) < 0.000001f && abs(it.height - h) < 0.000001f) it
                 else body(it.centerX, it.centerY)
             }
             fun overlap(rect: NormalizedRect): Float = occupied.sumOf { rect.intersectionArea(it).toDouble() }.toFloat() /
                 (w * h).coerceAtLeast(0.00001f)
 
+            val tail = balloon.tailTarget?.takeIf { balloon.locationConfidence >= 0.8f && !balloon.isUnknownSpeaker }
+            val origin = prior?.committedTail
+            fun distance(x: Float, y: Float, point: NormalizedPoint) = hypot(x - point.x, y - point.y)
+            val movement = tail != null && origin != null && previous != null &&
+                distance(origin.x, origin.y, tail) >= 0.30f &&
+                distance(previous.centerX, previous.centerY, tail) - distance(desired.centerX, desired.centerY, tail) >= 0.15f
+            val since = if (movement) prior?.movementSinceMs ?: presentationMs else null
+            val followSpeaker = since != null && presentationMs - since >= 350L
+
             val chosen = when {
                 balloon.event.placementMode == PlacementMode.MANUAL_OVERRIDE -> desired
-                previous != null && overlap(previous) <= 0.012f -> previous
+                previous != null && !followSpeaker && overlap(previous) <= 0.012f -> previous
                 overlap(desired) <= 0.001f -> desired
                 else -> {
                     val candidates = buildList {
@@ -83,7 +97,11 @@ internal class MeasuredBalloonLayout {
             }
             if (previous != null && (abs(chosen.centerX - previous.centerX) > 0.01f ||
                         abs(chosen.centerY - previous.centerY) > 0.01f)) relocations++
-            positions[id] = Commitment(balloon.layoutSceneKey, balloon.event.speakerId, balloon.event.placementMode, chosen)
+            val moved = previous != chosen
+            positions[id] = Commitment(
+                balloon.layoutSceneKey, balloon.event.speakerId, balloon.event.placementMode, chosen,
+                if (moved) tail else origin ?: tail, if (moved) null else since,
+            )
             result[id] = chosen
             occupied.add(chosen.expand(insetX * 0.6f, insetY * 0.6f))
         }

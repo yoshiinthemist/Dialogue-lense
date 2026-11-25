@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -60,7 +59,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -100,6 +98,7 @@ import com.example.domain.media.MediaCapabilities
 import com.example.domain.media.MediaSourceAdapterRegistry
 import com.example.ui.player.formatBeaconTimestamp
 import com.example.ui.player.healBeaconColor
+import com.example.ui.player.RepairComparison
 import com.example.ui.player.healBeaconStatusLabel
 import com.example.ui.player.healScopeLabel
 import com.example.ui.theme.CinemaElevated
@@ -1548,6 +1547,7 @@ private fun StudioHealBeaconsTab(
                             }
                         }
 
+                        RepairComparison(beacon)
                         if (beacon.statusNote.isNotBlank()) {
                             Text(
                                 text = beacon.statusNote,
@@ -1630,7 +1630,7 @@ private fun StudioChaptersTab(
                     inspection == null -> "Awaiting inspection"
                     repair != null -> "Repair · ${healBeaconStatusLabel(repair.status)}"
                     inspection.finding.isNotBlank() -> "Needs review · ${inspection.finding}"
-                    else -> "Inspected · no defect found"
+                    else -> "Transcript and pointer checks passed"
                 }
                 val sourceLabel = when (chapter.source) {
                     ChapterSource.YOUTUBE_DESCRIPTION -> "Video chapter"

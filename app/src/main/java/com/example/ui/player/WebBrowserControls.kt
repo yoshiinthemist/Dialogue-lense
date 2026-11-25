@@ -376,7 +376,7 @@ fun ScoutBrowserInspectorModal(
     scoutTimeMs: Long,
     scoutSessionHolder: WebStreamSessionHolder,
     onScoutPlaybackState: (Long, Long, Boolean) -> Unit,
-    onCapturedCaptions: (String) -> Unit,
+    onCapturedCaptions: (String, Boolean) -> Unit,
     onScoutDirectMediaUrl: (String) -> Unit,
     onScoutSniffedMediaStream: (SniffedWebMediaStream) -> Unit = {},
     onScoutAudioSlice: (Long, Long, String, String) -> Unit,

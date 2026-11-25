@@ -58,6 +58,7 @@ fun YouTubeEmbeddedPlayer(
     val latestCapturedTimedTextCallback by rememberUpdatedState(onCapturedTimedTextBody)
     val seenTimedTextUrls = remember(videoId) { mutableSetOf<String>() }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    PauseWebMediaWhenHidden(webViewRef, "window.dlPause && window.dlPause();")
     var loadedVideoId by remember { mutableStateOf<String?>(null) }
     var playerReady by remember { mutableStateOf(false) }
     var lastHandledPlaySeq by remember { mutableStateOf(0) }

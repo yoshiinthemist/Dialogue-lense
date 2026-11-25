@@ -3,7 +3,6 @@ package com.example.ui
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -15,49 +14,31 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.ArrowForward
-import androidx.compose.material.icons.filled.AddCircleOutline
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.material.icons.filled.ChatBubble
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
-import androidx.compose.material.icons.filled.FullscreenExit
-import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Palette
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.PrivacyTip
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Subtitles
-import androidx.compose.material.icons.filled.SubtitlesOff
 import androidx.compose.material.icons.filled.Translate
-import androidx.compose.material.icons.filled.TravelExplore
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.WarningAmber
@@ -65,32 +46,19 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
-import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.material3.minimumInteractiveComponentSize
-import androidx.compose.material3.rememberModalBottomSheetState
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.Button
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -98,7 +66,8 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import com.example.ui.setup.MediaLibrary
 import com.example.ui.setup.WatchHome
-import com.example.ui.setup.retainDocument
+import kotlinx.coroutines.launch
+import com.example.ui.setup.documentName
 import com.example.ui.setup.TARGET_LANGUAGES
 import com.example.ui.player.WatchControls
 import com.example.ui.player.PlaybackNotice
@@ -122,30 +91,22 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.BuildConfig
 import com.example.data.ai.AppCheckDiagnostics
-import com.example.data.ai.ScoutHeartbeatStatus
 import com.example.data.model.BubbleVisualStyle
-import com.example.data.model.CaptionDisplayMode
 import com.example.data.model.DialogueLensProject
 import com.example.data.model.HealScope
 import com.example.data.model.QuotaSaverMode
 import com.example.data.model.SpeakerLabelMode
 import com.example.data.model.TranslationMode
 import com.example.data.model.VideoSourceKind
-import com.example.data.model.isBubbleSpeakerUnknown
-import com.example.data.model.isNonSpeakerSpecificEvent
 import com.example.data.subtitle.SubtitleParser
 import com.example.ui.editor.InspectorTab
 import com.example.ui.editor.TimelineSubtitleEditor
 import com.example.ui.player.HealBeaconDetailSheet
-import com.example.ui.player.HealThisMomentPill
-import com.example.ui.player.PlayerControlsBar
-import com.example.ui.player.ReadinessStatusPill
 import com.example.ui.player.ScoutBrowserInspectorModal
 import com.example.ui.player.VideoPlayerStage
 import com.example.ui.player.WebBrowserControlStrip
 import com.example.ui.player.WebStreamSessionHolder
 import com.example.ui.settings.BalloonStyleSheet
-import com.example.ui.setup.MediaImportSheet
 import com.example.ui.setup.ProjectAndPrivacySheet
 import com.example.ui.setup.StartLauncherScreen
 import com.example.ui.setup.SubtitleExportSheet
@@ -161,9 +122,6 @@ import com.example.ui.theme.ConfidenceHighColor
 import com.example.ui.theme.LensAmber
 import com.example.ui.theme.LensMint
 import com.example.ui.theme.LensSky
-import com.example.ui.theme.NonSpeakerBubbleWhite
-import com.example.ui.theme.SpeakerAccentPalette
-import com.example.ui.theme.UnknownSpeakerGray
 import kotlinx.coroutines.delay
 
 private data class PendingSubtitleExport(
@@ -194,8 +152,22 @@ fun DialogueLensScreen(
     val accessibility = androidx.compose.ui.platform.LocalAccessibilityManager.current
     val snackbar = remember { androidx.compose.material3.SnackbarHostState() }
     val context = androidx.compose.ui.platform.LocalContext.current
+    val appScope = androidx.compose.runtime.rememberCoroutineScope()
+    val view = androidx.compose.ui.platform.LocalView.current
+    DisposableEffect(fullscreen, view) {
+        val window = (context as? android.app.Activity)?.window
+        val bars = window?.let { androidx.core.view.WindowCompat.getInsetsController(it, view) }
+        if (fullscreen) {
+            bars?.systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            bars?.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+        }
+        onDispose { if (fullscreen) bars?.show(androidx.core.view.WindowInsetsCompat.Type.systemBars()) }
+    }
     val attachCaptions = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) viewModel.attachSubtitleFileToCurrentProject(uri, context.retainDocument(uri, "subtitles.srt"))
+        if (uri != null) appScope.launch {
+            val name = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { context.documentName(uri, "subtitles.srt") }
+            viewModel.attachSubtitleFileToCurrentProject(uri, name)
+        }
     }
     fun attach() = attachCaptions.launch(arrayOf("text/*", "application/x-subrip", "application/octet-stream", "*/*"))
     LaunchedEffect(state.project.id) {
@@ -207,6 +179,10 @@ fun DialogueLensScreen(
             snackbar.showSnackbar(it)
             viewModel.clearStatusBanner()
         }
+    }
+    LaunchedEffect(state.project.id, state.playbackPhase) {
+        if (state.playbackPhase == com.example.domain.analysis.PlaybackPhase.USER_PAUSED ||
+            state.playbackPhase == com.example.domain.analysis.PlaybackPhase.PROCESSING_UNAVAILABLE) controlsVisible = true
     }
     LaunchedEffect(playbackVisible, state.isPlaying, controlsVisible, menuOpen, state.quickPickerEventId, showStyleSheet, showLanguage) {
         if (playbackVisible && state.isPlaying && controlsVisible && !menuOpen && state.quickPickerEventId == null && !showStyleSheet && !showLanguage) {
@@ -413,9 +389,11 @@ fun DialogueLensScreen(
         Triple(AppDestination.STUDIO, "Studio", Icons.Filled.Tune),
     )
     BoxWithConstraints(Modifier.fillMaxSize().background(CinemaObsidian)) {
-        val wide = maxWidth >= 760.dp
+        val compactLandscape = maxWidth > maxHeight && maxHeight < 500.dp
+        val wide = maxWidth >= 760.dp && !compactLandscape
+        val useRail = wide || compactLandscape
         Row(Modifier.fillMaxSize()) {
-            if (wide && !fullscreen) {
+            if (useRail && !fullscreen) {
                 NavigationRail(containerColor = CinemaSurface, modifier = Modifier.testTag("adaptive_navigation_rail")) {
                     tabs.forEach { (tab, label, icon) ->
                         NavigationRailItem(state.activeDestination == tab, { navigate(tab) },
@@ -427,7 +405,7 @@ fun DialogueLensScreen(
             Scaffold(modifier = Modifier.weight(1f), contentWindowInsets = WindowInsets.safeDrawing,
                 containerColor = CinemaObsidian, snackbarHost = { SnackbarHost(snackbar) },
                 bottomBar = {
-                    if (!wide && !fullscreen) NavigationBar(containerColor = CinemaSurface, modifier = Modifier.testTag("compact_navigation_bar")) {
+                    if (!useRail && !fullscreen) NavigationBar(containerColor = CinemaSurface, modifier = Modifier.testTag("compact_navigation_bar")) {
                         tabs.forEach { (tab, label, icon) ->
                             NavigationBarItem(state.activeDestination == tab, { navigate(tab) },
                                 icon = { Icon(icon, null) }, label = { Text(label) },
@@ -442,6 +420,41 @@ fun DialogueLensScreen(
                     if (!state.showStartLauncher) {
                         Column(if (stageVisible) Modifier.weight(if (studioPreview) 1.15f else 1f).fillMaxHeight()
                             else Modifier.size(0.dp).clearAndSetSemantics {}) {
+                            val nativeOverlay = (compactLandscape || fullscreen) && playbackVisible &&
+                                state.project.videoSource.kind in setOf(VideoSourceKind.LOCAL_MP4, VideoSourceKind.DEMO_SCENARIO) &&
+                                !state.isEditMode && state.quickPickerEventId == null
+                            val transportControls: @Composable () -> Unit = {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    val showControls = controlsVisible || studioPreview
+                                    if (playbackVisible) PlaybackNotice(state, viewModel, ::attach)
+                                    if (showControls) {
+                                        WatchControls(state, viewModel, onAppearance = { showStyleSheet = true },
+                                            onLanguage = { showLanguage = true }, onAttach = ::attach, onBrowser = { browserControls = !browserControls },
+                                            onCast = { inspectorTabRequest = InspectorTab.CAST; navigate(AppDestination.STUDIO) },
+                                            onOpenVideo = { viewModel.pausePlayback(); viewModel.exitFullscreenTheater(); showIntake = true },
+                                            onMenuVisible = { menuOpen = it }, compact = compactLandscape, onHide = { controlsVisible = false })
+                                    } else {
+                                        TextButton(onClick = { controlsVisible = true }, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+                                            Text("Show controls")
+                                        }
+                                    }
+                                    if (browserControls && state.project.videoSource.kind == VideoSourceKind.WEB_STREAM) {
+                                        WebBrowserControlStrip(
+                                            seedUrl = state.project.videoSource.uriString,
+                                            viewerNav = state.viewerWebNav,
+                                            scoutNav = state.scoutWebNav,
+                                            scoutTimeMs = state.scoutTimeMs,
+                                            dualInstanceEnabled = state.dualInstanceEnabled,
+                                            onViewerBack = viewModel::viewerWebGoBack,
+                                            onViewerForward = viewModel::viewerWebGoForward,
+                                            onViewerRefresh = viewModel::viewerWebRefresh,
+                                            onViewerResetSource = viewModel::viewerWebResetSource,
+                                            onViewerAllowOnce = viewModel::viewerWebAllowOnce,
+                                            onOpenScoutModal = viewModel::openScoutBrowserModal,
+                                        )
+                                    }
+                                }
+                            }
                             Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black), contentAlignment = Alignment.Center) {
                                 val stageProjectId = state.project.id
                                 androidx.compose.runtime.key(stageProjectId) {
@@ -455,18 +468,7 @@ fun DialogueLensScreen(
                                         streamPlayRequest = state.streamPlayRequest,
                                         youtubeSeekRequest = state.youtubeSeekRequest,
                                         dualInstanceEnabled = state.dualInstanceEnabled,
-                                        hasPendingPlayIntro = state.hasPendingPlayIntro,
                                         isCinemaIntroActive = state.isCinemaIntroActive,
-                                        introRemainingMs = state.introRemainingMs,
-                                        introTotalDurationMs = state.introTotalDurationMs,
-                                        requiredOpeningWindows = state.requiredOpeningLeadWindows,
-                                        isOpeningSpeakersReady = state.isOpeningSpeakersReady,
-                                        isScoutCatchUpBuffering = state.isScoutCatchUpBuffering,
-                                        onDismissCatchUpBuffering = viewModel::dismissScoutCatchUpBuffering,
-                                        scoutTimeMs = state.scoutTimeMs,
-                                        scoutedUpToMs = state.scoutedUpToMs,
-                                        scoutStatusText = state.scoutStatusText,
-                                        scoutCaptionState = state.scoutCaptionState,
                                         activeSpeakerToast = if (state.activeDestination == AppDestination.STUDIO) state.activeSpeakerToast else null,
                                         onDismissSpeakerToast = viewModel::dismissSpeakerToast,
                                         onOpenCastGlossary = {
@@ -477,24 +479,14 @@ fun DialogueLensScreen(
                                         scoutPlayRequest = state.scoutPlayRequest,
                                         scoutSeekRequest = state.scoutSeekRequest,
                                         showScoutMonitorPip = state.activeDestination == AppDestination.STUDIO && state.showScoutMonitorPip,
-                                        onToggleScoutMonitorPip = viewModel::toggleScoutMonitorPip,
-                                        onSkipIntro = viewModel::skipCinemaIntro,
-                                        onRetryYouTubeAiTranscript = viewModel::retryYouTubeAiTranscription,
-                                        onOpenAttachCaptions = {
-                                            viewModel.exitFullscreenTheater()
-                                            attach()
-                                        },
-                                        onSwitchToZeroCloudMode = viewModel::switchToZeroCloudFallback,
                                         displayMode = state.displayMode,
                                         placedBalloons = state.placedBalloons,
-                                        scoutCompletedWindows = state.scoutCompletedWindows,
-                                        scoutTotalWindows = state.scoutTotalWindows,
                                         onLiveFacesDetected = viewModel::onLiveStageFacesDetected,
                                         playbackGeneration = state.playbackGeneration,
+                                        onBodyRelocations = viewModel::recordBodyRelocations,
                                         onLiveFrameSnapshot = viewModel::onLiveStageFrameSnapshot,
                                         isEditMode = state.isEditMode,
                                         selectedEventId = state.selectedEventId,
-                                        onTogglePlayPause = viewModel::togglePlayPause,
                                         onStageTap = { controlsVisible = !controlsVisible },
                                         onViewerTransport = { sample -> viewModel.onViewerTransport(stageProjectId, sample) },
                                         onYouTubePlaybackState = viewModel::onYouTubePlaybackState,
@@ -510,7 +502,6 @@ fun DialogueLensScreen(
                                         onScoutWebNavChanged = viewModel::onScoutWebNavChanged,
                                         scoutSessionHolder = scoutSessionHolder,
                                         showScoutBrowserModal = state.showScoutBrowserModal,
-                                        onScoutYouTubePlaybackState = viewModel::onScoutYouTubePlaybackState,
                                         onScoutWebStreamPlaybackState = viewModel::onScoutWebStreamPlaybackState,
                                         onScoutWebStreamDirectMediaUrl = viewModel::onScoutWebStreamDirectMediaUrl,
                                         onWebStreamSniffedMediaStream = viewModel::onWebStreamSniffedMediaStream,
@@ -541,37 +532,14 @@ fun DialogueLensScreen(
                                         modifier = Modifier.fillMaxSize(),
                                     )
                                 }
-                            }
-                            if (stageVisible) {
-                                val showControls = controlsVisible || !state.isPlaying || studioPreview
-                                if (playbackVisible) PlaybackNotice(state, viewModel, ::attach)
-                                if (showControls) {
-                                    WatchControls(state, viewModel, onAppearance = { showStyleSheet = true },
-                                        onLanguage = { showLanguage = true }, onAttach = ::attach, onBrowser = { browserControls = !browserControls },
-                                        onCast = { inspectorTabRequest = InspectorTab.CAST; navigate(AppDestination.STUDIO) },
-                                        onOpenVideo = { viewModel.pausePlayback(); viewModel.exitFullscreenTheater(); showIntake = true },
-                                        onMenuVisible = { menuOpen = it })
-                                } else {
-                                    TextButton(onClick = { controlsVisible = true }, modifier = Modifier.align(Alignment.CenterHorizontally)) {
-                                        Text("Show controls")
+                                if (nativeOverlay) {
+                                    Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                                        transportControls()
                                     }
                                 }
-                                if (browserControls && state.project.videoSource.kind == VideoSourceKind.WEB_STREAM) {
-                                    WebBrowserControlStrip(
-                                        seedUrl = state.project.videoSource.uriString,
-                                        viewerNav = state.viewerWebNav,
-                                        scoutNav = state.scoutWebNav,
-                                        scoutTimeMs = state.scoutTimeMs,
-                                        dualInstanceEnabled = state.dualInstanceEnabled,
-                                        onViewerBack = viewModel::viewerWebGoBack,
-                                        onViewerForward = viewModel::viewerWebGoForward,
-                                        onViewerRefresh = viewModel::viewerWebRefresh,
-                                        onViewerResetSource = viewModel::viewerWebResetSource,
-                                        onViewerAllowOnce = viewModel::viewerWebAllowOnce,
-                                        onOpenScoutModal = viewModel::openScoutBrowserModal,
-                                    )
-                                }
                             }
+                            if (stageVisible && !nativeOverlay) transportControls()
+
                         }
                     }
                     if (!playbackVisible) Box(Modifier.weight(1f).fillMaxHeight().background(CinemaObsidian)) {
@@ -637,6 +605,7 @@ fun DialogueLensScreen(
                                         ToolsQuickSettingsHeader(
                                             state = state,
                                             expandScoutDiag = expandScoutDiagInDrawer,
+                                            visualDiagnostics = viewModel::visualDiagnostics,
                                             onToggleExpandScoutDiag = { expandScoutDiagInDrawer = !expandScoutDiagInDrawer },
                                             onToggleEditMode = {
                                                 if (!wide && !state.isEditMode) navigate(AppDestination.WATCH)
@@ -826,6 +795,7 @@ fun DialogueLensScreen(
 private fun ToolsQuickSettingsHeader(
     state: DialogueLensUiState,
     expandScoutDiag: Boolean,
+    visualDiagnostics: () -> String,
     onToggleExpandScoutDiag: () -> Unit,
     onToggleEditMode: () -> Unit,
     onCyclePlaybackSpeed: () -> Unit,
@@ -967,6 +937,7 @@ private fun ToolsQuickSettingsHeader(
                 val selected = state.quotaSaverMode == mode
                 FilterChip(
                     selected = selected,
+                    enabled = state.cloudDialogueConfigured || mode == QuotaSaverMode.ZERO_CLOUD,
                     onClick = { onSelectQuotaMode(mode) },
                     label = { Text(mode.label, fontSize = 11.5.sp) },
                     colors = FilterChipDefaults.filterChipColors(
@@ -1082,6 +1053,11 @@ private fun ToolsQuickSettingsHeader(
                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.testTag("scout_diagnostics_detail_text"),
+                        )
+                        Text(
+                            text = visualDiagnostics(),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Row(
                             modifier = Modifier

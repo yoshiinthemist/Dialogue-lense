@@ -161,10 +161,11 @@ fun SpeechBalloonView(
 
 
     // Wait until first pixel measurement finishes before fading in so balloons never hop on Frame 1 -> Frame 2
-    val enterAlpha = remember(event.id) { Animatable(if (style.reducedMotion) 1f else 0f) }
-    LaunchedEffect(event.id, committedRect != null, style.reducedMotion) {
-        if (committedRect == null && !style.reducedMotion) return@LaunchedEffect
-        if (style.reducedMotion) {
+    val immediate = style.reducedMotion || event.endTimeMs - event.startTimeMs < 250L
+    val enterAlpha = remember(event.id) { Animatable(if (immediate) 1f else 0f) }
+    LaunchedEffect(event.id, committedRect != null, immediate) {
+        if (committedRect == null) return@LaunchedEffect
+        if (immediate) {
             enterAlpha.snapTo(1f)
         } else {
             enterAlpha.animateTo(1f, animationSpec = tween(durationMillis = 120))
@@ -1588,10 +1589,11 @@ fun SpatialSfxNoteView(
         }
     }
 
-    val enterAlpha = remember(event.id) { Animatable(if (style.reducedMotion) 1f else 0f) }
-    LaunchedEffect(event.id, committedRect != null, style.reducedMotion) {
-        if (committedRect == null && !style.reducedMotion) return@LaunchedEffect
-        if (style.reducedMotion) {
+    val immediate = style.reducedMotion || event.endTimeMs - event.startTimeMs < 250L
+    val enterAlpha = remember(event.id) { Animatable(if (immediate) 1f else 0f) }
+    LaunchedEffect(event.id, committedRect != null, immediate) {
+        if (committedRect == null) return@LaunchedEffect
+        if (immediate) {
             enterAlpha.snapTo(1f)
         } else {
             enterAlpha.animateTo(1f, animationSpec = tween(durationMillis = 120))

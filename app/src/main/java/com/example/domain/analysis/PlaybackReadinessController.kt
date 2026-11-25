@@ -16,6 +16,7 @@ data class ViewerTransportSample(
     val transport: MediaTransport,
     val seekSequence: Int,
     val playSequence: Int,
+    val canSeek: Boolean = durationMs > 0L,
 )
 
 data class ReadinessDecision(
@@ -63,6 +64,14 @@ class PlaybackReadinessController {
         if (!settled || abs(target - positionMs) > 650L) return false
         pendingTargetMs = null
         return true
+    }
+
+    fun suspendPlayback() {
+        if (wantsPlay) {
+            wantsPlay = false
+            explicitPause = false
+            waitingSinceMs = null
+        }
     }
 
     fun end() {

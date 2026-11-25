@@ -261,12 +261,7 @@ class SubtitlePreGenerator(
             }
         }
 
-        val skipUpfrontFreeCc = LookaheadWindowPlanner.shouldSkipUpfrontFreeCaptionSearch(
-            quotaSaverMode = quotaSaverMode,
-            quotaCircuitBreakerTripped = quotaCircuitBreakerTripped,
-        )
-
-        if (!skipUpfrontFreeCc) {
+        run {
             onProgress(
                 SubtitlePrepState.Working(
                     title = cached?.title?.ifBlank { defaultTitle } ?: defaultTitle,
@@ -288,6 +283,10 @@ class SubtitlePreGenerator(
                 preferredSourceLanguage = sourceLanguage,
                 preferredTargetLanguage = targetLanguage,
             )
+            if (fetched.restricted) {
+                onProgress(SubtitlePrepState.Error("This video restricts dialogue access. Use the player’s captions or attach a subtitle file."))
+                return
+            }
             if (fetched.cues.isNotEmpty()) {
                 val resolvedTitle = fetched.title?.takeIf { it.isNotBlank() } ?: (cached?.title?.ifBlank { defaultTitle } ?: defaultTitle)
                 val resolvedChannel = fetched.channelName?.takeIf { it.isNotBlank() } ?: cached?.channelName.orEmpty()
@@ -295,7 +294,7 @@ class SubtitlePreGenerator(
                 val resolvedDurationMs = maxOf(
                     fetched.durationMs ?: 0L,
                     cached?.durationMs ?: 0L,
-                    60_000L,
+                    fetched.cues.maxOf { it.endTimeMs },
                 )
                 val resolvedSrcLang = if (sourceLanguage.equals("Auto-Detect", ignoreCase = true)) {
                     isoToFriendlyLanguage(fetched.languageCode, sourceLanguage)
@@ -320,7 +319,7 @@ class SubtitlePreGenerator(
                     channelName = resolvedChannel,
                     description = resolvedDescription,
                 )
-                val finalCcProj = maybeTranslateProjectOfflineOrCloud(
+                val translated = maybeTranslateProjectOfflineOrCloud(
                     project = ccProj,
                     quotaSaverMode = quotaSaverMode,
                     quotaCircuitBreakerTripped = quotaCircuitBreakerTripped,
@@ -341,6 +340,13 @@ class SubtitlePreGenerator(
                         )
                     },
                 )
+                val finalCcProj = translated.copy(
+                    speakers = (cached?.speakers.orEmpty() + translated.speakers).distinctBy { it.id },
+                    dialogueEvents = LookaheadWindowPlanner.mergeNativeTrack(
+                        cached?.dialogueEvents.orEmpty(), translated.dialogueEvents, restoredIntervals,
+                    ),
+                    chapters = fetched.chapters,
+                )
                 saveCacheEntry(finalCcProj, finalCcProj.videoSource.durationMs)
                 onProgress(
                     SubtitlePrepState.Ready(
@@ -354,16 +360,18 @@ class SubtitlePreGenerator(
                 return
             }
 
-            val reason = if (quotaCircuitBreakerTripped) {
+            if (quotaCircuitBreakerTripped || quotaSaverMode == QuotaSaverMode.ZERO_CLOUD) {
+                val reason = if (quotaCircuitBreakerTripped) {
                 "Credits depleted and no free YouTube CC track was exposed — open stream to capture player captions or attach an .srt."
             } else {
-                "No free YouTube CC track was found while Free CC Only is active. Switch to Best Model to pre-generate with Gemini 3.8 Flash."
+                "No native YouTube captions were available. Use the player’s captions or attach a subtitle file."
             }
-            onProgress(SubtitlePrepState.Error(reason))
-            return
+                onProgress(SubtitlePrepState.Error(reason))
+                return
+            }
         }
 
-        // Best-Model-First / Lite-First path: start AI immediately without blocking 8-10s on Free CC endpoints.
+        // Native captions were unavailable. Use the selected analysis tier for unresolved intervals.
         coroutineScope {
             val fastMetaDeferred = async {
                 runCatching { YouTubeCaptionFetcher.fetchFastMetadataOnly(videoId) }.getOrNull()

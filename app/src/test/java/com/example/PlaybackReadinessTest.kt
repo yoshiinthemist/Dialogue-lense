@@ -85,6 +85,23 @@ class PlaybackReadinessTest {
         assertEquals(false, update(0, pos = 3_500).playCommand)
     }
 
+    @Test fun backgroundingCancelsIntentWithoutPresentingAnEditingPause() {
+        controller.setIntent(true)
+        update(7_000)
+        controller.suspendPlayback()
+        assertEquals(false, update(7_000).playCommand)
+        assertEquals(PlaybackPhase.READY, update(7_000).phase)
+        assertNull(update(7_000, now = 50_000).playCommand)
+    }
+
+    @Test fun unacknowledgedPausedSeekAlsoHasBoundedRecovery() {
+        controller.setIntent(false)
+        controller.seek(80_000, 2)
+        update(7_000, now = 10)
+        assertEquals(PlaybackPhase.PROCESSING_UNAVAILABLE, update(7_000, now = 18_010).phase)
+        assertNull(update(7_000).playCommand)
+    }
+
     @Test fun transportStallDoesNotStartClockOrRepeatedlyIssuePlay() {
         controller.setIntent(true)
         val waiting = update(10_000, transport = MediaTransport.BUFFERING)

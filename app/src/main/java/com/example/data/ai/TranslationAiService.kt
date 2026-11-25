@@ -61,7 +61,7 @@ data class AiCastSlotAssignment(
     val isRolePlaceholder: Boolean,
     val rationale: String = "",
     val visualVoiceNotes: String = "",
-    val isVisuallyConfirmed: Boolean = true,
+    val isVisuallyConfirmed: Boolean = false,
 )
 
 data class AiCastDiscoveryResult(
@@ -119,7 +119,7 @@ class TranslationAiService {
                     description = "True if descriptive role/unconfirmed appearance, false if confirmed real character/person name"
                 ),
                 "isVisuallyConfirmed" to Schema.boolean(
-                    description = "True ONLY when the speaker's real name is visibly shown on a lower-third/chyron/title card, explicitly spoken/addressed in dialogue, or unmistakably visually confirmed on camera. NEVER guess from video title alone; set false if unconfirmed so the speaker stays dotted gray until confirmed."
+                    description = "True ONLY when the speaker's real name is visibly shown on a lower-third/chyron/title card, explicitly spoken/addressed in dialogue, or a clearly associated on-screen nameplate. NEVER guess from video title alone; set false if unconfirmed so the speaker stays dotted gray until confirmed."
                 ),
                 "rationale" to Schema.string(
                     description = "Brief 3-8 word reason from on-screen visuals, chyron, or spoken dialogue clues"
@@ -265,8 +265,11 @@ class TranslationAiService {
                         "isRolePlaceholder" to Schema.boolean(
                             description = "True if generic movie-credit role, false if real name/handle"
                         ),
+                        "isVisuallyConfirmed" to Schema.boolean(
+                            description = "True only for direct evidence tying the person to the name or role in the supplied scene or dialogue."
+                        ),
                         "rationale" to Schema.string(
-                            description = "Brief 3-8 word explanation from metadata, search, or scene clues"
+                            description = "Exact in-scene introduction, lower-third or observed role that supports this assignment"
                         ),
                         "visualVoiceNotes" to Schema.string(
                             description = "Optional concise visual or voice trait"
@@ -589,7 +592,7 @@ class TranslationAiService {
                 appendLine("2. Break speech into crisp, compact 1-2 line speech-balloon cues (ideally 6-14 words, 1.4s to 4.0s each) matching exact speech timing with no missing stretches.")
                 appendLine("3. STRICT SPEAKER CONSISTENCY: Match each line to speakerSlot (A-L) by face/lip movement and voice timbre. NEVER assign a new person (such as someone in an embedded news/podcast/video clip) to a slot already occupied by a different person! Either assign them the next unused slot letter (up to L) and register them in speakerUpdates, OR output speakerSlot=UNCERTAIN if they only speak briefly or all 12 slots are taken.")
                 appendLine("4. ACCURATE LIPS/MOUTH POSITION & DEAD SPACE: Report the speaking person's actual LIPS/MOUTH center via speakerPosition AND anchorX (0.12..0.88) and anchorY (typically 0.18..0.38 in seated panel/medium shots; NEVER report chest/suit/tie coordinates below the chin) ONLY when you visually confirm THAT person's lips are moving in sync with those words. Also set deadSpaceZone to the cleanest unobstructed background pocket (empty wall/margin/upper corner) that avoids ALL faces, hair/foreheads, hands, and on-screen graphics, and populate avoidBoxes with bounding boxes for ALL visible heads/faces (speaker + bystanders) and lower-third chyrons/text banners so bubbles never clip anyone.")
-                appendLine("5. STRICT VISUAL CONFIRMATION (NO MISATTRIBUTIONS!): In speakerUpdates, set isVisuallyConfirmed=true and isRolePlaceholder=false ONLY when you have DIRECT in-video proof of that specific person's real name (an on-screen lower-third/chyron/title card, explicit spoken introduction/address like 'Welcome Michael' or 'I'm Roy', or unmistakable visual match). NEVER guess or stamp a celebrity name from the video title onto a panelist/host who is NOT that person! Until visually confirmed, set isVisuallyConfirmed=false, isRolePlaceholder=true, give a brief appearance/role note in visualVoiceNotes (e.g. 'Man in brown blazer, right seat') so the app keeps them dotted gray until visually confirmed in this or a later window.")
+                appendLine("5. STRICT VISUAL CONFIRMATION (NO MISATTRIBUTIONS!): In speakerUpdates, set isVisuallyConfirmed=true and isRolePlaceholder=false ONLY when you have DIRECT in-video proof of that specific person's real name (an on-screen lower-third/chyron/title card, explicit spoken introduction/address like 'Welcome Michael' or 'I'm Roy', or a nameplate identifying this speaker). NEVER guess or stamp a celebrity name from the video title onto a panelist/host who is NOT that person! Until visually confirmed, set isVisuallyConfirmed=false, isRolePlaceholder=true, give a brief appearance/role note in visualVoiceNotes (e.g. 'Man in brown blazer, right seat') so the app keeps them dotted gray until visually confirmed in this or a later window.")
                 appendLine("6. Mark non-speech sound/music cues (e.g. '[applause]', '[♪ upbeat synth music]') with dialogueType=SOUND_DESCRIPTION and speakerSlot=UNCERTAIN.")
                 appendLine("7. CUTAWAY & REACTION-SHOT CONTINUITY (CRITICAL!): Whenever the camera shows a host or panelist LISTENING SILENTLY, smiling, nodding, or holding cards while a DIFFERENT person's voice speaks off-screen (or during B-roll), NEVER output dialogueType=SPOKEN or point anchorX/anchorY at the silent listener! SPLIT at the exact cut timestamp, KEEP the actual voice's speakerSlot, and tag the cutaway portion as OFF_SCREEN_LEFT, OFF_SCREEN_RIGHT, or OFF_SCREEN_BEHIND.")
                 appendLine("8. ONLY if there is genuinely zero audible speech or meaningful sound anywhere in ${windowStartSec}s–${windowEndSec}s, return an empty cues array AND set noSpeechConfirmed=true. Otherwise set noSpeechConfirmed=false.")
@@ -708,7 +711,7 @@ class TranslationAiService {
                     appendLine(sampleText)
                 }
                 appendLine("Rules:")
-                appendLine("1. If a real name/channel host/character name is confidently known from title, metadata, search, dialogue intro ('I'm Maya'), or nameplate visible in a frame, use that concise name (1-3 words max) and set isRolePlaceholder=false.")
+                appendLine("1. Use a name only when an introduction or visible nameplate in this scene identifies the speaker. Provide that evidence in rationale and set isVisuallyConfirmed=true. A title, cast list, facial resemblance or web search alone cannot confirm who is speaking.")
                 appendLine("2. If the speaker is unnamed or incidental, take inspiration from movie cast credits and assign a crisp descriptive role such as 'Host', 'Hot Dog Vendor', 'Civilian Woman 1', 'Interviewer', 'Security Guard', 'Caller' and set isRolePlaceholder=true.")
                 appendLine("3. Never output 'Speaker A', 'Speaker B', or 'Unknown'. Always give each active slot either a real name or a movie-credit role.")
             }
@@ -739,13 +742,16 @@ class TranslationAiService {
                         val obj = arr.getJSONObject(i)
                         val slot = obj.optString("slot", "").trim()
                         val displayName = obj.optString("displayName", "").trim()
-                        if (slot in listOf("A", "B", "C", "D") && displayName.isNotBlank()) {
+                        if (slot.length == 1 && slot[0] in 'A'..'H' && displayName.isNotBlank()) {
                             add(
                                 AiCastSlotAssignment(
                                     slot = slot,
                                     displayName = displayName.take(28),
                                     isRolePlaceholder = obj.optBoolean("isRolePlaceholder", false),
                                     rationale = obj.optString("rationale", "").trim(),
+                                    visualVoiceNotes = obj.optString("visualVoiceNotes", "").trim().take(80),
+                                    isVisuallyConfirmed = obj.optBoolean("isVisuallyConfirmed", false) &&
+                                        obj.optString("rationale").isNotBlank() && (shotKeyframes.isNotEmpty() || sampleText.isNotBlank()),
                                 )
                             )
                         }
@@ -1057,11 +1063,7 @@ class TranslationAiService {
                 val slot = obj.optString("slot", "").trim().uppercase()
                 val name = obj.optString("displayName", "").trim()
                 val isRole = obj.optBoolean("isRolePlaceholder", false)
-                val visuallyConfirmed = if (obj.has("isVisuallyConfirmed")) {
-                    obj.optBoolean("isVisuallyConfirmed", false)
-                } else {
-                    !isRole
-                }
+                val visuallyConfirmed = obj.optBoolean("isVisuallyConfirmed", false)
                 val notes = obj.optString("visualVoiceNotes", "").trim().take(80)
                 if (slot in validSlots && (name.isNotBlank() || notes.isNotBlank())) {
                     add(
@@ -1493,11 +1495,7 @@ class TranslationAiService {
                     val slot = obj.jsonString("slot", "").trim().uppercase()
                     val name = obj.jsonString("displayName", "").trim()
                     val isRole = obj.jsonBoolean("isRolePlaceholder", false)
-                    val visuallyConfirmed = if (obj.containsKey("isVisuallyConfirmed")) {
-                        obj.jsonBoolean("isVisuallyConfirmed", false)
-                    } else {
-                        !isRole
-                    }
+                    val visuallyConfirmed = obj.jsonBoolean("isVisuallyConfirmed", false)
                     val notes = obj.jsonString("visualVoiceNotes", "").trim().take(80)
                     if (slot in validSlots && (name.isNotBlank() || notes.isNotBlank())) {
                         add(

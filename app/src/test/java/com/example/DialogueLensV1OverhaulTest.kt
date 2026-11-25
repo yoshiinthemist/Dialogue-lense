@@ -413,7 +413,7 @@ class DialogueLensV1OverhaulTest {
         val ledger = com.example.domain.analysis.TranscriptCoverageLedger()
         val verified = com.example.data.model.CoverageStatus.VERIFIED_DIALOGUE
         val pending = com.example.data.model.CoverageStatus.PENDING
-        ledger.reset(30_000)
+        ledger.reset(30_000, source = SubtitleSourceKind.AI_DRAFT)
         val originals = ledger.recordRepairEvidence(listOf(com.example.data.model.CoverageInterval(10_000, 20_000, verified)), "attempt")
         ledger.recordOutcome(12_000, 16_000, verified)
         ledger.undoRepairEvidence(originals, "attempt")
@@ -436,7 +436,8 @@ class DialogueLensV1OverhaulTest {
     fun newMarkQueuesOnlyTheUncoveredPartOfAnActiveRepair() {
         val running = HealBeacon("active", 30_000, 20_000, 45_000, HealBeaconStatus.HEALING)
         val project = sampleProject(beacons = listOf(running))
-        val (updated, added) = HealBeaconEngine.placeOrMergeBeacon(project, 44_000, HealScope.QUICK)
+        val (updated, _) = HealBeaconEngine.placeOrMergeBeacon(project, 44_000, HealScope.QUICK)
+        val added = updated.healBeacons.single { it.id != running.id }
         assertEquals(running, updated.healBeacons.first { it.id == running.id })
         assertEquals(45_000L, added.windowStartMs)
         assertEquals(52_000L, added.windowEndMs)

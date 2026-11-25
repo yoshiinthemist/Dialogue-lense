@@ -31,6 +31,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.domain.analysis.RedirectDecision
@@ -64,7 +67,7 @@ class WebStreamSessionHolder {
 
     internal var transportCallback: ((ViewerTransportSample) -> Unit)? = null
     internal var playbackCallback: (Long, Long, Boolean) -> Unit = { _, _, _ -> }
-    internal var captionsCallback: (String) -> Unit = {}
+    internal var captionsCallback: (String, Boolean) -> Unit = { _, _ -> }
     internal var mediaUrlCallback: (String) -> Unit = {}
     internal var sniffedMediaCallback: (SniffedWebMediaStream) -> Unit = {}
     internal var audioSliceCallback: (Long, Long, String, String) -> Unit = { _, _, _, _ -> }
@@ -104,6 +107,26 @@ class WebStreamSessionHolder {
     }
 }
 
+/** Stop the actual WebView even when the stopped composition no longer collects commands. */
+@Composable
+internal fun PauseWebMediaWhenHidden(webView: WebView?, pauseScript: String) {
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner, webView, pauseScript) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> {
+                    webView?.evaluateJavascript(pauseScript, null)
+                    webView?.onPause()
+                }
+                Lifecycle.Event.ON_START -> webView?.onResume()
+                else -> Unit
+            }
+        }
+        owner.lifecycle.addObserver(observer)
+        onDispose { owner.lifecycle.removeObserver(observer) }
+    }
+}
+
 /**
  * In-app Web Cinema browser for non-YouTube web video pages shared from Chrome or pasted by URL.
  * Blocks pop-up windows and cross-site ad redirects, strips transparent click-hijack overlays,
@@ -119,7 +142,7 @@ fun WebStreamPlayer(
     seekRequest: Pair<Int, Long>?,
     onViewerTransport: ((ViewerTransportSample) -> Unit)? = null,
     onPlaybackState: (positionMs: Long, durationMs: Long, isPlaying: Boolean) -> Unit,
-    onCapturedCaptions: (cuesJson: String) -> Unit,
+    onCapturedCaptions: (cuesJson: String, completeTrack: Boolean) -> Unit,
     isScoutInstance: Boolean = false,
     isolateVideoInViewport: Boolean = true,
     onDirectMediaUrl: (String) -> Unit = {},
@@ -134,6 +157,7 @@ fun WebStreamPlayer(
 ) {
     val ownedHolder = remember { if (sessionHolder == null) WebStreamSessionHolder() else null }
     val holder = sessionHolder ?: ownedHolder!!
+    PauseWebMediaWhenHidden(holder.webView, "window.dlWebPause && window.dlWebPause();")
 
     val latestSeedUrl by rememberUpdatedState(webUrl)
     holder.isolateVideoInViewport = isolateVideoInViewport
@@ -335,7 +359,7 @@ private fun createGuardedWebView(
 
         val bridge = object {
             @JavascriptInterface
-            fun onProgress(posMs: Long, durMs: Long, code: Int, seekSeq: Int, playSeq: Int) {
+            fun onProgress(posMs: Long, durMs: Long, code: Int, seekSeq: Int, playSeq: Int, canSeek: Boolean) {
                 val transport = when (code) {
                     1 -> MediaTransport.PLAYING
                     2 -> MediaTransport.PAUSED
@@ -345,14 +369,14 @@ private fun createGuardedWebView(
                 }
                 mainHandler.post {
                     val callback = holder.transportCallback
-                    if (callback != null) callback(ViewerTransportSample(posMs, durMs, transport, seekSeq, playSeq))
+                    if (callback != null) callback(ViewerTransportSample(posMs, durMs, transport, seekSeq, playSeq, canSeek))
                     else holder.playbackCallback(posMs, durMs, transport == MediaTransport.PLAYING)
                 }
             }
 
             @JavascriptInterface
-            fun onCapturedTracks(cuesJson: String) {
-                if (cuesJson.length <= 4_000_000) mainHandler.post { holder.captionsCallback(cuesJson) }
+            fun onCapturedTracks(cuesJson: String, completeTrack: Boolean) {
+                if (cuesJson.length <= 4_000_000) mainHandler.post { holder.captionsCallback(cuesJson, completeTrack) }
             }
 
             @JavascriptInterface
@@ -1215,6 +1239,7 @@ private fun buildWebStreamHookScript(
     if (!video || !video.textTracks || !window.DialogueLensWeb) return;
     var collected = [];
     var hasUsableTrack = false;
+    var completeTrack = false;
     for (var i = 0; i < video.textTracks.length; i++) {
       var track = video.textTracks[i];
       if (track.kind !== 'subtitles' && track.kind !== 'captions') continue;
@@ -1224,6 +1249,10 @@ private fun buildWebStreamHookScript(
       var cues = track.cues;
       if (cues && cues.length > 0) {
         hasUsableTrack = true;
+        // A loaded <track> file is a complete dialogue source. MSE/live TextTracks can be incremental.
+        completeTrack = Array.prototype.some.call(video.querySelectorAll('track'), function(el) {
+          return el.track === track && el.readyState === 2 && !!el.src;
+        });
         if (track.mode === 'showing') track.mode = 'hidden';
         for (var j = 0; j < cues.length; j++) {
           var c = cues[j];
@@ -1240,11 +1269,11 @@ private fun buildWebStreamHookScript(
       }
     }
     if (hasUsableTrack && collected.length > 0) {
-      var sig = collected.length + ':' + collected[0].startMs + ':' + collected[collected.length - 1].endMs;
+      var sig = (completeTrack ? 'file:' : 'live:') + collected.length + ':' + collected[0].startMs + ':' + collected[collected.length - 1].endMs;
       if (sig !== window.__dlLastTrackSig) {
         window.__dlLastTrackSig = sig;
         try {
-          window.DialogueLensWeb.onCapturedTracks(JSON.stringify(collected));
+          window.DialogueLensWeb.onCapturedTracks(JSON.stringify(collected), completeTrack);
         } catch (err) {}
       }
     }
@@ -1270,7 +1299,8 @@ private fun buildWebStreamHookScript(
     var durMs = (isFinite(v.duration) && v.duration > 0) ? Math.round(v.duration * 1000) : 0;
     var code = v.ended ? 4 : (v.seeking || v.readyState < 2 || (!v.paused && v.readyState < 3)) ? 3 : v.paused ? 2 : 1;
     try {
-      window.DialogueLensWeb.onProgress(curMs, durMs, code, window.__dlSeekSequence || 0, window.__dlPlaySequence || 0);
+      var canSeek = !!(v.seekable && v.seekable.length && v.seekable.end(v.seekable.length - 1) > v.seekable.start(0));
+      window.DialogueLensWeb.onProgress(curMs, durMs, code, window.__dlSeekSequence || 0, window.__dlPlaySequence || 0, canSeek);
     } catch (err) {}
     harvestTextTracks(v);
     reportDirectSrc(v);

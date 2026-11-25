@@ -1,5 +1,6 @@
 package com.example.domain.analysis
 
+import com.example.data.model.CoverageInterval
 import com.example.data.model.DialogueEvent
 import com.example.data.model.DialogueLensProject
 import com.example.data.model.QuotaSaverMode
@@ -69,31 +70,40 @@ object LookaheadWindowPlanner {
             ScoutExecutionTier.BEST_AI
     }
 
-    /**
-     * When cloud AI credits are available, jump straight to the AI Scout without
-     * spending 8-10 seconds searching YouTube CC endpoints first. Only run the
-     * free CC search upfront when Zero-Cloud is selected or credits have run dry.
-     */
-    fun shouldSkipUpfrontFreeCaptionSearch(
-        quotaSaverMode: QuotaSaverMode,
-        quotaCircuitBreakerTripped: Boolean,
-    ): Boolean = quotaSaverMode != QuotaSaverMode.ZERO_CLOUD && !quotaCircuitBreakerTripped
+    fun needsNativeTrack(source: SubtitleSourceKind, events: List<DialogueEvent>, fullyVerified: Boolean): Boolean =
+        !fullyVerified && !hasLoadedSubtitlesLocked(source, events)
+
+    fun effectiveQuotaMode(requested: QuotaSaverMode, cloudConfigured: Boolean): QuotaSaverMode =
+        if (cloudConfigured) requested else QuotaSaverMode.ZERO_CLOUD
+
+    /** Retain reviewed words and edits as-is when an authoritative native track arrives late. */
+    fun mergeNativeTrack(
+        existing: List<DialogueEvent>,
+        native: List<DialogueEvent>,
+        intervals: List<CoverageInterval>,
+        correctedIds: Set<String> = emptySet(),
+    ): List<DialogueEvent> {
+        fun intersects(a: Long, b: Long, c: Long, d: Long) = a < d && c < b
+        val verified = intervals.filter { it.verified }.sortedBy { it.startMs }
+        var index = 0
+        val retained = existing.sortedBy { it.startTimeMs }.filter { cue ->
+            while (index < verified.size && verified[index].endMs <= cue.startTimeMs) index++
+            val span = verified.getOrNull(index)
+            cue.lockedByUser || cue.id in correctedIds ||
+                (span != null && intersects(cue.startTimeMs, cue.endTimeMs, span.startMs, span.endMs))
+        }
+        index = 0
+        val fill = native.sortedBy { it.startTimeMs }.filter { cue ->
+            while (index < retained.size && retained[index].endTimeMs <= cue.startTimeMs) index++
+            val previous = retained.getOrNull(index)
+            previous == null || !intersects(cue.startTimeMs, cue.endTimeMs, previous.startTimeMs, previous.endTimeMs)
+        }
+        return (retained + fill).sortedWith(compareBy<DialogueEvent> { it.startTimeMs }.thenBy { it.id })
+    }
 
     fun nextFallbackTierOnQuotaError(failedTier: ScoutExecutionTier): ScoutExecutionTier = when (failedTier) {
         ScoutExecutionTier.BEST_AI -> ScoutExecutionTier.LITE_AI
         ScoutExecutionTier.LITE_AI, ScoutExecutionTier.FREE_LOCAL -> ScoutExecutionTier.FREE_LOCAL
-    }
-
-    fun shouldAllowPassiveWebTimedTextOverride(
-        quotaSaverMode: QuotaSaverMode,
-        quotaCircuitBreakerTripped: Boolean,
-        subtitleSource: SubtitleSourceKind,
-        events: List<DialogueEvent>,
-    ): Boolean {
-        if (hasLoadedSubtitlesLocked(subtitleSource, events)) return false
-        if (quotaSaverMode == QuotaSaverMode.ZERO_CLOUD || quotaCircuitBreakerTripped) return true
-        if (quotaSaverMode == QuotaSaverMode.PRO_ACCURACY) return false
-        return !hasRealSubtitles(events)
     }
 
     fun hasRealSubtitles(events: List<DialogueEvent>): Boolean {

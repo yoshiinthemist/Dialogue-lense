@@ -1,6 +1,10 @@
 package com.example
 
+import com.example.data.ai.AiCastSlotAssignment
+import com.example.data.ai.TranslationAiService
 import com.example.data.ai.withModelDeadline
+import com.example.data.model.Speaker
+import com.example.ui.state.reconcileWindowOutcomeSpeakersAndCues
 import com.example.data.subtitle.SubtitleParser
 import com.example.domain.analysis.AudioAnalyzer
 import com.example.domain.media.YouTubeMediaAdapter
@@ -37,7 +41,26 @@ class MediaIntakeRegressionTest {
         assertEquals("retry", withModelDeadline(10) { "retry" })
         val cancellation = CancellationException("session replaced")
         val thrown = runCatching { withModelDeadline<String>(10) { throw cancellation } }.exceptionOrNull()
-        assertSame(cancellation, thrown)
+        assertTrue(thrown is CancellationException)
+        assertEquals(cancellation.message, thrown?.message)
+    }
+
+    @Test fun missingEvidenceDoesNotConfirmASpeakersName() {
+        val result = TranslationAiService.parseYouTubeTranscriptionPayload(
+            rawJson = """{"cues":[],"speakerUpdates":[{"slot":"A","displayName":"Alex","isRolePlaceholder":false}]}""",
+            windowStartSec = 0, windowEndSec = 8,
+        )
+        assertFalse(result.speakerUpdates.single().isVisuallyConfirmed)
+    }
+
+    @Test fun equalNamesDoNotMergeTwoSpeakersFromDifferentSlots() {
+        val existing = listOf(Speaker(id = "alex-1", defaultLabel = "Speaker A", accentIndex = 0,
+            customName = "Alex", isIdentityConfirmed = true, visualVoiceNotes = "left microphone"))
+        val another = AiCastSlotAssignment(slot = "B", displayName = "Alex", isRolePlaceholder = false,
+            isVisuallyConfirmed = true, visualVoiceNotes = "right microphone")
+        val (_, updates, remap) = reconcileWindowOutcomeSpeakersAndCues(existing, emptyList(), listOf(another))
+        assertEquals("B", remap["B"])
+        assertEquals("B", updates.single().slot)
     }
 
     @Test fun playlistChildrenCarryCredentialsOnlyOnTheSameOrigin() {

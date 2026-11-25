@@ -113,8 +113,11 @@ class TranscriptCoverageLedger(
     }
 
     fun releaseRepair(key: String) { synchronized(lock) { repairReservations.remove(key) } }
+
+    fun clearRepairReservations() { synchronized(lock) { repairReservations.clear() } }
     private var totalDurationMs: Long = initialDurationMs.coerceAtLeast(0L)
     private val intervals = mutableListOf<CoverageInterval>()
+    private var verifiedRanges: List<TimeWindowRange> = emptyList()
 
     private var requestedWindows = 0
     private var completedWindows = 0
@@ -139,6 +142,7 @@ class TranscriptCoverageLedger(
             totalDurationMs = durationMs.coerceAtLeast(0L)
             activeSource = source
             intervals.clear()
+            verifiedRanges = emptyList()
             requestedWindows = 0
             completedWindows = 0
             acceptedEvents = 0
@@ -184,6 +188,7 @@ class TranscriptCoverageLedger(
             totalDurationMs = safeDur
             if (safeDur <= 0L) {
                 intervals.clear()
+                verifiedRanges = emptyList()
                 return
             }
             rebuildNormalizedLocked(intervals.toList())
@@ -269,6 +274,7 @@ class TranscriptCoverageLedger(
         for (span in evidence) {
             if (!span.verified || span.startMs < 0 || span.endMs <= span.startMs) continue
             ensureDurationAtLeastLocked(span.endMs)
+            if (sourcePriority(span.source) > sourcePriority(activeSource)) activeSource = span.source
             applyIntervalMutationLocked(span.startMs, span.endMs) { previous ->
                 if (previous.verified || previous.status == CoverageStatus.IN_PROGRESS) previous else {
                     originals.add(previous)
@@ -348,11 +354,17 @@ class TranscriptCoverageLedger(
             "markAuthoritativeTrack requires UPLOADED_FILE or EMBEDDED_TRACK"
         }
         val maxCueEnd = events.maxOfOrNull { it.endTimeMs } ?: 0L
-        val effectiveDur = maxOf(durationMs, maxCueEnd).coerceAtLeast(1_000L)
+        val effectiveDur = durationMs.takeIf { it > 0L } ?: maxCueEnd.coerceAtLeast(0L)
         val built = mutableListOf<CoverageInterval>()
         val realSorted = events
-            .filter { it.endTimeMs > it.startTimeMs }
+            .filter { it.endTimeMs > it.startTimeMs && it.endTimeMs > 0L && it.startTimeMs < effectiveDur &&
+                (it.sourceText.isNotBlank() || it.translatedText.isNotBlank()) }
             .sortedBy { it.startTimeMs }
+        if (realSorted.isEmpty()) {
+            // A missing or unparsable track supplies no evidence, including for silence.
+            updateDuration(effectiveDur)
+            return
+        }
 
         var cursor = 0L
         var i = 0
@@ -416,12 +428,7 @@ class TranscriptCoverageLedger(
 
     fun intervalsSnapshot(): List<CoverageInterval> = synchronized(lock) { intervals.toList() }
 
-    fun bufferedRanges(): List<TimeWindowRange> = synchronized(lock) {
-        val verified = intervals
-            .filter { it.verified && it.endMs > it.startMs }
-            .map { TimeWindowRange(it.startMs, it.endMs) }
-        LookaheadWindowPlanner.coalesceBufferedRanges(verified, bridgeGapMs = 0L)
-    }
+    fun bufferedRanges(): List<TimeWindowRange> = synchronized(lock) { verifiedRanges }
 
     fun failedRanges(): List<TimeWindowRange> = synchronized(lock) {
         val failed = intervals
@@ -443,24 +450,12 @@ class TranscriptCoverageLedger(
     /** Continuous verified speech or confirmed silence forward from the actual playhead. */
     fun verifiedLeadMs(positionMs: Long): Long = synchronized(lock) {
         val position = positionMs.coerceAtLeast(0L)
-        var cursor = position
-        for (interval in intervals) {
-            if (interval.endMs <= cursor) continue
-            if (interval.startMs > cursor || !interval.verified) break
-            cursor = interval.endMs
-        }
-        cursor - position
+        val index = verifiedRanges.binarySearchBy(position) { it.startMs }
+        val range = verifiedRanges.getOrNull(if (index >= 0) index else -index - 2)
+        if (range == null) 0L else (range.endMs - position).coerceAtLeast(0L)
     }
 
-    fun continuousVerifiedUpToMs(): Long = synchronized(lock) {
-        var cursor = 0L
-        for (iv in intervals) {
-            if (iv.startMs > cursor) break
-            if (!iv.verified) break
-            cursor = maxOf(cursor, iv.endMs)
-        }
-        cursor
-    }
+    fun continuousVerifiedUpToMs(): Long = verifiedLeadMs(0L)
 
     fun isFullyVerified(): Boolean = synchronized(lock) {
         totalDurationMs > 0L &&
@@ -601,7 +596,7 @@ class TranscriptCoverageLedger(
             !iv.verified &&
                 iv.status != CoverageStatus.IN_PROGRESS &&
                 iv.endMs > iv.startMs &&
-                (iv.status != CoverageStatus.FAILED || iv.retryAttempts < maxRetryAttempts)
+                ((iv.status != CoverageStatus.FAILED && iv.status != CoverageStatus.PARTIAL_RECOVERY) || iv.retryAttempts < maxRetryAttempts)
         }
         if (candidates.isEmpty()) return@synchronized null
 
@@ -698,6 +693,7 @@ class TranscriptCoverageLedger(
     private fun rebuildNormalizedLocked(rawList: List<CoverageInterval>) {
         if (totalDurationMs <= 0L) {
             intervals.clear()
+            verifiedRanges = emptyList()
             return
         }
         val clipped = rawList
@@ -788,13 +784,15 @@ class TranscriptCoverageLedger(
 
         intervals.clear()
         intervals.addAll(coalesced)
+        verifiedRanges = LookaheadWindowPlanner.coalesceBufferedRanges(
+            coalesced.filter { it.verified }.map { TimeWindowRange(it.startMs, it.endMs) }, bridgeGapMs = 0L)
     }
 
     companion object {
         fun sourcePriority(source: SubtitleSourceKind): Int = when (source) {
             SubtitleSourceKind.BUILT_IN_DEMO -> 0
             SubtitleSourceKind.AI_DRAFT -> 1
-            SubtitleSourceKind.EMBEDDED_TRACK -> 2
+            SubtitleSourceKind.EMBEDDED_TRACK, SubtitleSourceKind.EMBEDDED_PARTIAL -> 2
             SubtitleSourceKind.UPLOADED_FILE -> 3
         }
 

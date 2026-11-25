@@ -10,6 +10,9 @@ import android.content.res.Configuration
 import android.net.Uri
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebView
 import androidx.annotation.OptIn
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasTestTag
@@ -17,6 +20,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTextInput
 import androidx.lifecycle.ViewModelProvider
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -31,6 +35,9 @@ import com.example.ui.state.AppDestination
 import com.example.ui.state.DialogueLensViewModel
 import java.io.File
 import java.util.concurrent.FutureTask
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import org.json.JSONArray
 import kotlin.math.abs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -208,6 +215,91 @@ class PlaybackSmokeTest {
             onPlayer { pausePlayback() }
             resolver.delete(video, null, null)
         }
+    }
+
+    @Test
+    fun directLinkDecodesAndSeeksOverHttp() {
+        FixtureMediaServer(instrumentation.context.assets).use { server ->
+            val url = server.origin + "/clip.mp4"
+            openLink(url)
+            waitForPlayer("direct MP4 decoded from HTTP") {
+                uiState.value.project.videoSource.uriString == url &&
+                    exoPlayer.playbackState == Player.STATE_READY && exoPlayer.duration in 11_900L..12_100L
+            }
+            onPlayer { attachSubtitleFileToCurrentProject(fixture("two-lines.srt"), "two-lines.srt") }
+            waitForPlayer("file attached to direct stream") { uiState.value.coverageSummary.isFullyVerified }
+            onPlayer { seekTo(7_800L); togglePlayPause() }
+            waitForPlayer("direct HTTP playback and matching second cue") {
+                exoPlayer.isPlaying && exoPlayer.currentPosition in 8_000L..9_400L &&
+                    (exoPlayer.videoDecoderCounters?.renderedOutputBufferCount ?: 0) > 0 &&
+                    uiState.value.placedBalloons.any { it.event.sourceText == "After the cut." }
+            }
+            assertTrue(server.requested.contains("/clip.mp4"))
+            onPlayer { pausePlayback() }
+        }
+    }
+
+    @Test
+    fun webPageCapturesNativeTrackAndUsesTheHtmlVideoClock() {
+        FixtureMediaServer(instrumentation.context.assets).use { server ->
+            openLink(server.origin + "/watch")
+            waitForPlayer("HTML5 track harvested from the page") {
+                uiState.value.project.subtitleSource == SubtitleSourceKind.EMBEDDED_TRACK &&
+                    uiState.value.project.dialogueEvents.map { it.startTimeMs to it.sourceText } == listOf(
+                        820L to "Opening line.", 7_780L to "After the cut.",
+                    )
+            }
+            onPlayer {
+                seekTo(7_800L)
+                togglePlayPause()
+            }
+            waitForPlayer("embedded player and subtitles after seek") {
+                uiState.value.isPlaying && uiState.value.currentTimeMs in 8_000L..9_400L &&
+                    uiState.value.placedBalloons.any { it.event.sourceText == "After the cut." }
+            }
+            val running = htmlMediaClock()
+            assertTrue("HTML video playhead $running", running.getDouble(0) in 7.8..11.0)
+            assertFalse(running.getBoolean(1))
+            onPlayer {
+                pausePlayback()
+                seekTo(1_400L)
+            }
+            waitForPlayer("paused HTML seek and opening cue") {
+                !uiState.value.isPlaying && !uiState.value.seekUnacknowledged &&
+                    uiState.value.placedBalloons.any { it.event.sourceText == "Opening line." }
+            }
+            val paused = htmlMediaClock()
+            assertTrue(paused.getBoolean(1))
+            assertEquals(1.4, paused.getDouble(0), 0.15)
+            assertEquals(12.0, paused.getDouble(2), 0.1)
+            assertTrue(server.requested.containsAll(listOf("/watch", "/clip.mp4", "/lines.vtt")))
+        }
+    }
+
+    private fun openLink(url: String) {
+        onPlayer { setQuotaSaverMode(QuotaSaverMode.ZERO_CLOUD) }
+        ui.onNodeWithTag("start_url_input").performTextInput(url)
+        ui.onNodeWithTag("start_submit_url_button").performClick()
+    }
+
+    private fun htmlMediaClock(): JSONArray {
+        fun webViews(view: View): List<WebView> = when (view) {
+            is WebView -> listOf(view)
+            is ViewGroup -> (0 until view.childCount).flatMap { webViews(view.getChildAt(it)) }
+            else -> emptyList()
+        }
+        val result = LinkedBlockingQueue<String>(1)
+        ui.activityRule.scenario.onActivity { activity ->
+            val viewer = webViews(activity.window.decorView).filter { it.isShown }
+                .maxByOrNull { it.width.toLong() * it.height } ?: error("No visible WebView")
+            viewer.evaluateJavascript("""
+                (() => {
+                    const v = document.querySelector('video');
+                    return v ? [v.currentTime, v.paused, v.duration] : [];
+                })()
+            """.trimIndent()) { result.offer(it) }
+        }
+        return JSONArray(requireNotNull(result.poll(10, TimeUnit.SECONDS)) { "No HTML media clock response" })
     }
 
     private fun fixture(name: String): Uri {

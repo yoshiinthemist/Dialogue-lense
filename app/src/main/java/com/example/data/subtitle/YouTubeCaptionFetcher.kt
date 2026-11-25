@@ -19,6 +19,7 @@ data class YouTubeCaptionResult(
     val languageCode: String? = null,
     val cues: List<RawSubtitleCue> = emptyList(),
     val chapters: List<VideoChapter> = emptyList(),
+    val restricted: Boolean = false,
 )
 
 /**
@@ -30,14 +31,7 @@ object YouTubeCaptionFetcher {
     private val moshi: Moshi = Moshi.Builder().addLast(KotlinJsonAdapterFactory()).build()
     private val mapAdapter = moshi.adapter<Map<String, Any?>>(Map::class.java)
 
-    private const val DESKTOP_UA =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    private const val ANDROID_YT_UA =
-        "com.google.android.youtube/19.44.38 (Linux; U; Android 14) gzip"
-    private const val IOS_YT_UA =
-        "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"
-    private const val ANDROID_VR_YT_UA =
-        "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+    private const val CAPTION_USER_AGENT = "DialogueLens/2.0 (Android)"
 
     suspend fun fetchFastMetadataOnly(
         videoId: String,
@@ -45,8 +39,7 @@ object YouTubeCaptionFetcher {
         val cleanId = videoId.replace(Regex("[^0-9A-Za-z_-]"), "")
         if (cleanId.isBlank()) return@withContext YouTubeCaptionResult()
         kotlinx.coroutines.withTimeoutOrNull(1_800L) {
-            val meta = runCatching { fetchFromAndroidVrInnertube(cleanId) }.getOrNull()
-                ?: runCatching { fetchFromWatchPage(cleanId) }.getOrNull()
+            val meta = runCatching { fetchFromWatchPage(cleanId) }.getOrNull()
             if (meta != null) {
                 YouTubeCaptionResult(
                     title = meta.title,
@@ -75,21 +68,12 @@ object YouTubeCaptionFetcher {
         var bestDurationMs: Long? = null
 
         val result = kotlinx.coroutines.withTimeoutOrNull(8_500L) {
-            val watchMeta = runCatching { fetchFromWatchPage(cleanId) }.getOrNull()
-            val apiKey = watchMeta?.innertubeApiKey
-            val visitorData = watchMeta?.visitorData
-
-            val candidates = buildList {
-                if (watchMeta != null) add(watchMeta)
-                runCatching { fetchFromAndroidVrInnertube(cleanId, apiKey, visitorData) }.getOrNull()?.let(::add)
-                runCatching { fetchFromAndroidInnertube(cleanId, apiKey, visitorData) }.getOrNull()?.let(::add)
-                if (size < 2) {
-                    runCatching { fetchFromEmbedPage(cleanId) }.getOrNull()?.let(::add)
-                }
-            }
-
             var emptyDownloadAttempts = 0
-            for (meta in candidates) {
+            // Use caption tracks actually advertised for a playable, public video.
+            val pages = listOf(::fetchFromWatchPage, ::fetchFromEmbedPage)
+            for (loadPage in pages) {
+                val meta = runCatching { loadPage(cleanId) }.getOrNull() ?: continue
+                if (meta.restricted) return@withTimeoutOrNull YouTubeCaptionResult(restricted = true)
                 if (bestTitle == null && !meta.title.isNullOrBlank()) bestTitle = meta.title
                 if (bestChannelName == null && !meta.channelName.isNullOrBlank()) bestChannelName = meta.channelName
                 if (bestDescription == null && !meta.description.isNullOrBlank()) bestDescription = meta.description
@@ -198,11 +182,11 @@ object YouTubeCaptionFetcher {
         observedBody: String = "",
         userAgent: String? = null,
     ): List<RawSubtitleCue> = withContext(Dispatchers.IO) {
+        if (!isPublicCaptionUrl(observedUrl)) return@withContext emptyList()
         if (observedBody.isNotBlank()) {
             val directCues = runCatching { parseCaptionPayload(observedBody) }.getOrDefault(emptyList())
             if (directCues.isNotEmpty()) return@withContext directCues
         }
-        if (!observedUrl.startsWith("http")) return@withContext emptyList()
         runCatching {
             downloadAndParseTrack(observedUrl, cookies, userAgent)
         }.getOrDefault(emptyList())
@@ -222,181 +206,21 @@ object YouTubeCaptionFetcher {
         val tracks: List<CaptionTrackMeta>,
         val cookies: String? = null,
         val preferredUserAgent: String? = null,
-        val innertubeApiKey: String? = null,
-        val visitorData: String? = null,
+        val restricted: Boolean = false,
     )
 
-    private fun fetchFromAndroidVrInnertube(
-        videoId: String,
-        apiKey: String? = null,
-        visitorData: String? = null,
-    ): PlayerMetaResult? {
-        val body = """
-            {
-              "videoId": "$videoId",
-              "context": {
-                "client": {
-                  "clientName": "ANDROID_VR",
-                  "clientVersion": "1.60.19",
-                  "deviceMake": "Oculus",
-                  "deviceModel": "Quest 3",
-                  "androidSdkVersion": 32,
-                  "hl": "en",
-                  "gl": "US"
-                }
-              }
-            }
-        """.trimIndent()
-        return postPlayerEndpoint(
-            body = body,
-            userAgent = ANDROID_VR_YT_UA,
-            clientNameHeader = "28",
-            clientVersionHeader = "1.60.19",
-            apiKey = apiKey,
-            visitorData = visitorData,
-        )
-    }
-
-    private fun fetchFromAndroidInnertube(
-        videoId: String,
-        apiKey: String? = null,
-        visitorData: String? = null,
-    ): PlayerMetaResult? {
-        val body = """
-            {
-              "videoId": "$videoId",
-              "context": {
-                "client": {
-                  "clientName": "ANDROID",
-                  "clientVersion": "19.44.38",
-                  "androidSdkVersion": 34,
-                  "hl": "en",
-                  "gl": "US"
-                }
-              }
-            }
-        """.trimIndent()
-        return postPlayerEndpoint(
-            body = body,
-            userAgent = ANDROID_YT_UA,
-            clientNameHeader = "3",
-            clientVersionHeader = "19.44.38",
-            apiKey = apiKey,
-            visitorData = visitorData,
-        )
-    }
-
-    private fun fetchFromIosInnertube(
-        videoId: String,
-        apiKey: String? = null,
-        visitorData: String? = null,
-    ): PlayerMetaResult? {
-        val body = """
-            {
-              "videoId": "$videoId",
-              "context": {
-                "client": {
-                  "clientName": "IOS",
-                  "clientVersion": "19.45.4",
-                  "deviceModel": "iPhone16,2",
-                  "hl": "en",
-                  "gl": "US"
-                }
-              }
-            }
-        """.trimIndent()
-        return postPlayerEndpoint(
-            body = body,
-            userAgent = IOS_YT_UA,
-            clientNameHeader = "5",
-            clientVersionHeader = "19.45.4",
-            apiKey = apiKey,
-            visitorData = visitorData,
-        )
-    }
-
-    private fun fetchFromWebInnertube(
-        videoId: String,
-        apiKey: String? = null,
-        visitorData: String? = null,
-    ): PlayerMetaResult? {
-        val body = """
-            {
-              "videoId": "$videoId",
-              "context": {
-                "client": {
-                  "clientName": "WEB",
-                  "clientVersion": "2.20241120.01.00",
-                  "hl": "en",
-                  "gl": "US"
-                }
-              }
-            }
-        """.trimIndent()
-        return postPlayerEndpoint(
-            body = body,
-            userAgent = DESKTOP_UA,
-            clientNameHeader = "1",
-            clientVersionHeader = "2.20241120.01.00",
-            apiKey = apiKey,
-            visitorData = visitorData,
-        )
-    }
-
-    private fun postPlayerEndpoint(
-        body: String,
-        userAgent: String,
-        clientNameHeader: String,
-        clientVersionHeader: String,
-        apiKey: String? = null,
-        visitorData: String? = null,
-    ): PlayerMetaResult? {
-        val endpoint = if (!apiKey.isNullOrBlank()) {
-            "https://www.youtube.com/youtubei/v1/player?key=$apiKey&prettyPrint=false"
-        } else {
-            "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
-        }
-        val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            connectTimeout = 3500
-            readTimeout = 3500
-            setRequestProperty("Content-Type", "application/json")
-            setRequestProperty("User-Agent", userAgent)
-            setRequestProperty("Origin", "https://www.youtube.com")
-            setRequestProperty("X-YouTube-Client-Name", clientNameHeader)
-            setRequestProperty("X-YouTube-Client-Version", clientVersionHeader)
-            if (!visitorData.isNullOrBlank()) {
-                setRequestProperty("X-Goog-Visitor-Id", visitorData)
-            }
-        }
-        return try {
-            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            if (conn.responseCode !in 200..299) return null
-            val cookies = extractCookieHeader(conn)
-            val raw = conn.inputStream.bufferedReader().use { it.readText() }
-            val parsed = mapAdapter.fromJson(raw) ?: return null
-            extractMetaFromPlayerMap(parsed, cookies, userAgent)
-        } finally {
-            conn.disconnect()
-        }
-    }
-
     private fun fetchFromWatchPage(videoId: String): PlayerMetaResult? {
-        val conn = (URL("https://www.youtube.com/watch?v=$videoId&hl=en&bpctr=9999999999").openConnection() as HttpURLConnection).apply {
+        val conn = (URL("https://www.youtube.com/watch?v=$videoId&hl=en").openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 3500
             readTimeout = 3500
-            setRequestProperty("User-Agent", DESKTOP_UA)
+            setRequestProperty("User-Agent", CAPTION_USER_AGENT)
             setRequestProperty("Accept-Language", "en-US,en;q=0.9")
-            setRequestProperty("Cookie", "CONSENT=YES+cb.20210328-17-p0.en+FX+678")
         }
         return try {
             if (conn.responseCode !in 200..299) return null
             val cookies = extractCookieHeader(conn)
             val html = conn.inputStream.bufferedReader().use { it.readText() }
-            val apiKey = Regex(""""INNERTUBE_API_KEY":"([^"]+)"""").find(html)?.groupValues?.getOrNull(1)
-            val visitorData = Regex(""""visitorData":"([^"]+)"""").find(html)?.groupValues?.getOrNull(1)
             val jsonObj = extractJsonObjectAfterMarker(html, "ytInitialPlayerResponse = ")
                 ?: extractJsonObjectAfterMarker(html, "\"playerResponse\":\"")
             val parsed = jsonObj?.let { mapAdapter.fromJson(it) }
@@ -404,9 +228,7 @@ object YouTubeCaptionFetcher {
                 extractMetaFromPlayerMap(
                     root = parsed,
                     cookies = cookies,
-                    userAgent = DESKTOP_UA,
-                    innertubeApiKey = apiKey,
-                    visitorData = visitorData,
+                    userAgent = CAPTION_USER_AGENT,
                 )
             } else {
                 PlayerMetaResult(
@@ -414,9 +236,7 @@ object YouTubeCaptionFetcher {
                     durationMs = null,
                     tracks = emptyList(),
                     cookies = cookies,
-                    preferredUserAgent = DESKTOP_UA,
-                    innertubeApiKey = apiKey,
-                    visitorData = visitorData,
+                    preferredUserAgent = CAPTION_USER_AGENT,
                 )
             }
         } finally {
@@ -429,7 +249,7 @@ object YouTubeCaptionFetcher {
             requestMethod = "GET"
             connectTimeout = 3500
             readTimeout = 3500
-            setRequestProperty("User-Agent", DESKTOP_UA)
+            setRequestProperty("User-Agent", CAPTION_USER_AGENT)
             setRequestProperty("Accept-Language", "en-US,en;q=0.9")
             setRequestProperty("Referer", "https://www.youtube.com/")
         }
@@ -437,8 +257,6 @@ object YouTubeCaptionFetcher {
             if (conn.responseCode !in 200..299) return null
             val cookies = extractCookieHeader(conn)
             val html = conn.inputStream.bufferedReader().use { it.readText() }
-            val apiKey = Regex(""""INNERTUBE_API_KEY":"([^"]+)"""").find(html)?.groupValues?.getOrNull(1)
-            val visitorData = Regex(""""visitorData":"([^"]+)"""").find(html)?.groupValues?.getOrNull(1)
             val jsonObj = extractJsonObjectAfterMarker(html, "ytInitialPlayerResponse = ")
                 ?: extractJsonObjectAfterMarker(html, "\"embedded_player_response\":\"")
             val parsed = jsonObj?.let { runCatching { mapAdapter.fromJson(it) }.getOrNull() }
@@ -446,9 +264,7 @@ object YouTubeCaptionFetcher {
                 extractMetaFromPlayerMap(
                     root = parsed,
                     cookies = cookies,
-                    userAgent = DESKTOP_UA,
-                    innertubeApiKey = apiKey,
-                    visitorData = visitorData,
+                    userAgent = CAPTION_USER_AGENT,
                 )
             } else {
                 PlayerMetaResult(
@@ -456,9 +272,7 @@ object YouTubeCaptionFetcher {
                     durationMs = null,
                     tracks = emptyList(),
                     cookies = cookies,
-                    preferredUserAgent = DESKTOP_UA,
-                    innertubeApiKey = apiKey,
-                    visitorData = visitorData,
+                    preferredUserAgent = CAPTION_USER_AGENT,
                 )
             }
         } finally {
@@ -478,16 +292,18 @@ object YouTubeCaptionFetcher {
         root: Map<String, Any?>,
         cookies: String? = null,
         userAgent: String? = null,
-        innertubeApiKey: String? = null,
-        visitorData: String? = null,
     ): PlayerMetaResult {
+        val status = (root["playabilityStatus"] as? Map<*, *>)?.get("status") as? String
+        if (status != null && status != "OK") {
+            return PlayerMetaResult(title = null, durationMs = null, tracks = emptyList(), restricted = true)
+        }
         val videoDetails = root["videoDetails"] as? Map<String, Any?>
         val title = (videoDetails?.get("title") as? String)?.trim()?.takeIf { it.isNotEmpty() }
         val channelName = (videoDetails?.get("author") as? String)?.trim()?.takeIf { it.isNotEmpty() }
         val description = (videoDetails?.get("shortDescription") as? String)
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
-            ?.take(900)
+            ?.take(16_000)
         val lengthSec = videoDetails?.get("lengthSeconds")?.toString()?.toDoubleOrNull()?.toLong()
         val durationMs = lengthSec?.takeIf { it > 0 }?.times(1000L)
 
@@ -514,10 +330,16 @@ object YouTubeCaptionFetcher {
             tracks = tracks,
             cookies = cookies,
             preferredUserAgent = userAgent,
-            innertubeApiKey = innertubeApiKey,
-            visitorData = visitorData,
         )
     }
+
+    internal fun isWholeTrackForVideo(url: String, videoId: String): Boolean = runCatching {
+        if (!isPublicCaptionUrl(url)) return false
+        val query = java.net.URI(url).rawQuery.orEmpty().split('&').associate {
+            it.substringBefore('=') to it.substringAfter('=', "")
+        }
+        query["v"] == videoId && query.keys.none { it in setOf("sq", "start", "end", "begin", "endtime") }
+    }.getOrDefault(false)
 
     private fun downloadAndParseTrack(
         baseUrl: String,
@@ -526,42 +348,17 @@ object YouTubeCaptionFetcher {
     ): List<RawSubtitleCue> {
         val cleanBase = baseUrl.replace("\\u0026", "&")
 
-        // 1. Always try the exact unmodified signed URL first (preserves live pot= tokens & params)
-        val rawBody = httpGetText(cleanBase, cookies, userAgent)
-        if (!rawBody.isNullOrBlank()) {
-            val parsedRaw = parseCaptionPayload(rawBody)
-            if (parsedRaw.isNotEmpty()) return parsedRaw
-        }
-
-        val withoutFmt = cleanBase
-            .replace(Regex("[?&]fmt=[^&]*"), "")
-            .let { url ->
-                if (!url.contains('?') && url.contains('&')) url.replaceFirst('&', '?') else url
-            }
-        val sep = if (withoutFmt.contains('?')) "&" else "?"
-
-        // 2. JSON3
-        val json3Body = httpGetText("${withoutFmt}${sep}fmt=json3", cookies, userAgent)
-        if (!json3Body.isNullOrBlank()) {
-            val parsedJson = parseCaptionPayload(json3Body)
-            if (parsedJson.isNotEmpty()) return parsedJson
-        }
-
-        // 3. WebVTT
-        val vttBody = httpGetText("${withoutFmt}${sep}fmt=vtt", cookies, userAgent)
-        if (!vttBody.isNullOrBlank()) {
-            val parsedVtt = parseCaptionPayload(vttBody)
-            if (parsedVtt.isNotEmpty()) return parsedVtt
-        }
-
-        // 4. TimedText XML srv1 (<text start=... dur=...>)
-        val srv1Body = httpGetText("${withoutFmt}${sep}fmt=srv1", cookies, userAgent)
-        if (!srv1Body.isNullOrBlank()) {
-            val parsedSrv1 = parseCaptionPayload(srv1Body)
-            if (parsedSrv1.isNotEmpty()) return parsedSrv1
-        }
-        return emptyList()
+        if (!isPublicCaptionUrl(cleanBase)) return emptyList()
+        return httpGetText(cleanBase, cookies, userAgent)?.let(::parseCaptionPayload).orEmpty()
     }
+
+    internal fun isPublicCaptionUrl(value: String): Boolean = runCatching {
+        val uri = java.net.URI(value)
+        val host = uri.host?.lowercase(Locale.ROOT).orEmpty()
+        uri.scheme.equals("https", ignoreCase = true) && uri.userInfo == null && uri.port in listOf(-1, 443) &&
+            (host == "youtube.com" || host.endsWith(".youtube.com") || host == "youtube-nocookie.com" || host.endsWith(".youtube-nocookie.com")) &&
+            uri.path == "/api/timedtext"
+    }.getOrDefault(false)
 
     internal fun parseCaptionPayload(raw: String): List<RawSubtitleCue> {
         val trimmed = raw.trim().removePrefix("\uFEFF")
@@ -588,9 +385,10 @@ object YouTubeCaptionFetcher {
     ): String? {
         val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 7000
-            readTimeout = 7000
-            setRequestProperty("User-Agent", userAgent?.takeIf { it.isNotBlank() } ?: DESKTOP_UA)
+            instanceFollowRedirects = false
+            connectTimeout = 2000
+            readTimeout = 2500
+            setRequestProperty("User-Agent", userAgent?.takeIf { it.isNotBlank() } ?: CAPTION_USER_AGENT)
             setRequestProperty("Referer", "https://www.youtube.com/")
             setRequestProperty("Origin", "https://www.youtube.com")
             setRequestProperty("Accept-Language", "en-US,en;q=0.9")

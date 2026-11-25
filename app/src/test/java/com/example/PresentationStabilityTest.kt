@@ -73,6 +73,25 @@ class PresentationStabilityTest {
         assertNotEquals(moved, run(first, "B"))
     }
 
+    @Test fun substantialVerifiedMovementMustPersistBeforeTheBodyFollows() {
+        val layout = MeasuredBalloonLayout()
+        val sizes = mapOf(proposal.event.id to NormalizedPoint(.3f, .15f))
+        fun run(rect: NormalizedRect, time: Long): NormalizedRect {
+            val tracked = proposal.copy(
+                rect = rect, tailTarget = NormalizedPoint(rect.centerX, rect.centerY + .1f),
+                locationConfidence = .95f, isUnknownSpeaker = false,
+            )
+            return layout.place(listOf(tracked), sizes, emptyList(), .01f, .01f, time).getValue(proposal.event.id)
+        }
+        val original = run(first, 100L)
+        assertEquals(original, run(far, 300L))
+        assertEquals(original, run(first, 350L))
+        assertEquals(original, run(far, 400L))
+        val moved = run(far, 800L)
+        assertNotEquals(original, moved)
+        assertEquals(moved, run(first, 900L))
+    }
+
     @Test fun simultaneousCuesKeepPositionAcrossReorderAndManualDrag() {
         val layout = MeasuredBalloonLayout()
         val a = proposal.copy(rect = first)
