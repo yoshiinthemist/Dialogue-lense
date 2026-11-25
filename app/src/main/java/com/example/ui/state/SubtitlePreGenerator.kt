@@ -639,10 +639,13 @@ class SubtitlePreGenerator(
                 if (completed.invalidTimestampCount > 0) ledger.recordInvalidOrAmbiguousTimestamp(completed.invalidTimestampCount)
                 if (completed.quotaFallbackTransitions > 0) ledger.recordQuotaFallbackTransition()
 
-                if (completed.speakerUpdates.isNotEmpty() || completed.summary.isNotBlank()) {
+                val (reconciledCues, reconciledSpeakers, _) = reconcileWindowOutcomeSpeakersAndCues(
+                    workingProj.speakers, completed.cues, completed.speakerUpdates,
+                )
+                if (reconciledSpeakers.isNotEmpty() || completed.summary.isNotBlank()) {
                     val (castMerged, updatedMem) = mergeCastSlotAssignments(
                         project = workingProj,
-                        assignments = completed.speakerUpdates,
+                        assignments = reconciledSpeakers,
                         rememberedColors = currentColorMemory,
                         reconcileColors = attributionEngine::reconcileCharacterColors,
                         summary = completed.summary,
@@ -653,9 +656,9 @@ class SubtitlePreGenerator(
                 }
 
                 var windowEvidence = emptyList<DialogueEvent>()
-                if (completed.cues.isNotEmpty()) {
+                if (reconciledCues.isNotEmpty()) {
                     val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
-                    val windowEvents = completed.cues.map { cue ->
+                    val windowEvents = reconciledCues.map { cue ->
                         val eventId = SubtitleParser.newEventId()
                         val isNonSpeaker = cue.dialogueType == DialogueType.SOUND_DESCRIPTION ||
                             cue.dialogueType == DialogueType.NARRATION
@@ -664,6 +667,9 @@ class SubtitlePreGenerator(
                             NormalizedPoint(cue.anchorX, cue.anchorY)
                         } else null
                         val slotUpper = cue.suggestedSpeakerSlot.trim().uppercase()
+                        val recognizedSpeaker = if (!isNonSpeaker && slotUpper in validSlots) {
+                            workingProj.speakers.firstOrNull { it.id.equals("spk_${slotUpper.lowercase()}", ignoreCase = true) }
+                        } else null
                         hintMap[eventId] = AiTranslatedLine(
                             id = eventId,
                             naturalTranslation = cue.naturalTranslation,
@@ -683,8 +689,8 @@ class SubtitlePreGenerator(
                             translatedText = cue.naturalTranslation,
                             literalText = cue.literalTranslation,
                             romanization = cue.romanization,
-                            speakerId = null,
-                            speakerConfidence = if (slotUpper in validSlots) 0.84f else 0.42f,
+                            speakerId = recognizedSpeaker?.id,
+                            speakerConfidence = if (recognizedSpeaker != null) 0.84f else 0.42f,
                             faceTrackId = null,
                             faceConfidence = if (spatialAnchor != null) 0.78f else 0f,
                             shotId = "shot_1",
@@ -707,13 +713,13 @@ class SubtitlePreGenerator(
                         incoming = paced,
                         windowStartMs = sliceStartMs,
                     )
-                    windowEvidence = antiEchoed
                     val mergeReport = LookaheadWindowPlanner.mergeWindowDialogueEventsWithReport(
                         existing = workingProj.dialogueEvents,
                         incoming = antiEchoed,
                         windowStartMs = sliceStartMs,
                         windowEndMs = sliceEndMs,
                     )
+                    windowEvidence = mergeReport.windowEvidence
                     ledger.recordDuplicateDecisions(mergeReport.decisions)
                     val (attributedSpeakers, attributedEvents) = attributionEngine.assignSpeakers(
                         events = mergeReport.events,

@@ -1805,12 +1805,13 @@ private fun StudioDiagnosticsTab(
                         }
                     }
                     Text(
-                        text = "${visualStabilitySnapshot.totalRelocations} relocations · ${visualStabilitySnapshot.suppressedAbaOscillations} bounces blocked · ${visualStabilitySnapshot.tailVisibilityToggles} tail flips",
+                        text = "${visualStabilitySnapshot.measuredBodyRelocations} on-screen moves · ${visualStabilitySnapshot.suppressedAbaOscillations} bounces blocked · ${visualStabilitySnapshot.tailVisibilityToggles} tail flips",
                         style = MaterialTheme.typography.bodySmall,
                         color = SoftJade,
                     )
                     DiagnosticMetricRow("Layout evaluations", "${visualStabilitySnapshot.layoutEvaluations}")
-                    DiagnosticMetricRow("Committed relocations", "${visualStabilitySnapshot.totalRelocations}")
+                    DiagnosticMetricRow("On-screen balloon moves", "${visualStabilitySnapshot.measuredBodyRelocations}")
+                    DiagnosticMetricRow("Layout proposal moves", "${visualStabilitySnapshot.totalRelocations}")
                     DiagnosticMetricRow("A-B-A bounces blocked", "${visualStabilitySnapshot.suppressedAbaOscillations}")
                     DiagnosticMetricRow("Tail state toggles", "${visualStabilitySnapshot.tailVisibilityToggles}")
                     DiagnosticMetricRow("Tracking dropouts", "${visualStabilitySnapshot.trackingDropouts}")

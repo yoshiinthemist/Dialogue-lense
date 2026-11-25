@@ -47,6 +47,10 @@ sealed interface ScoutSyncCommand {
  */
 object LookaheadWindowPlanner {
 
+    private val nonWord = Regex("[^\\p{L}\\p{N}]+")
+    private val orderedWord = Regex("[\\p{L}\\p{N}']+")
+    private val orderedSeparator = Regex("[^\\p{L}\\p{N}']+")
+
     const val LOOKAHEAD_LEAD_MS = 7_000L
     const val INTRO_MIN_BUFFER_MS = 3_000L
     const val INTRO_DURATION_MS = 18_000L
@@ -419,6 +423,8 @@ object LookaheadWindowPlanner {
         val acceptedCount: Int,
         val rejectedCount: Int,
         val decisions: List<DuplicateDecisionRecord>,
+        /** Incoming cues retained or independently re-observed inside the requested window. */
+        val windowEvidence: List<DialogueEvent>,
     )
 
     fun mergeWindowDialogueEvents(
@@ -451,6 +457,7 @@ object LookaheadWindowPlanner {
         }
 
         val merged = keptExisting.toMutableList()
+        val evidence = mutableListOf<DialogueEvent>()
         val decisions = mutableListOf<DuplicateDecisionRecord>()
         var acceptedCount = 0
         var rejectedCount = 0
@@ -492,6 +499,7 @@ object LookaheadWindowPlanner {
                         abs(locked.startTimeMs - candidate.startTimeMs) <= 350L)
             }
             if (matchedLocked != null) {
+                if (candidate.startTimeMs in windowStartMs until windowEndMs) evidence.add(candidate)
                 rejectedCount++
                 decisions.add(
                     DuplicateDecisionRecord(
@@ -510,6 +518,8 @@ object LookaheadWindowPlanner {
                 areDuplicateUtterances(prev, candidate)
             }
             if (duplicateMatch != null) {
+                if (duplicateMatch.startTimeMs in windowStartMs until windowEndMs &&
+                    candidate.startTimeMs in windowStartMs until windowEndMs) evidence.add(candidate)
                 rejectedCount++
                 decisions.add(
                     DuplicateDecisionRecord(
@@ -613,6 +623,7 @@ object LookaheadWindowPlanner {
             }
 
             merged.add(stitchedCandidate)
+            if (stitchedCandidate.startTimeMs in windowStartMs until windowEndMs) evidence.add(stitchedCandidate)
             acceptedCount++
             if (decisions.size < 24) {
                 decisions.add(
@@ -631,6 +642,7 @@ object LookaheadWindowPlanner {
             acceptedCount = acceptedCount,
             rejectedCount = rejectedCount,
             decisions = decisions,
+            windowEvidence = evidence,
         )
     }
 
@@ -723,15 +735,22 @@ object LookaheadWindowPlanner {
 
     private fun tokenizeOrderedWords(raw: String): List<String> =
         raw.trim().lowercase()
-            .split(Regex("[^\\p{L}\\p{N}']+"))
+            .split(orderedSeparator)
             .filter { it.isNotBlank() }
 
     private fun dropLeadingWordsPreservingOriginal(raw: String, wordsToDrop: Int): String {
         if (wordsToDrop <= 0) return raw.trim()
-        val matcher = Regex("[\\p{L}\\p{N}']+").findAll(raw).toList()
+        val matcher = orderedWord.findAll(raw).toList()
         if (wordsToDrop >= matcher.size) return ""
         val cutIndex = matcher[wordsToDrop].range.first
         return raw.substring(cutIndex).trimStart(' ', ',', ';', ':', '-', '—', '.').trim()
+    }
+
+    private data class EchoCandidate(val cue: DialogueEvent, val normalized: String, val words: Set<String>)
+
+    private fun echoCandidate(cue: DialogueEvent): EchoCandidate? {
+        val normalized = normalizeCueComparisonText(cue.sourceText)
+        return if (normalized.length < 14) null else EchoCandidate(cue, normalized, tokenizeComparisonWords(cue.sourceText))
     }
 
     /**
@@ -747,23 +766,19 @@ object LookaheadWindowPlanner {
         windowStartMs: Long,
     ): List<DialogueEvent> {
         if (incoming.isEmpty() || existing.isEmpty() || windowStartMs < 35_000L) return incoming
-        val priorAnchors = existing
-            .filter {
-                it.startTimeMs < (windowStartMs - 25_000L).coerceAtLeast(0L) &&
-                    normalizeCueComparisonText(it.sourceText).length >= 14
-            }
-            .sortedBy { it.startTimeMs }
+        val priorAnchors = existing.asSequence()
+            .filter { it.startTimeMs < windowStartMs - 25_000L }
+            .mapNotNull(::echoCandidate)
+            .sortedBy { it.cue.startTimeMs }
+            .toList()
         if (priorAnchors.isEmpty()) return incoming
 
         val exactOrFuzzyMatches = mutableListOf<Pair<Int, DialogueEvent>>() // (incomingIdx, matchedPrior)
         val sameSpeakerMatches = mutableSetOf<Int>()
 
         incoming.forEachIndexed { idx, evt ->
-            val norm = normalizeCueComparisonText(evt.sourceText)
-            if (norm.length < 14) return@forEachIndexed
-            val matchedPrior = priorAnchors.firstOrNull { prior ->
-                isEchoCandidateTextMatch(prior.sourceText, evt.sourceText)
-            }
+            val candidate = echoCandidate(evt) ?: return@forEachIndexed
+            val matchedPrior = priorAnchors.firstOrNull { isEchoCandidateTextMatch(it, candidate) }?.cue
             if (matchedPrior != null) {
                 exactOrFuzzyMatches.add(idx to matchedPrior)
                 if (areSpeakersCompatible(matchedPrior.speakerId, evt.speakerId)) {
@@ -799,18 +814,17 @@ object LookaheadWindowPlanner {
         }
     }
 
-    private fun isEchoCandidateTextMatch(priorText: String, incomingText: String): Boolean {
-        val priorNorm = normalizeCueComparisonText(priorText)
-        val incNorm = normalizeCueComparisonText(incomingText)
-        if (priorNorm.length < 14 || incNorm.length < 14) return false
+    private fun isEchoCandidateTextMatch(prior: EchoCandidate, incoming: EchoCandidate): Boolean {
+        val priorNorm = prior.normalized
+        val incNorm = incoming.normalized
         if (priorNorm == incNorm) return true
         val shorter = minOf(priorNorm.length, incNorm.length)
         if (shorter >= 18 && (priorNorm.contains(incNorm) || incNorm.contains(priorNorm))) return true
-        val priorWords = tokenizeComparisonWords(priorText)
-        val incWords = tokenizeComparisonWords(incomingText)
+        val priorWords = prior.words
+        val incWords = incoming.words
         if (priorWords.size >= 4 && incWords.size >= 4) {
-            val intersection = priorWords.intersect(incWords).size
-            val union = priorWords.union(incWords).size.coerceAtLeast(1)
+            val intersection = incWords.count { it in priorWords }
+            val union = priorWords.size + incWords.size - intersection
             val minSet = minOf(priorWords.size, incWords.size).coerceAtLeast(1)
             if (intersection.toFloat() / union.toFloat() >= 0.58f ||
                 (intersection >= 4 && intersection.toFloat() / minSet.toFloat() >= 0.72f)
@@ -929,11 +943,11 @@ object LookaheadWindowPlanner {
 
     private fun tokenizeComparisonWords(raw: String): Set<String> =
         raw.trim().lowercase()
-            .split(Regex("[^\\p{L}\\p{N}]+"))
+            .split(nonWord)
             .filter { it.length >= 2 }
             .toSet()
 
     private fun normalizeCueComparisonText(raw: String): String =
-        raw.trim().lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), "")
+        raw.trim().lowercase().replace(nonWord, "")
 }
 

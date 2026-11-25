@@ -246,7 +246,8 @@ class HierarchicalContextEngine {
         consecutiveVisible = if (seen) consecutiveVisible + 1 else 0
         if (seen) lastVisibleMs = playbackMs
 
-        val confirmedEmpty = !seen && snapshot.hasLiveVisionSignal && (cut || consecutiveEmpty >= 2)
+        val confirmedEmpty = !seen && snapshot.hasLiveVisionSignal &&
+            (cut || maxOf(consecutiveEmpty, snapshot.emptyFrameConsecutiveCount) >= LiveStageFrameSnapshot.CONFIRMED_EMPTY_FRAME_STREAK)
         val restore = seen && (!prev.liveFrameObservedEmpty || consecutiveVisible >= 2) &&
             (!cut || snapshot.cutDistance < 0.35f)
         val hold = !seen && !cut && !confirmedEmpty && prev.coordinatesValidated &&

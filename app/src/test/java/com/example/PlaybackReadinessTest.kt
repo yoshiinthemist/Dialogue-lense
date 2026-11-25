@@ -1,5 +1,8 @@
 package com.example
 
+import com.example.data.model.CoverageStatus
+import com.example.data.model.SubtitleSourceKind
+import com.example.domain.analysis.TranscriptCoverageLedger
 import com.example.domain.analysis.MediaTransport
 import com.example.domain.analysis.PlaybackPhase
 import com.example.domain.playback.PlaybackReadinessController
@@ -100,6 +103,23 @@ class PlaybackReadinessTest {
         update(7_000, now = 10)
         assertEquals(PlaybackPhase.PROCESSING_UNAVAILABLE, update(7_000, now = 18_010).phase)
         assertNull(update(7_000).playCommand)
+    }
+
+    @Test fun preparedResumeIntentCannotDispatchBeforeTheCurrentSeekIsAcknowledged() {
+        val ledger = TranscriptCoverageLedger(120_000)
+        controller.resetForMedia(0L, 120_000L, true)
+        controller.onUserPlayRequested(0L, ledger, 10)
+        controller.onUserSeekRequested(40_000L, ledger, 20)
+        ledger.recordOutcome(40_000L, 50_000L, CoverageStatus.VERIFIED_DIALOGUE, SubtitleSourceKind.AI_DRAFT, 2)
+        val prepared = controller.evaluateCoverage(ledger, 30).pendingAutoResume!!
+        assertEquals(40_000L, prepared.targetPositionMs)
+        assertEquals(prepared, controller.consumeAutoResumeDirective(prepared.id).pendingAutoResume)
+        assertFalse(controller.acknowledge(0, 40_000L, true))
+        assertTrue(controller.acknowledge(1, 40_000L, true))
+        assertEquals(true, update(10_000L, pos = 40_000L, now = 40).playCommand)
+        assertNull(controller.consumeAutoResumeDirective(prepared.id).pendingAutoResume)
+        assertEquals(1, controller.consumeAutoResumeDirective(prepared.id).diagnostics.autoResumeCount)
+        assertNull(update(10_000L, pos = 40_000L, now = 45).playCommand)
     }
 
     @Test fun transportStallDoesNotStartClockOrRepeatedlyIssuePlay() {

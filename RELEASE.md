@@ -2,6 +2,14 @@
 
 DialogueLens 2.0.0 uses version code 29 and application ID `com.aistudio.dialoguelens.vkpzmx`. The Gradle wrapper pins Gradle 9.3.1 and verifies its distribution checksum. Use JDK 21 and Android SDK platform 36.1 with build tools 36.0.0.
 
+## Build the Play update in the existing Google AI Studio project
+
+This project is developed in Google AI Studio and synced to GitHub. After the verified pull request is merged, open the existing DialogueLens app in Studio, pull the changes from its connected GitHub repository and check that `app/build.gradle.kts` shows version `2.0.0` and code `29`. The original Studio project holds the app's signing identity and Firebase integration.
+
+Use **Settings → Publish → Publish to Play Store** in Studio to send the update to internal testing. Install it over the current Play version, run the media checks below and confirm that saved projects survive. Production promotion happens in Play Console after the internal checks pass.
+
+[Google's Android publishing guide](https://aistudio.google.com/docs/aistudio-android#publish)
+
 ## Build and test locally
 
 From the repository root, install the SDK packages and create a local debug signer once. Run these commands with the Android command-line tools on your PATH.
@@ -21,7 +29,7 @@ Connect a device or start an emulator, then run `bash gradlew :app:connectedDebu
 
 Supply the Firebase Android configuration for this exact application ID in `app/google-services.json`. Enable the project's Firebase AI Logic service and configure App Check for its deployed provider. Use a registered App Check debug token only with a development installation. The production app selects reCAPTCHA Enterprise when a site key is configured, otherwise Play Integrity. The debug package built by public pull-request CI exercises local functionality without production credentials.
 
-## Produce a signed bundle
+## Optional GitHub signing workflow
 
 The Android verification workflow runs the unit suite, lint, debug packaging and API 35 emulator tests. After merging to `main`, the owner can run the workflow manually and select **Build a signed Play bundle**. The `production` GitHub environment supplies the existing upload credential and Firebase configuration.
 

@@ -65,10 +65,12 @@ class LiveStageFaceTracker {
     @Volatile
     private var previousVideoTimeMs: Long = -1L
 
+    private var historyGeneration = 0L
     private var consecutiveEmpty = 0
     private var consecutiveSoftCuts = 0
 
     fun resetSceneHistory() {
+        historyGeneration++
         consecutiveSoftCuts = 0
         consecutiveEmpty = 0
         previousLumaGrid = null
@@ -97,6 +99,7 @@ class LiveStageFaceTracker {
         if (stageBoundsInWindow.width < 48f || stageBoundsInWindow.height < 48f) return null
         if (!captureBusy.compareAndSet(false, true)) return null
 
+        val capturedGeneration = historyGeneration
         var capturedBitmap: Bitmap? = null
         return try {
             val window = findWindow(hostView.context) ?: return null
@@ -137,6 +140,7 @@ class LiveStageFaceTracker {
             if (!lumaAverage.isFinite()) return null
 
             val faces = withContext(NonCancellable) { detectFacesOnBitmap(bitmap) } ?: return null
+            if (closed || historyGeneration != capturedGeneration) return null
             val w = bitmap.width.toFloat().coerceAtLeast(1f)
             val h = bitmap.height.toFloat().coerceAtLeast(1f)
             val nowMs = System.currentTimeMillis()
@@ -179,7 +183,9 @@ class LiveStageFaceTracker {
             val cutDetected = timeDiscontinuity || (reliable && lumaDiff >= VISUAL_CUT_LUMA_THRESHOLD) ||
                 consecutiveSoftCuts >= 2
             if (cutDetected) consecutiveSoftCuts = 0
-            consecutiveEmpty = if (observations.isEmpty()) consecutiveEmpty + 1 else 0
+            val hasLiveVisionSignal = observations.isNotEmpty() || faces.isEmpty() && reliable &&
+                masks.none { it.width * it.height > 0.20f }
+            consecutiveEmpty = if (hasLiveVisionSignal && observations.isEmpty()) consecutiveEmpty + 1 else 0
             previousLumaGrid = if (cutDetected) lumaGrid else mergeGridPreservingMasked(prevGrid, lumaGrid)
             previousFaceSignature = currentFaceSig
             previousVideoTimeMs = videoTimeMs
@@ -196,9 +202,7 @@ class LiveStageFaceTracker {
                 frameLumaAverage = lumaAverage,
                 capturedAtMs = nowMs.coerceAtLeast(videoTimeMs),
                 // Occluded faces and detector failures are not evidence of an empty scene.
-                hasLiveVisionSignal = observations.isNotEmpty() || faces.isEmpty() && masks.none {
-                    it.width * it.height > 0.20f
-                },
+                hasLiveVisionSignal = hasLiveVisionSignal,
             )
         } catch (cancelled: CancellationException) {
             throw cancelled

@@ -146,6 +146,7 @@ class PlaybackReadinessController(
     private var state = PlaybackReadinessState.IDLE
     private var acknowledgedGeneration = 0
     private var episodeStarted: Long? = null
+    private var episodeStartedAtEpochMs = 0L
     private var episodeCount = 0
     private var previousWaitDuration = 0L
     private var resumeSeq = 0L
@@ -178,6 +179,7 @@ class PlaybackReadinessController(
         transport = MediaTransport.PAUSED
         lastNow = 0
         episodeStarted = null
+        episodeStartedAtEpochMs = 0L
         episodeCount = 0
         previousWaitDuration = 0
         directive = null
@@ -258,6 +260,7 @@ class PlaybackReadinessController(
         processingFailed: Boolean,
         transport: MediaTransport,
         nowMs: Long,
+        nowEpochMs: Long = nowMs,
     ): ReadinessDecision {
         lastPosition = positionMs
         duration = durationMs?.takeIf { it > 0L }
@@ -296,6 +299,7 @@ class PlaybackReadinessController(
             directive = null
             if (episodeStarted == null) {
                 episodeStarted = nowMs
+                episodeStartedAtEpochMs = nowEpochMs
                 episodeCount++
             }
         } else if (episodeStarted != null) {
@@ -396,7 +400,7 @@ class PlaybackReadinessController(
     fun confirmResumeDispatched() {
         val pending = directive ?: return
         if (!wantsPlay || pendingTargetMs != null || pending.seekGeneration != generation.toLong() ||
-            !commandedPlaying || transport !in listOf(MediaTransport.PAUSED, MediaTransport.PLAYING)) return
+            !commandedPlaying || (transport != MediaTransport.PAUSED && transport != MediaTransport.PLAYING)) return
         directive = null
         resumesDispatched++
         state = PlaybackReadinessState.PLAYING
@@ -449,7 +453,8 @@ class PlaybackReadinessController(
             midPlaybackBufferThresholdMs = midPlaybackBufferTriggerMs(target), healthyLeadTargetMs = healthyLeadTargetMs(target),
             seekGeneration = generation.toLong(), acknowledgedSeekGeneration = acknowledgedGeneration.toLong(),
             isSeekInFlight = pendingTargetMs != null, bufferingEpisodeCount = episodeCount,
-            bufferingStartedAtEpochMs = episodeStarted ?: 0L, lastBufferingDurationMs = previousWaitDuration,
+            bufferingStartedAtEpochMs = if (episodeStarted != null) episodeStartedAtEpochMs else 0L,
+            lastBufferingDurationMs = previousWaitDuration,
             autoResumeCount = resumesDispatched, watchNowBypassActive = bypassEndMs != null,
             waitTimedOut = waitTimedOut, statusDetail = failureReason,
         )

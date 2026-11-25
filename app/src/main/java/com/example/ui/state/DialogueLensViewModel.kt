@@ -278,6 +278,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun visualStabilitySnapshot() = layoutEngine.stabilityDiagnostics.snapshot()
+        .copy(measuredBodyRelocations = bodyRelocations)
 
     private fun sampledStability(state: DialogueLensUiState): VisualStabilityDiagnosticsSnapshot {
         val now = android.os.SystemClock.elapsedRealtime()
@@ -897,7 +898,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             return
         }
         if (snapshot.visualCutDetected) observedCuts++
-        contextEngine.onLiveFrameSnapshot(snapshot, timeMs)
+        val after = contextEngine.onLiveFrameSnapshot(snapshot, timeMs)
+        if (snapshot.hasLiveVisionSignal && snapshot.faces.isEmpty() && !snapshot.visualCutDetected &&
+            before.sceneMemory.visibleFaces.isNotEmpty() && !after.sceneMemory.liveFrameObservedEmpty
+        ) layoutEngine.stabilityDiagnostics.recordTrackingDropout()
         recomputeBalloons()
     }
 
@@ -928,7 +932,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             if (state.viewerWantsPlay) pausePlayback()
         }
         _uiState.update { current ->
-            current.copy(activeDestination = destination, isFullscreenTheater = false, isEditMode = false)
+            current.copy(
+                activeDestination = destination,
+                isFullscreenTheater = false,
+                isEditMode = false,
+                visualStabilitySnapshot = if (destination == AppDestination.STUDIO) visualStabilitySnapshot()
+                    else current.visualStabilitySnapshot,
+            )
         }
     }
 
@@ -965,9 +975,11 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             speed = state.playbackSpeed,
             verifiedLeadMs = lead,
             needsDialogue = kind != VideoSourceKind.DEMO_SCENARIO && state.displayMode != CaptionDisplayMode.OFF,
-            processingFailed = state.scoutCaptionState is ScoutCaptionState.Error || (kind == VideoSourceKind.LOCAL_MP4 && exoPlayer.playerError != null),
+            processingFailed = coverageLedger.hasFailedIntervalAt(position) || state.scoutCaptionState is ScoutCaptionState.Error ||
+                (kind == VideoSourceKind.LOCAL_MP4 && exoPlayer.playerError != null),
             transport = transportFor(state),
             nowMs = android.os.SystemClock.elapsedRealtime(),
+            nowEpochMs = System.currentTimeMillis(),
         )
         val cmd = result.playCommand
         if (cmd == true) readiness.confirmResumeDispatched()
@@ -5633,6 +5645,9 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                 null
                             }
                             val slotUpper = cue.suggestedSpeakerSlot.trim().uppercase()
+                            val recognizedSpeaker = if (!isNonSpeaker && slotUpper in validSlots) {
+                                workingProj.speakers.firstOrNull { it.id.equals("spk_${slotUpper.lowercase()}", ignoreCase = true) }
+                            } else null
                             windowEvents.add(
                                 DialogueEvent(
                                     id = eventId,
@@ -5642,8 +5657,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                     translatedText = cue.naturalTranslation,
                                     literalText = cue.literalTranslation,
                                     romanization = cue.romanization,
-                                    speakerId = null,
-                                    speakerConfidence = if (slotUpper in validSlots) 0.84f else 0.42f,
+                                    speakerId = recognizedSpeaker?.id,
+                                    speakerConfidence = if (recognizedSpeaker != null) 0.84f else 0.42f,
                                     faceTrackId = null,
                                     faceConfidence = if (spatialAnchor != null) 0.78f else 0f,
                                     shotId = "shot_1",
@@ -5690,16 +5705,18 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                             incoming = pacedWindow,
                             windowStartMs = wStartMs,
                         )
-                        acceptedEvidence = antiEchoedWindow
                         val mergeReport = LookaheadWindowPlanner.mergeWindowDialogueEventsWithReport(
                             existing = cleanExisting,
                             incoming = antiEchoedWindow,
                             windowStartMs = wStartMs,
                             windowEndMs = wEndMs,
                         )
+                        acceptedEvidence = mergeReport.windowEvidence
                         coverageLedger.recordDuplicateDecisions(mergeReport.decisions)
-                        cachedAiTurnHints.putAll(hintMap)
-                        antiEchoedWindow.forEach { autoAnalyzedEventIds.add(it.id) }
+                        acceptedEvidence.forEach { event ->
+                            hintMap[event.id]?.let { cachedAiTurnHints[event.id] = it }
+                            autoAnalyzedEventIds.add(event.id)
+                        }
 
                         // Decouple dialogue acquisition from attribution/placement: even if attribution throws,
                         // preserve every merged spoken dialogue event with safe neutral fallback placement.
