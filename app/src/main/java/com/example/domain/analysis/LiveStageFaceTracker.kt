@@ -32,11 +32,21 @@ data class LiveFaceObservation(
     val capturedAtMs: Long,
 )
 
+data class LiveStageFrameSnapshot(
+    val faces: List<LiveFaceObservation>,
+    val visualCutDetected: Boolean,
+    val cutDistance: Float,
+    val frameLumaAverage: Float,
+    val capturedAtMs: Long,
+    val hasLiveVisionSignal: Boolean = true,
+)
+
 /**
- * High-frequency (~6fps) on-device ML Kit face + mouth landmark tracker that captures rendered
- * VideoPlayerStage frames via Android PixelCopy (zero extra permissions; works identically across
- * embedded YouTube WebView, Web Stream, and ExoPlayer MP4) so balloon tails track moving mouths
- * in real time rather than sticking to static cue coordinates.
+ * High-frequency (~6fps) on-device ML Kit face + mouth landmark tracker with lightweight 8x6
+ * luma-grid visual cut detection. Captures rendered VideoPlayerStage frames via Android PixelCopy
+ * (zero extra permissions; works across embedded YouTube WebView, Web Stream, and ExoPlayer MP4)
+ * so balloon tails track moving mouths and immediately invalidate stale coordinates across real
+ * visual camera cuts, reaction shots, and B-roll transitions.
  */
 class LiveStageFaceTracker {
 
@@ -52,11 +62,33 @@ class LiveStageFaceTracker {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val captureBusy = AtomicBoolean(false)
 
+    @Volatile
+    private var previousLumaGrid: FloatArray? = null
+
+    @Volatile
+    private var previousFaceSignature: List<Pair<Float, Float>> = emptyList()
+
+    @Volatile
+    private var previousVideoTimeMs: Long = -1L
+
+    fun resetSceneHistory() {
+        previousLumaGrid = null
+        previousFaceSignature = emptyList()
+        previousVideoTimeMs = -1L
+    }
+
     suspend fun captureAndDetect(
         hostView: View,
         stageBoundsInWindow: ComposeRect,
         videoTimeMs: Long,
-    ): List<LiveFaceObservation>? {
+    ): List<LiveFaceObservation>? =
+        captureFrameSnapshot(hostView, stageBoundsInWindow, videoTimeMs)?.faces
+
+    suspend fun captureFrameSnapshot(
+        hostView: View,
+        stageBoundsInWindow: ComposeRect,
+        videoTimeMs: Long,
+    ): LiveStageFrameSnapshot? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
         if (!hostView.isAttachedToWindow) return null
         if (stageBoundsInWindow.width < 48f || stageBoundsInWindow.height < 48f) return null
@@ -82,11 +114,14 @@ class LiveStageFaceTracker {
             val copySuccess = requestWindowPixelCopy(window, srcRect, bitmap)
             if (!copySuccess) return null
 
+            val lumaGrid = computeLumaGrid(bitmap)
+            val lumaAverage = if (lumaGrid.isNotEmpty()) lumaGrid.average().toFloat() else 0.5f
+
             val faces = detectFacesOnBitmap(bitmap)
             val w = bitmap.width.toFloat().coerceAtLeast(1f)
             val h = bitmap.height.toFloat().coerceAtLeast(1f)
             val nowMs = System.currentTimeMillis()
-            faces.map { face ->
+            val observations = faces.map { face ->
                 val normBox = NormalizedRect(
                     left = (face.boundingBox.left / w).coerceIn(0f, 1f),
                     top = (face.boundingBox.top / h).coerceIn(0f, 1f),
@@ -101,11 +136,101 @@ class LiveStageFaceTracker {
                     capturedAtMs = nowMs.coerceAtLeast(videoTimeMs),
                 )
             }
+
+            val currentFaceSig = observations
+                .sortedBy { it.boundingBox.centerX }
+                .map { it.boundingBox.centerX to it.boundingBox.centerY }
+
+            val prevGrid = previousLumaGrid
+            val lumaDiff = if (prevGrid != null) computeGridDistance(prevGrid, lumaGrid) else 0f
+            val timeDiscontinuity = previousVideoTimeMs >= 0L &&
+                kotlin.math.abs(videoTimeMs - previousVideoTimeMs) > 2_500L
+            val faceLayoutJump = detectFaceLayoutCut(previousFaceSignature, currentFaceSig)
+
+            // Ignore completely dark transition frames as noise unless paired with big luma jump
+            val cutDetected = timeDiscontinuity ||
+                lumaDiff >= VISUAL_CUT_LUMA_THRESHOLD ||
+                (lumaDiff >= SOFT_CUT_LUMA_THRESHOLD && faceLayoutJump)
+
+            previousLumaGrid = lumaGrid
+            previousFaceSignature = currentFaceSig
+            previousVideoTimeMs = videoTimeMs
+
+            LiveStageFrameSnapshot(
+                faces = observations,
+                visualCutDetected = cutDetected,
+                cutDistance = lumaDiff,
+                frameLumaAverage = lumaAverage,
+                capturedAtMs = nowMs.coerceAtLeast(videoTimeMs),
+                hasLiveVisionSignal = true,
+            )
         } catch (_: Throwable) {
             null
         } finally {
             runCatching { capturedBitmap?.recycle() }
             captureBusy.set(false)
+        }
+    }
+
+    private fun computeLumaGrid(bitmap: Bitmap): FloatArray {
+        val cols = 8
+        val rows = 6
+        val grid = FloatArray(cols * rows)
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w <= 0 || h <= 0) return grid
+        // Sample inner 84% of frame to ignore top/bottom player chrome & letterbox bars
+        val startX = (w * 0.08f).toInt().coerceIn(0, w - 1)
+        val endX = (w * 0.92f).toInt().coerceIn(startX + 1, w)
+        val startY = (h * 0.08f).toInt().coerceIn(0, h - 1)
+        val endY = (h * 0.92f).toInt().coerceIn(startY + 1, h)
+        val cellW = ((endX - startX) / cols).coerceAtLeast(1)
+        val cellH = ((endY - startY) / rows).coerceAtLeast(1)
+
+        var idx = 0
+        for (r in 0 until rows) {
+            val y = (startY + r * cellH + cellH / 2).coerceIn(0, h - 1)
+            for (c in 0 until cols) {
+                val x = (startX + c * cellW + cellW / 2).coerceIn(0, w - 1)
+                val px = bitmap.getPixel(x, y)
+                val red = (px shr 16) and 0xFF
+                val green = (px shr 8) and 0xFF
+                val blue = px and 0xFF
+                grid[idx++] = (0.299f * red + 0.587f * green + 0.114f * blue) / 255f
+            }
+        }
+        return grid
+    }
+
+    companion object {
+        const val VISUAL_CUT_LUMA_THRESHOLD = 0.165f
+        const val SOFT_CUT_LUMA_THRESHOLD = 0.105f
+
+        fun computeGridDistance(a: FloatArray, b: FloatArray): Float {
+            if (a.isEmpty() || a.size != b.size) return 0f
+            var sum = 0f
+            for (i in a.indices) {
+                sum += kotlin.math.abs(a[i] - b[i])
+            }
+            return sum / a.size
+        }
+
+        fun detectFaceLayoutCut(
+            previous: List<Pair<Float, Float>>,
+            current: List<Pair<Float, Float>>,
+        ): Boolean {
+            if (previous.isEmpty() && current.isEmpty()) return false
+            if (previous.isEmpty() != current.isEmpty()) return true
+            if (kotlin.math.abs(previous.size - current.size) >= 2) return true
+            val minSize = minOf(previous.size, current.size)
+            var maxShift = 0f
+            for (i in 0 until minSize) {
+                val dx = previous[i].first - current[i].first
+                val dy = previous[i].second - current[i].second
+                val dist = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+                if (dist > maxShift) maxShift = dist
+            }
+            return maxShift >= 0.24f
         }
     }
 

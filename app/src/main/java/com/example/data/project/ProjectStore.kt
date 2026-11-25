@@ -69,6 +69,8 @@ class ProjectStore(private val context: Context) {
         val SPEAKER_COLORS = booleanPreferencesKey("balloon_speaker_colors")
         val MAX_LINES = intPreferencesKey("balloon_max_lines")
         val REDUCED_MOTION = booleanPreferencesKey("balloon_reduced_motion")
+        val STABLE_POSITIONING = booleanPreferencesKey("balloon_stable_positioning")
+        val MOVEMENT_SENSITIVITY = floatPreferencesKey("balloon_movement_sensitivity")
         val SHOW_SPEAKER_LABELS = booleanPreferencesKey("balloon_show_labels")
         val SPEAKER_LABEL_MODE = stringPreferencesKey("balloon_speaker_label_mode")
         val SHOW_CONFIDENCE = booleanPreferencesKey("balloon_show_confidence")
@@ -99,6 +101,9 @@ class ProjectStore(private val context: Context) {
             speakerSpecificColors = prefs[Keys.SPEAKER_COLORS] ?: defaultStyle.speakerSpecificColors,
             maxLines = prefs[Keys.MAX_LINES] ?: defaultStyle.maxLines,
             reducedMotion = prefs[Keys.REDUCED_MOTION] ?: defaultStyle.reducedMotion,
+            stablePositioning = prefs[Keys.STABLE_POSITIONING] ?: defaultStyle.stablePositioning,
+            movementSensitivity = (prefs[Keys.MOVEMENT_SENSITIVITY] ?: defaultStyle.movementSensitivity)
+                .coerceIn(0f, 1f),
             showSpeakerLabels = labelMode != SpeakerLabelMode.OFF,
             labelMode = labelMode,
             showConfidenceIndicators = prefs[Keys.SHOW_CONFIDENCE] ?: defaultStyle.showConfidenceIndicators,
@@ -158,6 +163,8 @@ class ProjectStore(private val context: Context) {
             prefs[Keys.SPEAKER_COLORS] = settings.speakerSpecificColors
             prefs[Keys.MAX_LINES] = settings.maxLines
             prefs[Keys.REDUCED_MOTION] = settings.reducedMotion
+            prefs[Keys.STABLE_POSITIONING] = settings.stablePositioning
+            prefs[Keys.MOVEMENT_SENSITIVITY] = settings.movementSensitivity.coerceIn(0f, 1f)
             prefs[Keys.SHOW_SPEAKER_LABELS] = settings.labelMode != SpeakerLabelMode.OFF
             prefs[Keys.SPEAKER_LABEL_MODE] = settings.labelMode.name
             prefs[Keys.SHOW_CONFIDENCE] = settings.showConfidenceIndicators
@@ -272,6 +279,14 @@ class ProjectStore(private val context: Context) {
             val langSlug = targetLanguage.trim().lowercase().replace(Regex("[^a-z0-9]"), "").ifBlank { "en" }
             return "yt_${cleanId}_$langSlug"
         }
+
+        fun canonicalCacheKey(
+            source: com.example.data.model.VideoSource,
+            targetLanguage: String,
+        ): String = com.example.domain.media.MediaSourceAdapterRegistry.default.canonicalCacheKey(
+            source = source,
+            targetLanguage = targetLanguage,
+        )
 
         fun buildLineTranslationCacheKey(
             sourceText: String,

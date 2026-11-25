@@ -1,0 +1,885 @@
+DialogueLens — Final 1.0 Polish, Reliability & User Experience Overhaul
+
+1. Mission
+
+Transform the existing DialogueLens application into a polished, reliable, intuitive, release-quality media viewing experience.
+
+DialogueLens has successfully demonstrated its core concept: transforming conventional subtitles into intelligently positioned, speaker-aware dialogue bubbles that allow viewers to follow conversations naturally without constantly looking away from the action.
+
+The concept works. Do not reinvent it.
+
+This update should focus on four pillars:
+
+- Reliable contextual understanding.
+- Intelligent, localized self-healing.
+- Exceptionally intuitive user experience.
+- Professional visual and interactive design.
+
+The finished application should feel like a thoughtfully designed media player with extraordinary subtitle capabilities, not a technical interface for operating an artificial intelligence model.
+
+2. Development Philosophy
+
+Before making changes, thoroughly inspect the existing codebase, architecture, processing pipeline, data structures, and working features.
+
+Preserve successful functionality.
+
+Do not unnecessarily rebuild working systems, introduce regressions, remove capabilities, or replace functional implementations with superficial demonstrations.
+
+Make meaningful improvements to the actual application, not merely its visual presentation.
+
+Every visible control must perform its intended function.
+
+Prioritize the following, in order:
+
+1. Dialogue accuracy.
+2. Speaker attribution accuracy.
+3. Temporal synchronization.
+4. Visual stability.
+5. Ease of use.
+6. Processing efficiency.
+7. Aesthetic refinement.
+
+When the system is uncertain, graceful degradation is preferable to confidently displaying incorrect information.
+
+3. Investigate and Resolve Contextual Transition Failures
+
+Real-world testing has revealed intermittent issues around transitions between different portions of YouTube videos.
+
+Suspected triggers include:
+
+- YouTube chapter boundaries.
+- Abrupt camera cuts.
+- Inserted prerecorded footage.
+- Transitions between studio discussions and external clips.
+- Changes in camera angle.
+- Speakers temporarily leaving the frame.
+- Voice-over narration.
+- Rapid exchanges between speakers.
+- Picture-in-picture content.
+- Changes between different groups of participants.
+
+Observed symptoms include:
+
+- Dialogue persisting across unrelated shots.
+- Incorrect speaker attribution.
+- Speech bubbles pointing toward empty space.
+- Incorrect or outdated speaker coordinates.
+- Unnecessarily dramatic changes in bubble placement.
+- Dialogue that appears to become temporarily disconnected from the current visual context.
+
+Investigate whether these problems originate from stale scene context, timestamp drift, analysis segment boundaries, cached coordinates, incorrect speaker identification, playback synchronization, asynchronous processing, or another underlying cause.
+
+Do not assume that YouTube chapters themselves are definitively responsible.
+
+Identify and address the actual root causes.
+
+4. Implement Hierarchical Contextual Awareness
+
+Separate the application's understanding of a video into three distinct contextual layers.
+
+Layer A — Video Memory
+
+Persistent knowledge maintained throughout the entire video.
+
+Includes:
+
+- Established speaker identities.
+- Speaker names and aliases.
+- Assigned speaker colors.
+- Previously verified voice characteristics, where supported.
+- Previously verified visual characteristics, where supported.
+- User-confirmed speaker corrections.
+- Established relationships between recurring speakers and their dialogue.
+
+This information should survive camera cuts, chapter changes, temporary absences, and localized repairs.
+
+Do not create duplicate speaker identities simply because an existing speaker appears in a different scene or camera angle.
+
+Layer B — Chapter Memory
+
+Context associated with a particular section of the video.
+
+Includes:
+
+- Current discussion topic.
+- Relevant participants.
+- Chapter boundaries.
+- Editorial segment boundaries.
+- Recently established conversational context.
+
+Use available YouTube chapter metadata where accessible and reliable.
+
+Where explicit chapter metadata is unavailable, infer meaningful contextual boundaries from the available audio, visual, and transcript evidence.
+
+Chapter transitions should trigger contextual revalidation without unnecessarily discarding established video-level speaker knowledge.
+
+Layer C — Scene Memory
+
+Short-lived information associated with the current visual environment.
+
+Includes:
+
+- Visible participants.
+- Current face and body positions.
+- Speaker coordinates.
+- Camera framing.
+- Current visual layout.
+- Safe speech bubble placement regions.
+- Whether an active speaker is actually visible.
+
+Revalidate scene memory whenever a meaningful visual transition occurs.
+
+Never assume that coordinates from a previous camera shot remain valid in the next shot.
+
+Separate speaker identity confidence from speaker location confidence.
+
+The application may know exactly who is speaking without knowing where that person currently appears on screen.
+
+5. Intelligent Transition Handling
+
+Implement a transition-aware analysis and rendering pipeline.
+
+When a significant scene change occurs:
+
+1. Invalidate stale positional information.
+2. Retain independently verified speaker identities.
+3. Determine whether the existing dialogue remains temporally valid.
+4. Reevaluate which participants are visible.
+5. Reestablish reliable speaker positioning.
+6. Restore directional speech bubbles only when sufficient evidence exists.
+
+A camera cut does not necessarily mean that the speaker has changed.
+
+A speaker may continue talking while the video shows another person, a reaction shot, an image, or prerecorded footage.
+
+The system must understand this distinction.
+
+Core rendering rule
+
+Never confidently point a speech bubble toward an unverified speaker location.
+
+If speaker identity is known but location is uncertain, display a speaker-colored, tailless dialogue bubble.
+
+If speaker identity is unknown, use a neutral caption.
+
+If the speaker is confidently off-screen, use an appropriate off-screen dialogue presentation.
+
+Do not classify every off-screen speaker as generic voice-over narration.
+
+Preserve established identity whenever evidence supports it.
+
+6. Speech Bubble Intelligence
+
+Speech bubbles are the defining feature of DialogueLens.
+
+Treat their design and behavior as a primary product experience.
+
+Speech bubbles must:
+
+- Remain readable across different backgrounds.
+- Maintain sufficient text contrast.
+- Avoid covering important facial features.
+- Avoid unnecessarily obscuring the action.
+- Remain within the visible video boundaries.
+- Point accurately toward verified speakers.
+- Maintain consistent speaker colors.
+- Accommodate different video aspect ratios.
+- Adapt to screen size and orientation.
+- Handle multiple simultaneous speakers gracefully.
+
+Improve the placement algorithm to consider:
+
+- Speaker position.
+- Available negative space.
+- Other visible participants.
+- Existing on-screen text.
+- Important visual content.
+- Previous bubble location.
+- Reading comfort.
+- Bubble dimensions.
+
+Use spatial smoothing and placement hysteresis to prevent unnecessary movement.
+
+Avoid repositioning a bubble for insignificant changes in speaker coordinates.
+
+When an actual camera cut occurs, prioritize immediate positional correctness rather than smoothing across unrelated shots.
+
+Do not animate bubbles excessively.
+
+Reading comfort is more important than decorative movement.
+
+Use readable typography, restrained outlines, appropriate padding, and subtle translucent backgrounds.
+
+Speech bubble tails should be visually meaningful, not excessively long or arbitrarily oriented.
+
+Provide a stable tailless fallback whenever directional placement cannot be justified.
+
+7. Introduce the Heal Beacon System
+
+Implement a new feature called Heal Beacon.
+
+This feature allows viewers to report and initiate localized repairs without understanding the technical cause of a problem.
+
+Its guiding principle is:
+
+Pause. Mark. Heal. Continue.
+
+The user should never need to determine whether an error originates from speaker identification, timing, scene detection, or another processing subsystem.
+
+Primary interaction
+
+Whenever playback is paused, make a contextual action available:
+
+Heal this moment
+
+Use a recognizable, approachable icon representing localized repair.
+
+Selecting this action should:
+
+- Capture the exact playback timestamp.
+- Place a persistent repair beacon on the timeline.
+- Queue a localized reanalysis.
+- Provide immediate visual confirmation.
+- Allow the viewer to resume watching.
+
+The entire process should require no more than two intentional interactions after noticing an error.
+
+Do not require the viewer to complete a report, select an error category, or describe the problem.
+
+Beacon lifecycle
+
+Each beacon should have an understandable status:
+
+- Marked.
+- Healing.
+- Healed.
+- Needs attention.
+
+Use restrained, accessible visual indicators.
+
+Multiple beacons must be supported.
+
+Persist beacons with the video so unfinished repairs are not lost when the user closes the application.
+
+Allow users to inspect, retry, dismiss, or revisit individual beacons.
+
+Timeline integration
+
+Display repair beacons directly on the media timeline.
+
+They should be distinguishable from ordinary speaker and chapter markers without making the timeline visually overwhelming.
+
+Selecting a beacon should allow the viewer to:
+
+- Jump to the affected moment.
+- See its repair status.
+- Review the result.
+- Retry if necessary.
+- Undo the repair where applicable.
+
+The main timeline must remain primarily a playback navigation tool.
+
+8. Localized Healing Pipeline
+
+A Heal Beacon should initially trigger analysis of approximately 15 seconds before and 15 seconds after the marked timestamp.
+
+Treat this as an adaptive starting window rather than a rigid boundary.
+
+Expand the analysis window when necessary to capture:
+
+- Complete dialogue segments.
+- Sentence boundaries.
+- Scene boundaries.
+- Relevant chapter transitions.
+- Speaker identification evidence.
+- Sufficient surrounding conversational context.
+
+The healing process should evaluate all relevant failure categories:
+
+- Missing dialogue.
+- Incorrect dialogue.
+- Incorrect timing.
+- Incorrect speaker identity.
+- Incorrect speaker location.
+- Stale dialogue.
+- Invalid positional information.
+- Incorrect scene classification.
+- Duplicate dialogue.
+- Incorrect off-screen speaker handling.
+
+Compare the proposed repair against existing analysis.
+
+Replace only the affected data.
+
+Preserve unrelated analysis, established speaker identities, user-confirmed corrections, and unaffected portions of the video.
+
+Safe repair requirements
+
+Repairs must be:
+
+- Localized.
+- Validated.
+- Reversible.
+- Persistent.
+- Protected against duplicate processing.
+- Protected against partial or corrupted writes.
+
+Use atomic updates and versioned analysis data where appropriate.
+
+Keep the original analysis available until the proposed replacement has been successfully validated.
+
+Do not mark a repair as successful merely because an AI request completed.
+
+If insufficient evidence exists to improve the affected segment, retain the safer existing result or use an appropriate fallback.
+
+Communicate that the moment still needs attention.
+
+Advanced healing options
+
+Provide optional expanded repair controls in Studio or a contextual beacon detail panel:
+
+- Quick Heal — immediate surrounding moment.
+- Scene Heal — complete affected scene.
+- Chapter Heal — complete affected chapter or editorial segment.
+
+The default action must remain simple and adaptive.
+
+Most users should never need to select a repair scope manually.
+
+9. Automatic Self-Healing
+
+In addition to manual Heal Beacons, implement intelligent detection of likely analysis failures.
+
+Potential signals include:
+
+- Speech bubbles targeting invalid coordinates.
+- Dialogue persisting beyond its established time range.
+- Abrupt unexplained speaker identity changes.
+- Repeated dialogue segments.
+- Unexpected gaps in dialogue coverage.
+- Conflicting overlapping dialogue.
+- Directional bubbles persisting across incompatible shots.
+- Duplicate speaker identities.
+- Repeated low-confidence positional predictions.
+
+Use these signals to trigger appropriate safeguards and, when supported by the available processing budget, localized reanalysis.
+
+Avoid endless repair loops.
+
+Use retry limits, cooldown periods, deduplication, and intelligent prioritization.
+
+Do not consume significant cloud processing resources without appropriate user awareness or authorization.
+
+The user should be able to continue watching while eligible background repairs occur.
+
+10. Complete UX Architecture
+
+Organize DialogueLens around three understandable destinations.
+
+WATCH
+
+The primary viewing experience.
+
+This should be where users spend most of their time.
+
+Its purpose is watching media, not managing AI analysis.
+
+LIBRARY
+
+A collection of imported, previously watched, and analyzed media.
+
+Include:
+
+- Video thumbnails.
+- Titles.
+- Playback progress.
+- Resume actions.
+- Analysis readiness.
+- Outstanding repair beacons.
+- Recently watched media.
+- Search and appropriate sorting.
+
+Opening previously analyzed media should reuse valid cached analysis rather than unnecessarily repeating expensive processing.
+
+STUDIO
+
+A dedicated environment for advanced editing and troubleshooting.
+
+Include:
+
+- Dialogue timeline.
+- Speaker management.
+- Subtitle editing.
+- Timing corrections.
+- Speaker reassignment.
+- Repair management.
+- Chapter and scene review.
+- Subtitle imports and exports.
+- Analysis diagnostics.
+
+Studio should contain the advanced capabilities that would otherwise clutter the viewing experience.
+
+Keep global preferences within a clearly accessible Settings destination.
+
+11. Perfect the Home and Import Experience
+
+A first-time user should immediately understand what DialogueLens does and how to begin.
+
+Use a concise product explanation:
+
+Follow the conversation, not the subtitles.
+
+Offer clear entry points:
+
+- Paste a video link.
+- Open a video file.
+- Try an interactive demo.
+
+Support existing caption imports and AI-generated dialogue according to the application's actual capabilities.
+
+Clearly explain the difference between using existing captions and generating new dialogue with AI when the distinction affects accuracy, cost, or functionality.
+
+Do not overwhelm users with model selection, processing methods, segmentation settings, or other implementation details.
+
+Choose sensible defaults.
+
+Technical configuration should be optional and progressively disclosed.
+
+Automatically begin appropriate preparation when permitted by the user's settings and processing authorization.
+
+Provide clear recovery actions when importing or opening media fails.
+
+12. Perfect the Watching Experience
+
+Make the Watch interface familiar to anyone who has used a modern media player.
+
+Primary controls
+
+Include:
+
+- Play and pause.
+- Skip backward and forward.
+- Seek timeline.
+- Playback position and duration.
+- Volume or mute.
+- Fullscreen.
+- Dialogue display mode.
+
+Dialogue display modes
+
+Make the three primary modes immediately understandable:
+
+- Speech bubbles.
+- Traditional subtitles.
+- Dialogue off.
+
+Use recognizable icons, accessible labels, and clear selected states.
+
+Switching display modes must not interrupt playback or require reanalysis.
+
+Contextual controls
+
+Show relevant secondary actions when appropriate:
+
+- Heal this moment.
+- Change speaker.
+- Review dialogue.
+- Display preferences.
+
+Keep advanced functions out of the permanent primary control surface.
+
+Dialogue panel
+
+Preserve access to the current speaker and dialogue.
+
+Make the separate dialogue panel collapsible or adaptable so the user can choose between a focused cinematic experience and additional reading assistance.
+
+Do not unnecessarily duplicate large amounts of information on screen.
+
+Fullscreen experience
+
+Prioritize immersion.
+
+Controls should fade when not needed and reappear predictably.
+
+Preserve access to subtitle modes and Heal Beacons without forcing the user to exit fullscreen.
+
+Use native player controls where appropriate and avoid conflicting duplicated controls.
+
+13. Make Processing Understandable
+
+The current application exposes technical information that may be meaningful to developers but confusing to ordinary viewers.
+
+Examples include:
+
+- Scout 20/28.
+- Full · 344.
+- Partial coverage percentages.
+- Model names.
+- Processing segment counts.
+- Internal analysis terminology.
+
+Translate these into meaningful user-facing states:
+
+- Preparing dialogue.
+- Ready to watch.
+- Analyzing ahead.
+- Some dialogue is unavailable.
+- Healing a moment.
+- Ready offline, where applicable.
+- Needs attention.
+
+Distinguish genuinely silent portions of a video from unanalyzed, failed, or missing dialogue.
+
+Never present incomplete analysis as fully ready.
+
+Consolidate processing information into a subtle, understandable readiness indicator.
+
+Keep detailed metrics, coverage ledgers, processing logs, model information, and technical diagnostics accessible in Studio.
+
+Disable intrusive Scout picture-in-picture behavior by default.
+
+Do not interrupt the viewing experience with routine success notifications or technical banners.
+
+Communicate actionable failures clearly and provide relevant recovery options.
+
+14. Make Speaker Corrections Effortless
+
+Users should be able to correct speaker attribution directly from the viewing experience.
+
+When an appropriate bubble or speaker label is selected, provide a lightweight contextual menu:
+
+- Change speaker.
+- Mark as off-screen.
+- Edit dialogue.
+- Heal this moment.
+
+Show established speakers using recognizable names, avatars where available, and consistent colors.
+
+Allow users to create or merge speaker identities when necessary.
+
+Distinguish between correcting one line and correcting a broader identity assignment.
+
+Never silently apply an uncertain global correction.
+
+Treat explicitly confirmed user corrections as high-priority evidence during subsequent analysis and repairs.
+
+Do not overwrite verified manual corrections without user authorization.
+
+15. Establish a Premium Visual Design System
+
+Preserve DialogueLens's existing identity while refining its visual execution.
+
+The desired aesthetic is:
+
+- Cinematic.
+- Modern.
+- Quiet.
+- Intelligent.
+- Accessible.
+- Professional.
+
+Use a restrained dark interface with the existing cyan accent direction.
+
+Reserve additional colors primarily for speaker identification and meaningful status communication.
+
+Avoid:
+
+- Excessive gradients.
+- Unnecessary neon effects.
+- Decorative glows.
+- Overly complicated cards.
+- Crowded toolbars.
+- Tiny technical indicators.
+- Inconsistent iconography.
+- Excessive borders.
+- Unnecessary animation.
+- Generic AI dashboard styling.
+
+Create a coherent design system covering:
+
+- Typography.
+- Spacing.
+- Surface hierarchy.
+- Color tokens.
+- Buttons.
+- Icons.
+- Touch targets.
+- Navigation.
+- Dialogs.
+- Bottom sheets.
+- Timeline markers.
+- Loading states.
+- Empty states.
+- Error states.
+- Accessibility states.
+
+Every screen should feel like part of the same application.
+
+Visual hierarchy should communicate importance without relying on excessive text or decoration.
+
+16. Responsive and Adaptive Layouts
+
+Treat mobile usability as a fundamental requirement rather than a scaled-down desktop design.
+
+Test and refine:
+
+- Small Android phones.
+- Large phones.
+- Foldable phones.
+- Folded and unfolded display states.
+- Tablets.
+- Portrait orientation.
+- Landscape orientation.
+- Fullscreen video.
+- Desktop browser layouts, where supported.
+
+Avoid clipping, horizontal overflow, awkwardly stacked controls, and inaccessible actions.
+
+Use the additional screen space of tablets and unfolded devices intelligently.
+
+For example, larger screens may support a dedicated dialogue panel alongside the video rather than beneath it.
+
+Orientation and display-size changes must preserve:
+
+- Playback position.
+- Playback state.
+- Current dialogue.
+- Analysis state.
+- Speaker identities.
+- Repair beacons.
+
+Recalculate visual coordinates correctly after layout changes.
+
+Do not restart playback or analysis unnecessarily.
+
+17. Accessibility and Reading Comfort
+
+DialogueLens should be usable by viewers with different visual, auditory, neurological, and motor accessibility needs.
+
+Include appropriate controls for:
+
+- Dialogue font size.
+- Bubble opacity.
+- Text contrast.
+- Reduced motion.
+- Bubble movement sensitivity.
+- Stable positioning.
+- Speaker identification visibility.
+- Traditional subtitle presentation.
+
+Ensure that speaker identity is not communicated exclusively through color.
+
+Use accessible names for interactive controls.
+
+Maintain adequate touch target sizes and logical navigation.
+
+Support relevant platform accessibility features.
+
+Provide an optional stable-dialogue mode that minimizes bubble movement while preserving speaker attribution.
+
+Avoid flashing elements, rapid animations, and unnecessary visual disruptions.
+
+The application should make media easier to consume, not introduce additional cognitive or visual strain.
+
+18. Reliability, Persistence and Resource Management
+
+Preserve and strengthen existing reliability mechanisms.
+
+Maintain:
+
+- Explicit analysis coverage tracking.
+- Accurate processing outcomes.
+- Failed-segment tracking.
+- Cache versioning.
+- Atomic data writes.
+- Duplicate-request prevention.
+- Recovery mechanisms.
+- Persistent video analysis.
+- Persistent user corrections.
+- Persistent repair beacons.
+
+Ensure that overlapping repairs do not overwrite one another incorrectly.
+
+Merge compatible repair requests or serialize conflicting operations.
+
+Prevent stale asynchronous analysis results from replacing newer validated data.
+
+Gracefully handle:
+
+- Network interruptions.
+- AI request failures.
+- API rate limits.
+- Processing quota exhaustion.
+- Application suspension.
+- Application restarts.
+- Media playback errors.
+- Unavailable YouTube videos.
+- Restricted or unsupported media.
+- Missing captions.
+
+Clearly communicate processing costs or credit limitations when applicable.
+
+Do not repeatedly process identical content unnecessarily.
+
+Protect user credentials and avoid exposing secrets in diagnostic interfaces or production logs.
+
+Do not claim access to video frames, chapter metadata, audio, or other information that the current media source does not actually provide.
+
+Adapt analysis capabilities to the available evidence.
+
+19. Testing and Quality Assurance
+
+Do not consider this update complete after implementing the requested features.
+
+Conduct systematic functional, visual, and regression testing.
+
+Media test scenarios
+
+Test:
+
+- Single-speaker videos.
+- Two-person interviews.
+- Multi-person panel discussions.
+- Anime and animated media.
+- Movies and television.
+- Podcasts.
+- Voice-over content.
+- Documentary footage.
+- Videos with chapter boundaries.
+- Videos with frequent camera cuts.
+- Videos containing inserted clips.
+- Videos with overlapping speakers.
+- Videos with periods of silence.
+- Vertical video within horizontal video.
+- Videos with existing burned-in subtitles.
+
+Where supported, test different languages and subtitle sources.
+
+Transition-specific testing
+
+Verify that:
+
+- Speaker identity survives appropriate camera cuts.
+- Stale coordinates do not survive incompatible scene changes.
+- Dialogue remains synchronized after seeking.
+- Dialogue does not persist past valid timestamps.
+- Off-screen speakers retain their identities when justified.
+- Chapter transitions do not corrupt subsequent analysis.
+- Inserted footage does not unnecessarily contaminate established speaker identities.
+- Directional bubbles never rely on invalidated positional data.
+
+Heal Beacon testing
+
+Verify:
+
+- Beacon placement while paused.
+- Exact timestamp capture.
+- Multiple queued repairs.
+- Overlapping repair windows.
+- Repairs across chapter boundaries.
+- Successful localized replacement.
+- Failed repair recovery.
+- Repair cancellation where supported.
+- Undo functionality.
+- Persistence after restarting.
+- Preservation of unaffected dialogue.
+- Preservation of user-confirmed corrections.
+- Continued playback during eligible processing.
+- Appropriate behavior when processing resources are unavailable.
+
+UX testing
+
+Evaluate the application from the perspective of a completely new user.
+
+Can the user:
+
+- Understand what DialogueLens does?
+- Open a video without instruction?
+- Begin watching without configuring AI parameters?
+- Understand when the video is ready?
+- Switch dialogue modes easily?
+- Recognize who is speaking?
+- Correct an obvious mistake?
+- Place a Heal Beacon without assistance?
+- Resume watching immediately?
+- Return to a previously watched video?
+- Locate advanced controls when needed?
+
+If an ordinary action requires unnecessary decisions or technical understanding, simplify it.
+
+20. Final Refinement Passes
+
+Before declaring completion, perform five distinct refinement passes.
+
+Pass 1 — Engineering
+
+Investigate root causes, race conditions, data integrity, analysis boundaries, and regressions.
+
+Pass 2 — User Experience
+
+Reduce unnecessary interactions, confusing terminology, redundant controls, and cognitive load.
+
+Pass 3 — Visual Design
+
+Refine typography, spacing, consistency, iconography, responsive layouts, and visual hierarchy.
+
+Pass 4 — Accessibility
+
+Evaluate readability, contrast, reduced motion, touch targets, stable dialogue presentation, and assistive technology compatibility.
+
+Pass 5 — Real-World Viewing
+
+Evaluate the application as an actual viewer watching an extended video.
+
+Pay particular attention to whether the dialogue presentation feels natural over time rather than merely impressive during a short demonstration.
+
+Identify distractions, unnecessary notifications, awkward transitions, unstable bubbles, and any moments where the viewer must manage the application instead of watching the content.
+
+Correct discovered issues.
+
+21. Release Acceptance Criteria
+
+The update is successful when:
+
+- Previously working functionality remains intact.
+- Scene and chapter transitions are handled safely.
+- Speech bubbles remain temporally and spatially reliable.
+- Uncertain analysis degrades gracefully.
+- Users can initiate localized repairs with minimal interaction.
+- Repairs preserve unaffected analysis.
+- Manual corrections remain protected.
+- The application is understandable without a tutorial.
+- Advanced functionality remains accessible without cluttering playback.
+- Media playback feels stable and uninterrupted.
+- Mobile and foldable layouts feel intentional.
+- Technical failures produce understandable recovery options.
+- The interface feels cohesive and professionally designed.
+- Resource consumption is controlled.
+- Testing results are documented accurately.
+
+Do not claim that untested functionality has been verified.
+
+Clearly identify any remaining limitations imposed by the current architecture, platform, media source, or available AI services.
+
+22. Final Implementation Directive
+
+Implement these improvements in the existing application.
+
+Exercise thoughtful design judgment where specific visual or technical decisions have not been prescribed.
+
+Do not simply provide recommendations, mockups, or a development roadmap. Make the functional changes, test them, and refine the results.
+
+Preserve the soul of DialogueLens.
+
+The application is not fundamentally about AI, transcription, face tracking, speaker classification, or subtitle technology.
+
+It is about allowing people to experience dialogue as naturally as possible.
+
+The intelligence should be powerful enough to notice mistakes, humble enough to acknowledge uncertainty, and accessible enough to let anyone correct a problem without technical expertise.
+
+The interface should become almost invisible during normal use.
+
+When something goes wrong, the viewer should be able to mark the moment, let DialogueLens heal it, and return to enjoying the video.
+
+Make DialogueLens feel like the next evolution of subtitles.

@@ -59,6 +59,8 @@ import com.example.data.model.ProcessingQualityMode
 import com.example.data.model.SubtitleSourceKind
 import com.example.data.model.TranslationMode
 import com.example.data.model.VideoSourceKind
+import com.example.domain.media.MediaProviderKind
+import com.example.domain.media.MediaSourceAdapterRegistry
 import com.example.ui.theme.CinemaElevated
 import com.example.ui.theme.LensAmber
 import com.example.ui.theme.LensMint
@@ -150,8 +152,15 @@ fun MediaImportSheet(
         }
     }
 
-    val extractedYoutubeId = remember(youtubeUrlInput) { extractYouTubeId(youtubeUrlInput) }
-    val normalizedWebUrl = remember(youtubeUrlInput) { normalizeWebStreamUrl(youtubeUrlInput) }
+    val resolvedMedia = remember(youtubeUrlInput) {
+        MediaSourceAdapterRegistry.default.resolveInput(youtubeUrlInput)
+    }
+    val extractedYoutubeId = resolvedMedia?.youtubeVideoId
+        ?: remember(youtubeUrlInput) { extractYouTubeId(youtubeUrlInput) }
+    val normalizedWebUrl = remember(youtubeUrlInput, resolvedMedia) {
+        resolvedMedia?.normalizedUri?.takeIf { it.startsWith("http", ignoreCase = true) }
+            ?: normalizeWebStreamUrl(youtubeUrlInput)
+    }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -276,13 +285,21 @@ fun MediaImportSheet(
             }
 
             if (youtubeUrlInput.isNotBlank()) {
-                val isGenericWeb = extractedYoutubeId == null && normalizedWebUrl != null
+                val isDrmBlocked = resolvedMedia?.providerKind == MediaProviderKind.UNSUPPORTED_DRM_PLATFORM
+                val isDirectStream = resolvedMedia?.providerKind == MediaProviderKind.DIRECT_MEDIA_URL
+                val isGenericWeb = extractedYoutubeId == null && normalizedWebUrl != null && !isDrmBlocked
+                val accentColor = when {
+                    isDrmBlocked -> MaterialTheme.colorScheme.error
+                    isDirectStream -> LensMint
+                    isGenericWeb -> LensSky
+                    else -> LensAmber
+                }
                 Surface(
                     color = CinemaElevated,
                     shape = RoundedCornerShape(10.dp),
                     border = BorderStroke(
                         1.dp,
-                        (if (isGenericWeb) LensSky else LensAmber).copy(alpha = 0.55f),
+                        accentColor.copy(alpha = 0.55f),
                     ),
                 ) {
                     Column(
@@ -296,41 +313,55 @@ fun MediaImportSheet(
                             Icon(
                                 imageVector = Icons.Filled.Info,
                                 contentDescription = null,
-                                tint = if (isGenericWeb) LensSky else LensAmber,
+                                tint = accentColor,
                                 modifier = Modifier.size(16.dp),
                             )
                             Text(
                                 text = when {
+                                    isDrmBlocked -> "${resolvedMedia?.providerName ?: "DRM Service"} · Not Supported"
                                     extractedYoutubeId != null -> "YouTube Video ID: $extractedYoutubeId"
-                                    normalizedWebUrl != null -> "Web Cinema Browser Ready"
-                                    else -> "Enter a valid YouTube or https:// web video link"
+                                    isDirectStream -> "Direct Media Stream (Native Player)"
+                                    normalizedWebUrl != null -> "HTML5 Web Embed Ready"
+                                    else -> "Enter a valid YouTube, direct media, or https:// web link"
                                 },
                                 style = MaterialTheme.typography.labelMedium,
-                                color = if (isGenericWeb) LensSky else LensAmber,
+                                color = accentColor,
                             )
                         }
                         Text(
                             text = when {
+                                isDrmBlocked ->
+                                    resolvedMedia?.userNotice?.ifBlank {
+                                        "This service uses DRM protection. DialogueLens respects DRM and cannot read or play protected streams."
+                                    } ?: "DRM-protected streams are not supported."
                                 extractedYoutubeId != null ->
-                                    "Plays via YouTube's official embedded IFrame player. Attach SRT/VTT or paste transcript below for spatial balloons (note: creators can restrict embedding on specific uploads)."
+                                    "Plays via YouTube's official embedded IFrame player. Attach SRT/VTT or paste transcript below for spatial balloons (creators can restrict embedding on specific uploads)."
+                                isDirectStream ->
+                                    resolvedMedia?.userNotice?.ifBlank {
+                                        "Plays directly in the native player with full playback sync, audio transcription, live face tracking, and Heal Beacon support."
+                                    } ?: "Direct media stream ready."
                                 normalizedWebUrl != null ->
-                                    "Opens in Web Cinema: automatically hides default bottom HTML5 captions, captures WebVTT TextTracks when exposed by the site, and renders spatial DialogueLens bubbles over playback."
+                                    resolvedMedia?.userNotice?.ifBlank {
+                                        "Opens in Web Cinema: captures available HTML5 captions and overlays speaker-aware bubbles. Cross-origin sites may limit audio extraction."
+                                    } ?: "HTML5 web playback ready."
                                 else ->
-                                    "Paste a full http:// or https:// web video link, YouTube URL, or pick a local MP4."
+                                    "Paste a full http:// or https:// web video link, direct .mp4/.m3u8 URL, YouTube URL, or pick a local video."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        OutlinedTextField(
-                            value = pastedTranscriptInput,
-                            onValueChange = { pastedTranscriptInput = it },
-                            label = { Text("Paste SRT/VTT or plain transcript lines (optional)") },
-                            maxLines = 4,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("youtube_paste_transcript_input"),
-                        )
-                        if (extractedYoutubeId != null) {
+                        if (!isDrmBlocked) {
+                            OutlinedTextField(
+                                value = pastedTranscriptInput,
+                                onValueChange = { pastedTranscriptInput = it },
+                                label = { Text("Paste SRT/VTT or plain transcript lines (optional)") },
+                                maxLines = 4,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("youtube_paste_transcript_input"),
+                            )
+                        }
+                        if (!isDrmBlocked && extractedYoutubeId != null) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -368,7 +399,7 @@ fun MediaImportSheet(
                                     Text("YouTube App", fontSize = 12.sp)
                                 }
                             }
-                        } else if (normalizedWebUrl != null) {
+                        } else if (!isDrmBlocked && normalizedWebUrl != null) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -389,7 +420,10 @@ fun MediaImportSheet(
                                     },
                                     modifier = Modifier.testTag("load_web_stream_button"),
                                 ) {
-                                    Text("Open in Web Cinema", fontSize = 12.sp)
+                                    Text(
+                                        text = if (isDirectStream) "Play Direct Stream" else "Open in Web Cinema",
+                                        fontSize = 12.sp,
+                                    )
                                 }
                             }
                         }

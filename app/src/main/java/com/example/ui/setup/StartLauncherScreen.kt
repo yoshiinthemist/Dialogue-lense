@@ -64,18 +64,34 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.material.icons.filled.AutoFixHigh
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Shield
 import com.example.data.model.DialogueLensProject
+import com.example.data.model.HealBeaconStatus
 import com.example.data.model.ProcessingQualityMode
 import com.example.data.model.SubtitleSourceKind
 import com.example.data.model.TranslationMode
 import com.example.data.subtitle.SubtitleParser
+import com.example.domain.media.MediaProviderKind
+import com.example.domain.media.MediaSourceAdapterRegistry
+import com.example.ui.player.formatBeaconTimestamp
 import com.example.ui.state.SubtitlePrepState
 import com.example.ui.theme.CinemaElevated
 import com.example.ui.theme.CinemaObsidian
 import com.example.ui.theme.CinemaSurface
+import com.example.ui.theme.ConfidenceHighColor
+import com.example.ui.theme.ConfidenceLowColor
+import com.example.ui.theme.ConfidenceMediumColor
 import com.example.ui.theme.LensAmber
 import com.example.ui.theme.LensMint
 import com.example.ui.theme.LensSky
+
+private enum class LibrarySortOrder(val label: String) {
+    RECENT("Recent"),
+    TITLE("Title"),
+    NEEDS_ATTENTION("Needs attention"),
+}
 
 @Composable
 fun StartLauncherScreen(
@@ -110,6 +126,15 @@ fun StartLauncherScreen(
         translationMode: TranslationMode,
         pastedSubtitleText: String,
     ) -> Unit,
+    onStartDirectMediaUrl: (
+        mediaUrl: String,
+        subtitleUri: Uri?,
+        subtitleName: String,
+        sourceLang: String,
+        targetLang: String,
+        translationMode: TranslationMode,
+        pastedSubtitleText: String,
+    ) -> Unit = onStartWebStreamProject,
     onOpenSavedProject: (DialogueLensProject) -> Unit,
     onLoadDemoScenario: () -> Unit,
     subtitlePrepState: SubtitlePrepState = SubtitlePrepState.Idle,
@@ -139,6 +164,7 @@ fun StartLauncherScreen(
     onDownloadPreparedSubtitles: () -> Unit = {},
     onLaunchPreparedProject: () -> Unit = {},
     onExportSavedProjectSubtitles: (DialogueLensProject) -> Unit = {},
+    embeddedInNavigation: Boolean = false,
 ) {
     var urlInput by remember { mutableStateOf("") }
     var pastedTranscriptInput by remember { mutableStateOf("") }
@@ -149,6 +175,8 @@ fun StartLauncherScreen(
     var sourceLanguage by remember { mutableStateOf("Auto-Detect") }
     var targetLanguage by remember { mutableStateOf("English") }
     var translationMode by remember { mutableStateOf(TranslationMode.NATURAL) }
+    var libraryQuery by remember { mutableStateOf("") }
+    var librarySort by remember { mutableStateOf(LibrarySortOrder.RECENT) }
 
     val videoPhotoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -177,16 +205,19 @@ fun StartLauncherScreen(
         }
     }
 
-    val extractedYoutubeId = remember(urlInput) { extractYouTubeId(urlInput) }
-    val normalizedWebUrl = remember(urlInput) { normalizeWebStreamUrl(urlInput) }
-    val isUrlReady = extractedYoutubeId != null || normalizedWebUrl != null
+    val resolvedMedia = remember(urlInput) { MediaSourceAdapterRegistry.default.resolveInput(urlInput) }
+    val extractedYoutubeId = remember(resolvedMedia, urlInput) {
+        resolvedMedia?.youtubeVideoId?.takeIf { it.isNotBlank() } ?: extractYouTubeId(urlInput)
+    }
+    val normalizedWebUrl = remember(resolvedMedia, urlInput) {
+        resolvedMedia?.normalizedUri?.takeIf { resolvedMedia.isSupported } ?: normalizeWebStreamUrl(urlInput)
+    }
+    val isDrmRestricted = resolvedMedia?.capabilities?.isDrmRestricted == true
+    val isUrlReady = !isDrmRestricted && (resolvedMedia?.isSupported == true || extractedYoutubeId != null || normalizedWebUrl != null)
 
-    Scaffold(
-        contentWindowInsets = WindowInsets.safeDrawing,
-        containerColor = CinemaObsidian,
-    ) { innerPadding ->
+    val contentBlock: @Composable (Modifier) -> Unit = { containerModifier ->
         Box(
-            modifier = Modifier
+            modifier = containerModifier
                 .fillMaxSize()
                 .background(
                     Brush.verticalGradient(
@@ -196,14 +227,13 @@ fun StartLauncherScreen(
                             Color(0xFF070A10),
                         )
                     )
-                )
-                .padding(innerPadding),
+                ),
             contentAlignment = Alignment.TopCenter,
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .widthIn(max = 600.dp)
+                    .widthIn(max = 640.dp)
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 18.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -227,7 +257,7 @@ fun StartLauncherScreen(
                                 modifier = Modifier.size(14.dp),
                             )
                             Text(
-                                text = "DIALOGUELENS · v${com.example.BuildConfig.VERSION_NAME}",
+                                text = "DIALOGUELENS",
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     fontWeight = FontWeight.Bold,
                                     letterSpacing = 0.7.sp,
@@ -238,12 +268,12 @@ fun StartLauncherScreen(
                     }
 
                     Text(
-                        text = "Watch any video with speaker speech bubbles",
+                        text = "Follow the conversation, not the subtitles.",
                         style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                     Text(
-                        text = "Paste a video link or pick a file to start muted background scouting and live spatial speech bubbles.",
+                        text = "Paste a video link, open a local file, or try the interactive demo. Existing captions are used first; AI fills missing dialogue automatically.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -302,18 +332,56 @@ fun StartLauncherScreen(
                         }
 
                         if (urlInput.isNotBlank()) {
-                            Text(
-                                text = when {
-                                    extractedYoutubeId != null ->
-                                        "YouTube ready ($extractedYoutubeId) · Scout will fetch captions, metadata & cast names"
-                                    normalizedWebUrl != null ->
-                                        "Web Cinema ready · Captures HTML5 captions, audio & page cast context"
-                                    else ->
-                                        "Enter a valid http:// or https:// video link"
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (isUrlReady) LensMint else LensAmber,
-                            )
+                            if (isDrmRestricted && resolvedMedia != null) {
+                                Surface(
+                                    color = ConfidenceMediumColor.copy(alpha = 0.12f),
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, ConfidenceMediumColor.copy(alpha = 0.45f)),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("start_drm_restriction_notice"),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(10.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalAlignment = Alignment.Top,
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Shield,
+                                            contentDescription = "DRM restriction",
+                                            tint = ConfidenceMediumColor,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Text(
+                                                text = "${resolvedMedia.providerName} is not supported",
+                                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                                color = ConfidenceMediumColor,
+                                            )
+                                            Text(
+                                                text = resolvedMedia.userNotice,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                    }
+                                }
+                            } else {
+                                Text(
+                                    text = when (resolvedMedia?.providerKind) {
+                                        MediaProviderKind.YOUTUBE_EMBED ->
+                                            "YouTube ready · Uses captions when available, or AI dialogue analysis when needed"
+                                        MediaProviderKind.DIRECT_MEDIA_URL ->
+                                            "Direct video stream ready · Full native playback, sync, and Heal Beacon audio repair"
+                                        MediaProviderKind.HTML5_WEB_EMBED ->
+                                            "${resolvedMedia.providerName} · ${resolvedMedia.userNotice}"
+                                        else ->
+                                            "Enter a valid YouTube, direct stream (.mp4/.m3u8), or web video link"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (isUrlReady) LensMint else LensAmber,
+                                )
+                            }
                         }
 
                         OutlinedTextField(
@@ -329,27 +397,54 @@ fun StartLauncherScreen(
                         Button(
                             enabled = isUrlReady,
                             onClick = {
-                                if (extractedYoutubeId != null) {
-                                    onStartYouTubeProject(
-                                        urlInput,
-                                        extractedYoutubeId,
-                                        selectedSubtitleUri,
-                                        selectedSubtitleName,
-                                        sourceLanguage,
-                                        targetLanguage,
-                                        translationMode,
-                                        pastedTranscriptInput,
-                                    )
-                                } else if (normalizedWebUrl != null) {
-                                    onStartWebStreamProject(
-                                        normalizedWebUrl,
-                                        selectedSubtitleUri,
-                                        selectedSubtitleName,
-                                        sourceLanguage,
-                                        targetLanguage,
-                                        translationMode,
-                                        pastedTranscriptInput,
-                                    )
+                                when (resolvedMedia?.providerKind) {
+                                    MediaProviderKind.YOUTUBE_EMBED -> {
+                                        onStartYouTubeProject(
+                                            resolvedMedia.normalizedUri,
+                                            resolvedMedia.youtubeVideoId,
+                                            selectedSubtitleUri,
+                                            selectedSubtitleName,
+                                            sourceLanguage,
+                                            targetLanguage,
+                                            translationMode,
+                                            pastedTranscriptInput,
+                                        )
+                                    }
+                                    MediaProviderKind.DIRECT_MEDIA_URL -> {
+                                        onStartDirectMediaUrl(
+                                            resolvedMedia.normalizedUri,
+                                            selectedSubtitleUri,
+                                            selectedSubtitleName,
+                                            sourceLanguage,
+                                            targetLanguage,
+                                            translationMode,
+                                            pastedTranscriptInput,
+                                        )
+                                    }
+                                    else -> {
+                                        if (extractedYoutubeId != null) {
+                                            onStartYouTubeProject(
+                                                urlInput,
+                                                extractedYoutubeId,
+                                                selectedSubtitleUri,
+                                                selectedSubtitleName,
+                                                sourceLanguage,
+                                                targetLanguage,
+                                                translationMode,
+                                                pastedTranscriptInput,
+                                            )
+                                        } else if (normalizedWebUrl != null) {
+                                            onStartWebStreamProject(
+                                                normalizedWebUrl,
+                                                selectedSubtitleUri,
+                                                selectedSubtitleName,
+                                                sourceLanguage,
+                                                targetLanguage,
+                                                translationMode,
+                                                pastedTranscriptInput,
+                                            )
+                                        }
+                                    }
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(
@@ -362,7 +457,11 @@ fun StartLauncherScreen(
                                 .testTag("start_submit_url_button"),
                         ) {
                             Text(
-                                text = "Submit & Open Stream",
+                                text = when (resolvedMedia?.providerKind) {
+                                    MediaProviderKind.UNSUPPORTED_DRM_PLATFORM -> "Unsupported DRM Source"
+                                    MediaProviderKind.DIRECT_MEDIA_URL -> "Open Direct Video Stream"
+                                    else -> "Open & Watch"
+                                },
                                 fontWeight = FontWeight.Bold,
                             )
                         }
@@ -653,76 +752,210 @@ fun StartLauncherScreen(
                 }
 
                 if (savedProjects.isNotEmpty()) {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val filteredProjects = remember(savedProjects, libraryQuery, librarySort) {
+                        val q = libraryQuery.trim()
+                        val matching = if (q.isBlank()) {
+                            savedProjects
+                        } else {
+                            savedProjects.filter { p ->
+                                p.title.contains(q, ignoreCase = true) ||
+                                    p.sourceLanguage.contains(q, ignoreCase = true) ||
+                                    p.targetLanguage.contains(q, ignoreCase = true)
+                            }
+                        }
+                        when (librarySort) {
+                            LibrarySortOrder.RECENT -> matching.sortedByDescending {
+                                maxOf(it.lastWatchedAtEpochMs, it.createdAtEpochMs)
+                            }
+                            LibrarySortOrder.TITLE -> matching.sortedBy { it.title.lowercase() }
+                            LibrarySortOrder.NEEDS_ATTENTION -> matching.sortedByDescending { proj ->
+                                val attentionCount = proj.healBeacons.count {
+                                    it.status == HealBeaconStatus.NEEDS_ATTENTION || it.status == HealBeaconStatus.MARKED
+                                }
+                                attentionCount * 1000 + if (proj.dialogueEvents.isEmpty()) 100 else 0
+                            }
+                        }
+                    }
+
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Row(
+                            modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
-                            Icon(
-                                imageVector = Icons.Filled.History,
-                                contentDescription = null,
-                                tint = LensSky,
-                                modifier = Modifier.size(16.dp),
-                            )
-                            Text(
-                                text = "Recent Projects",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = MaterialTheme.colorScheme.onSurface,
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.History,
+                                    contentDescription = null,
+                                    tint = LensSky,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Text(
+                                    text = "Your Library (${savedProjects.size})",
+                                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                )
+                            }
+                        }
+
+                        if (savedProjects.size >= 3) {
+                            OutlinedTextField(
+                                value = libraryQuery,
+                                onValueChange = { libraryQuery = it },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                                },
+                                placeholder = { Text("Search saved videos…") },
+                                singleLine = true,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("library_search_input"),
                             )
                         }
-                        savedProjects.take(5).forEach { proj ->
+
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            LibrarySortOrder.entries.forEach { order ->
+                                FilterChip(
+                                    selected = librarySort == order,
+                                    onClick = { librarySort = order },
+                                    label = { Text(order.label, fontSize = 11.5.sp) },
+                                    modifier = Modifier.testTag("library_sort_${order.name.lowercase()}"),
+                                )
+                            }
+                        }
+
+                        filteredProjects.take(12).forEach { proj ->
+                            val durationMs = proj.videoSource.durationMs.coerceAtLeast(1L)
+                            val resumeFraction = (proj.lastPlaybackPositionMs.toFloat() / durationMs.toFloat())
+                                .coerceIn(0f, 1f)
+                            val attentionBeacons = proj.healBeacons.count {
+                                it.status == HealBeaconStatus.NEEDS_ATTENTION || it.status == HealBeaconStatus.MARKED
+                            }
+                            val activeBeacons = proj.healBeacons.count { it.status == HealBeaconStatus.HEALING }
+                            val readinessText = when {
+                                attentionBeacons > 0 -> "$attentionBeacons beacon${if (attentionBeacons == 1) "" else "s"} to review"
+                                activeBeacons > 0 -> "Healing in progress"
+                                proj.dialogueEvents.isNotEmpty() -> "Ready offline"
+                                else -> "Ready to prepare"
+                            }
+                            val readinessAccent = when {
+                                attentionBeacons > 0 -> ConfidenceMediumColor
+                                activeBeacons > 0 -> LensSky
+                                proj.dialogueEvents.isNotEmpty() -> ConfidenceHighColor
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+
                             Surface(
                                 color = CinemaSurface,
-                                shape = RoundedCornerShape(12.dp),
-                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (attentionBeacons > 0) ConfidenceMediumColor.copy(alpha = 0.45f)
+                                    else MaterialTheme.colorScheme.outlineVariant,
+                                ),
                                 onClick = { onOpenSavedProject(proj) },
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .minimumInteractiveComponentSize()
                                     .testTag("start_saved_proj_${proj.id}"),
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = proj.title,
-                                            style = MaterialTheme.typography.titleSmall,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                        Text(
-                                            text = "${proj.sourceLanguage} → ${proj.targetLanguage} · ${proj.dialogueEvents.size} lines",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                    }
                                     Row(
                                         verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        modifier = Modifier.fillMaxWidth(),
                                     ) {
-                                        if (proj.dialogueEvents.isNotEmpty()) {
-                                            IconButton(
-                                                onClick = { onExportSavedProjectSubtitles(proj) },
-                                                modifier = Modifier
-                                                    .minimumInteractiveComponentSize()
-                                                    .testTag("start_export_proj_${proj.id}"),
-                                            ) {
+                                        Column(
+                                            modifier = Modifier.weight(1f),
+                                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                                        ) {
+                                            Text(
+                                                text = proj.title,
+                                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                            Text(
+                                                text = "${proj.sourceLanguage} → ${proj.targetLanguage} · ${proj.dialogueEvents.size} lines",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                                        ) {
+                                            if (proj.dialogueEvents.isNotEmpty()) {
+                                                IconButton(
+                                                    onClick = { onExportSavedProjectSubtitles(proj) },
+                                                    modifier = Modifier
+                                                        .minimumInteractiveComponentSize()
+                                                        .testTag("start_export_proj_${proj.id}"),
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Filled.Download,
+                                                        contentDescription = "Export translations for ${proj.title}",
+                                                        tint = LensMint,
+                                                        modifier = Modifier.size(20.dp),
+                                                    )
+                                                }
+                                            }
+                                            Icon(
+                                                imageVector = Icons.Filled.PlayCircle,
+                                                contentDescription = "Resume ${proj.title}",
+                                                tint = LensSky,
+                                                modifier = Modifier.size(24.dp),
+                                            )
+                                        }
+                                    }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                        ) {
+                                            if (attentionBeacons > 0) {
                                                 Icon(
-                                                    imageVector = Icons.Filled.Download,
-                                                    contentDescription = "Export translations for ${proj.title}",
-                                                    tint = LensMint,
-                                                    modifier = Modifier.size(20.dp),
+                                                    imageVector = Icons.Filled.AutoFixHigh,
+                                                    contentDescription = null,
+                                                    tint = readinessAccent,
+                                                    modifier = Modifier.size(13.dp),
                                                 )
                                             }
+                                            Text(
+                                                text = readinessText,
+                                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                                                color = readinessAccent,
+                                            )
                                         }
-                                        Icon(
-                                            imageVector = Icons.Filled.PlayCircle,
-                                            contentDescription = "Open ${proj.title}",
-                                            tint = LensSky,
-                                            modifier = Modifier.size(22.dp),
+                                        if (proj.lastPlaybackPositionMs > 1_000L) {
+                                            Text(
+                                                text = "Resume at ${formatBeaconTimestamp(proj.lastPlaybackPositionMs)}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = LensSky,
+                                            )
+                                        }
+                                    }
+
+                                    if (resumeFraction > 0.01f) {
+                                        LinearProgressIndicator(
+                                            progress = { resumeFraction },
+                                            color = LensSky,
+                                            trackColor = CinemaObsidian,
+                                            modifier = Modifier.fillMaxWidth(),
                                         )
                                     }
                                 }
@@ -731,6 +964,17 @@ fun StartLauncherScreen(
                     }
                 }
             }
+        }
+    }
+
+    if (embeddedInNavigation) {
+        contentBlock(Modifier)
+    } else {
+        Scaffold(
+            contentWindowInsets = WindowInsets.safeDrawing,
+            containerColor = CinemaObsidian,
+        ) { innerPadding ->
+            contentBlock(Modifier.padding(innerPadding))
         }
     }
 }

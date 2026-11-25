@@ -334,6 +334,52 @@ data class UserCorrection(
     val timestampMs: Long,
 )
 
+enum class ChapterSource {
+    YOUTUBE_DESCRIPTION,
+    YOUTUBE_METADATA,
+    INFERRED_EDITORIAL,
+}
+
+@JsonClass(generateAdapter = true)
+data class VideoChapter(
+    val id: String,
+    val title: String,
+    val startMs: Long,
+    val endMs: Long,
+    val source: ChapterSource = ChapterSource.YOUTUBE_DESCRIPTION,
+)
+
+enum class HealBeaconStatus {
+    MARKED,
+    HEALING,
+    HEALED,
+    NEEDS_ATTENTION,
+}
+
+enum class HealScope {
+    ADAPTIVE,
+    QUICK,
+    SCENE,
+    CHAPTER,
+}
+
+@JsonClass(generateAdapter = true)
+data class HealBeacon(
+    val id: String,
+    val timestampMs: Long,
+    val windowStartMs: Long,
+    val windowEndMs: Long,
+    val status: HealBeaconStatus = HealBeaconStatus.MARKED,
+    val scope: HealScope = HealScope.ADAPTIVE,
+    val createdAtEpochMs: Long = System.currentTimeMillis(),
+    val updatedAtEpochMs: Long = System.currentTimeMillis(),
+    val statusNote: String = "",
+    val attemptCount: Int = 0,
+    val preHealSnapshotEvents: List<DialogueEvent> = emptyList(),
+    val replacedEventIds: List<String> = emptyList(),
+    val autoTriggered: Boolean = false,
+)
+
 @JsonClass(generateAdapter = true)
 data class BalloonStyleSettings(
     val visualStyle: BubbleVisualStyle = BubbleVisualStyle.CINEMA_SUBTLE,
@@ -344,6 +390,8 @@ data class BalloonStyleSettings(
     val speakerSpecificColors: Boolean = true,
     val maxLines: Int = 2,
     val reducedMotion: Boolean = false,
+    val stablePositioning: Boolean = false,
+    val movementSensitivity: Float = 0.5f,
     val showSpeakerLabels: Boolean = true,
     val labelMode: SpeakerLabelMode = SpeakerLabelMode.AUTO_FIRST_10,
     val showConfidenceIndicators: Boolean = true,
@@ -377,6 +425,11 @@ data class DialogueLensProject(
     val groundingQueries: List<String> = emptyList(),
     val groundingSources: List<String> = emptyList(),
     val castDiscoverySummary: String = "",
+    val chapters: List<VideoChapter> = emptyList(),
+    val healBeacons: List<HealBeacon> = emptyList(),
+    val lastPlaybackPositionMs: Long = 0L,
+    val lastWatchedAtEpochMs: Long = 0L,
+    val coveragePercent: Int = 0,
 )
 
 /**

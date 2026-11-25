@@ -74,15 +74,33 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.material.icons.filled.AutoFixHigh
+import androidx.compose.material.icons.filled.Bookmarks
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.MergeType
+import androidx.compose.material.icons.filled.Refresh
+import com.example.data.model.ChapterSource
 import com.example.data.model.ConfidenceTier
 import com.example.data.model.DialogueEvent
 import com.example.data.model.DialogueLensProject
 import com.example.data.model.DialogueType
 import com.example.data.model.GlossaryEntry
+import com.example.data.model.HealBeaconStatus
+import com.example.data.model.HealScope
 import com.example.data.model.PlacementMode
+import com.example.data.model.QuotaSaverMode
 import com.example.data.model.Speaker
 import com.example.data.model.VideoSourceKind
 import com.example.data.subtitle.SubtitleParser
+import com.example.domain.analysis.TranscriptDiagnostics
+import com.example.domain.media.MediaCapabilities
+import com.example.domain.media.MediaSourceAdapterRegistry
+import com.example.ui.player.formatBeaconTimestamp
+import com.example.ui.player.healBeaconColor
+import com.example.ui.player.healBeaconStatusLabel
+import com.example.ui.player.healScopeLabel
 import com.example.ui.theme.CinemaElevated
 import com.example.ui.theme.CinemaObsidian
 import com.example.ui.theme.CinemaSurface
@@ -99,6 +117,9 @@ import kotlin.math.roundToInt
 enum class InspectorTab {
     TIMELINE,
     CAST,
+    REPAIRS,
+    CHAPTERS,
+    DIAGNOSTICS,
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -136,6 +157,18 @@ fun TimelineSubtitleEditor(
     onAddGlossaryEntry: (String, String, String) -> Unit = { _, _, _ -> },
     onRemoveGlossaryEntry: (String) -> Unit = {},
     onExportSubtitles: () -> Unit = {},
+    onMergeSpeakers: (sourceSpeakerId: String, targetSpeakerId: String) -> Unit = { _, _ -> },
+    onMarkHealBeaconHere: (HealScope) -> Unit = {},
+    onRetryHealBeacon: (beaconId: String, scope: HealScope) -> Unit = { _, _ -> },
+    onUndoHealBeacon: (beaconId: String) -> Unit = {},
+    onDismissHealBeacon: (beaconId: String) -> Unit = {},
+    onChapterHealAt: (timestampMs: Long) -> Unit = {},
+    mediaCapabilities: MediaCapabilities = MediaSourceAdapterRegistry.default.capabilitiesFor(project.videoSource),
+    transcriptDiagnostics: TranscriptDiagnostics = TranscriptDiagnostics(),
+    quotaSaverMode: QuotaSaverMode = QuotaSaverMode.PRO_ACCURACY,
+    onSelectQuotaMode: (QuotaSaverMode) -> Unit = {},
+    onRetryAiTranscription: () -> Unit = {},
+    onAttachSubtitleFile: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var activeTab by remember { mutableStateOf(initialTab) }
@@ -169,9 +202,11 @@ fun TimelineSubtitleEditor(
                     .padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                // Primary Tab Switcher: Timeline vs Running Speaker Glossary (Cast)
+                // Primary Studio Tab Switcher: Timeline · Cast · Repairs · Chapters · Diagnostics
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -192,6 +227,33 @@ fun TimelineSubtitleEditor(
                         },
                         label = { Text("Cast (${project.speakers.size})", fontSize = 12.sp) },
                         modifier = Modifier.testTag("inspector_tab_cast"),
+                    )
+                    FilterChip(
+                        selected = activeTab == InspectorTab.REPAIRS,
+                        onClick = { activeTab = InspectorTab.REPAIRS },
+                        leadingIcon = {
+                            Icon(Icons.Filled.AutoFixHigh, contentDescription = null, modifier = Modifier.size(15.dp))
+                        },
+                        label = { Text("Repairs (${project.healBeacons.size})", fontSize = 12.sp) },
+                        modifier = Modifier.testTag("inspector_tab_repairs"),
+                    )
+                    FilterChip(
+                        selected = activeTab == InspectorTab.CHAPTERS,
+                        onClick = { activeTab = InspectorTab.CHAPTERS },
+                        leadingIcon = {
+                            Icon(Icons.Filled.Bookmarks, contentDescription = null, modifier = Modifier.size(15.dp))
+                        },
+                        label = { Text("Chapters (${project.chapters.size})", fontSize = 12.sp) },
+                        modifier = Modifier.testTag("inspector_tab_chapters"),
+                    )
+                    FilterChip(
+                        selected = activeTab == InspectorTab.DIAGNOSTICS,
+                        onClick = { activeTab = InspectorTab.DIAGNOSTICS },
+                        leadingIcon = {
+                            Icon(Icons.Filled.Info, contentDescription = null, modifier = Modifier.size(15.dp))
+                        },
+                        label = { Text("Diagnostics", fontSize = 12.sp) },
+                        modifier = Modifier.testTag("inspector_tab_diagnostics"),
                     )
                 }
 
@@ -455,14 +517,50 @@ fun TimelineSubtitleEditor(
             }
         }
 
-        if (activeTab == InspectorTab.CAST) {
-            RunningSpeakerGlossaryTab(
-                project = project,
-                onSeekTo = onSeekTo,
-                onRenameSpeaker = { spk -> renamingSpeaker = spk },
-                modifier = Modifier.fillMaxSize(),
-            )
-        } else if (sortedEvents.isEmpty()) {
+        when (activeTab) {
+            InspectorTab.CAST -> {
+                RunningSpeakerGlossaryTab(
+                    project = project,
+                    onSeekTo = onSeekTo,
+                    onRenameSpeaker = { spk -> renamingSpeaker = spk },
+                    onMergeSpeakers = onMergeSpeakers,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+            InspectorTab.REPAIRS -> {
+                StudioHealBeaconsTab(
+                    project = project,
+                    currentTimeMs = currentTimeMs,
+                    onMarkHere = onMarkHealBeaconHere,
+                    onSeekTo = onSeekTo,
+                    onRetry = onRetryHealBeacon,
+                    onUndo = onUndoHealBeacon,
+                    onDismiss = onDismissHealBeacon,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+            InspectorTab.CHAPTERS -> {
+                StudioChaptersTab(
+                    project = project,
+                    currentTimeMs = currentTimeMs,
+                    onSeekTo = onSeekTo,
+                    onChapterHeal = onChapterHealAt,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+            InspectorTab.DIAGNOSTICS -> {
+                StudioDiagnosticsTab(
+                    project = project,
+                    mediaCapabilities = mediaCapabilities,
+                    transcriptDiagnostics = transcriptDiagnostics,
+                    quotaSaverMode = quotaSaverMode,
+                    onSelectQuotaMode = onSelectQuotaMode,
+                    onRetryAi = onRetryAiTranscription,
+                    onAttachSubtitles = onAttachSubtitleFile,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+            InspectorTab.TIMELINE -> if (sortedEvents.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -508,6 +606,7 @@ fun TimelineSubtitleEditor(
                     )
                 }
             }
+        }
         }
     }
 
@@ -1040,8 +1139,10 @@ private fun RunningSpeakerGlossaryTab(
     project: DialogueLensProject,
     onSeekTo: (Long) -> Unit,
     onRenameSpeaker: (Speaker) -> Unit,
+    onMergeSpeakers: (String, String) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
+    var mergingSourceSpeaker by remember { mutableStateOf<Speaker?>(null) }
     val lineCountsBySpeaker = remember(project.dialogueEvents) {
         project.dialogueEvents
             .filter { it.speakerId != null && it.dialogueType != DialogueType.SOUND_DESCRIPTION }
@@ -1201,6 +1302,23 @@ private fun RunningSpeakerGlossaryTab(
                             }
                         }
 
+                        if (project.speakers.size > 1) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End,
+                            ) {
+                                TextButton(
+                                    onClick = { mergingSourceSpeaker = spk },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                    modifier = Modifier.testTag("glossary_merge_${spk.id}"),
+                                ) {
+                                    Icon(Icons.Filled.MergeType, contentDescription = "Merge ${spk.displayName}", modifier = Modifier.size(14.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Merge into another speaker", fontSize = 11.5.sp)
+                                }
+                            }
+                        }
+
                         if (spk.previousNames.isNotEmpty()) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
@@ -1222,7 +1340,7 @@ private fun RunningSpeakerGlossaryTab(
 
                         if (spk.visualVoiceNotes.isNotBlank()) {
                             Text(
-                                text = "Scout notes: ${spk.visualVoiceNotes}",
+                                text = "Notes: ${spk.visualVoiceNotes}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -1248,6 +1366,438 @@ private fun RunningSpeakerGlossaryTab(
                                     fontSize = 11.5.sp,
                                 )
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    mergingSourceSpeaker?.let { source ->
+        val candidates = project.speakers.filter { it.id != source.id }
+        AlertDialog(
+            onDismissRequest = { mergingSourceSpeaker = null },
+            title = { Text("Merge \"${source.displayName}\" into…") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "All lines spoken by ${source.displayName} will be reassigned to the selected speaker.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    candidates.forEach { target ->
+                        OutlinedButton(
+                            onClick = {
+                                onMergeSpeakers(source.id, target.id)
+                                mergingSourceSpeaker = null
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("merge_target_${target.id}"),
+                        ) {
+                            Text(target.displayName)
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { mergingSourceSpeaker = null }) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun StudioHealBeaconsTab(
+    project: DialogueLensProject,
+    currentTimeMs: Long,
+    onMarkHere: (HealScope) -> Unit,
+    onSeekTo: (Long) -> Unit,
+    onRetry: (String, HealScope) -> Unit,
+    onUndo: (String) -> Unit,
+    onDismiss: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LazyColumn(
+        contentPadding = PaddingValues(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = modifier.testTag("studio_heal_beacons_list"),
+    ) {
+        item(key = "heal_beacons_header") {
+            Surface(
+                color = CinemaElevated,
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, LensSky.copy(alpha = 0.35f)),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        text = "Heal Beacons · Localized Dialogue Repair",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = "Mark any moment where dialogue, timing, or speaker attribution looks off. DialogueLens repairs only that window while keeping your edits and the rest of the video untouched.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Button(
+                            onClick = { onMarkHere(HealScope.ADAPTIVE) },
+                            modifier = Modifier.testTag("studio_mark_adaptive_heal_button"),
+                        ) {
+                            Icon(Icons.Filled.AutoFixHigh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Heal at ${formatBeaconTimestamp(currentTimeMs)}", fontSize = 12.sp)
+                        }
+                        OutlinedButton(
+                            onClick = { onMarkHere(HealScope.SCENE) },
+                            modifier = Modifier.testTag("studio_mark_scene_heal_button"),
+                        ) {
+                            Text("Scene Heal", fontSize = 12.sp)
+                        }
+                        if (project.chapters.isNotEmpty()) {
+                            OutlinedButton(
+                                onClick = { onMarkHere(HealScope.CHAPTER) },
+                                modifier = Modifier.testTag("studio_mark_chapter_heal_button"),
+                            ) {
+                                Text("Chapter Heal", fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (project.healBeacons.isEmpty()) {
+            item(key = "heal_beacons_empty") {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 28.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "No Heal Beacons placed yet. Pause on Watch and tap \"Heal this moment\" whenever something needs attention.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        } else {
+            itemsIndexed(
+                project.healBeacons.sortedBy { it.timestampMs },
+                key = { _, b -> b.id },
+            ) { _, beacon ->
+                val accent = healBeaconColor(beacon.status)
+                val canUndo = beacon.status == HealBeaconStatus.HEALED &&
+                    (beacon.preHealSnapshotEvents.isNotEmpty() || beacon.replacedEventIds.isNotEmpty())
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = CinemaSurface),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, accent.copy(alpha = 0.5f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("studio_beacon_card_${beacon.id}"),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "${formatBeaconTimestamp(beacon.timestampMs)} · ${healBeaconStatusLabel(beacon.status)}",
+                                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = accent,
+                                )
+                                Text(
+                                    text = "${healScopeLabel(beacon.scope)} · ${formatBeaconTimestamp(beacon.windowStartMs)}–${formatBeaconTimestamp(beacon.windowEndMs)}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            IconButton(
+                                onClick = { onDismiss(beacon.id) },
+                                modifier = Modifier.size(36.dp),
+                            ) {
+                                Icon(
+                                    Icons.Filled.DeleteOutline,
+                                    contentDescription = "Remove beacon",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
+
+                        if (beacon.statusNote.isNotBlank()) {
+                            Text(
+                                text = beacon.statusNote,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OutlinedButton(
+                                onClick = { onSeekTo(beacon.timestampMs) },
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            ) {
+                                Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Jump", fontSize = 11.5.sp)
+                            }
+                            OutlinedButton(
+                                onClick = { onRetry(beacon.id, beacon.scope) },
+                                enabled = beacon.status != HealBeaconStatus.HEALING,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            ) {
+                                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text(if (beacon.status == HealBeaconStatus.HEALED) "Re-heal" else "Retry", fontSize = 11.5.sp)
+                            }
+                            if (canUndo) {
+                                TextButton(onClick = { onUndo(beacon.id) }) {
+                                    Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Undo", fontSize = 11.5.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StudioChaptersTab(
+    project: DialogueLensProject,
+    currentTimeMs: Long,
+    onSeekTo: (Long) -> Unit,
+    onChapterHeal: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LazyColumn(
+        contentPadding = PaddingValues(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        modifier = modifier.testTag("studio_chapters_list"),
+    ) {
+        if (project.chapters.isEmpty()) {
+            item(key = "chapters_empty") {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 28.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "Chapters appear automatically from video descriptions or once dialogue sections are detected.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        } else {
+            itemsIndexed(project.chapters, key = { _, ch -> ch.id }) { idx, chapter ->
+                val isCurrent = currentTimeMs in chapter.startMs..chapter.endMs
+                val sourceLabel = when (chapter.source) {
+                    ChapterSource.YOUTUBE_DESCRIPTION -> "Video chapter"
+                    ChapterSource.YOUTUBE_METADATA -> "Video chapter"
+                    ChapterSource.INFERRED_EDITORIAL -> "Inferred section"
+                }
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isCurrent) CinemaElevated else CinemaSurface,
+                    ),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(
+                        if (isCurrent) 1.5.dp else 1.dp,
+                        if (isCurrent) LensSky else MaterialTheme.colorScheme.outlineVariant,
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSeekTo(chapter.startMs + 50L) }
+                        .testTag("studio_chapter_card_${chapter.id}"),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                text = "${idx + 1}. ${chapter.title}",
+                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = "${formatBeaconTimestamp(chapter.startMs)}–${formatBeaconTimestamp(chapter.endMs)} · $sourceLabel",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isCurrent) LensSky else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = { onChapterHeal(chapter.startMs + 1000L) },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        ) {
+                            Icon(Icons.Filled.AutoFixHigh, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Heal", fontSize = 11.5.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StudioDiagnosticsTab(
+    project: DialogueLensProject,
+    mediaCapabilities: MediaCapabilities,
+    transcriptDiagnostics: TranscriptDiagnostics,
+    quotaSaverMode: QuotaSaverMode,
+    onSelectQuotaMode: (QuotaSaverMode) -> Unit,
+    onRetryAi: () -> Unit,
+    onAttachSubtitles: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LazyColumn(
+        contentPadding = PaddingValues(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = modifier.testTag("studio_diagnostics_list"),
+    ) {
+        item(key = "media_compat_card") {
+            Surface(
+                color = CinemaSurface,
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, LensSky.copy(alpha = 0.35f)),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "Media Source Compatibility · ${mediaCapabilities.providerName}",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    if (mediaCapabilities.limitationSummary.isNotBlank()) {
+                        Text(
+                            text = mediaCapabilities.limitationSummary,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    mediaCapabilities.capabilityChecklist().forEach { (axis, status) ->
+                        val supported = !status.contains("Unavailable", true) &&
+                            !status.contains("Restricted", true) &&
+                            !status.contains("Limited", true)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = axis,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Icon(
+                                    imageVector = if (supported) Icons.Filled.CheckCircle else Icons.Filled.Info,
+                                    contentDescription = null,
+                                    tint = if (supported) ConfidenceHighColor else ConfidenceMediumColor,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                                Text(
+                                    text = status,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (supported) ConfidenceHighColor else ConfidenceMediumColor,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        item(key = "transcript_health_card") {
+            Surface(
+                color = CinemaSurface,
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "Dialogue Coverage & Processing",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = transcriptDiagnostics.summaryLine(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = "Lines: ${project.dialogueEvents.size} · Speakers: ${project.speakers.size} · Chapters: ${project.chapters.size} · Beacons: ${project.healBeacons.size}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = LensSky,
+                    )
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        QuotaSaverMode.entries.forEach { mode ->
+                            FilterChip(
+                                selected = quotaSaverMode == mode,
+                                onClick = { onSelectQuotaMode(mode) },
+                                label = { Text(mode.label, fontSize = 11.5.sp) },
+                            )
+                        }
+                    }
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        if (project.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT) {
+                            OutlinedButton(onClick = onRetryAi) {
+                                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
+                                Spacer(Modifier.width(5.dp))
+                                Text("Retry AI Analysis", fontSize = 12.sp)
+                            }
+                        }
+                        OutlinedButton(onClick = onAttachSubtitles) {
+                            Icon(Icons.Filled.Subtitles, contentDescription = null, modifier = Modifier.size(15.dp))
+                            Spacer(Modifier.width(5.dp))
+                            Text("Attach SRT / VTT", fontSize = 12.sp)
                         }
                     }
                 }

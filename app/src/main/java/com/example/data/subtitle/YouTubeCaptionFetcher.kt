@@ -1,6 +1,8 @@
 package com.example.data.subtitle
 
+import com.example.data.model.ChapterSource
 import com.example.data.model.DialogueType
+import com.example.data.model.VideoChapter
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.Dispatchers
@@ -16,6 +18,7 @@ data class YouTubeCaptionResult(
     val durationMs: Long? = null,
     val languageCode: String? = null,
     val cues: List<RawSubtitleCue> = emptyList(),
+    val chapters: List<VideoChapter> = emptyList(),
 )
 
 /**
@@ -50,6 +53,7 @@ object YouTubeCaptionFetcher {
                     channelName = meta.channelName,
                     description = meta.description,
                     durationMs = meta.durationMs,
+                    chapters = extractChaptersFromDescription(meta.description, meta.durationMs ?: 0L),
                 )
             } else {
                 null
@@ -103,13 +107,16 @@ object YouTubeCaptionFetcher {
                         downloadAndParseTrack(track.baseUrl, meta.cookies, meta.preferredUserAgent)
                     }.getOrDefault(emptyList())
                     if (cues.isNotEmpty()) {
+                        val finalDesc = bestDescription ?: meta.description
+                        val finalDur = bestDurationMs ?: meta.durationMs
                         return@withTimeoutOrNull YouTubeCaptionResult(
                             title = bestTitle ?: meta.title,
                             channelName = bestChannelName ?: meta.channelName,
-                            description = bestDescription ?: meta.description,
-                            durationMs = bestDurationMs ?: meta.durationMs,
+                            description = finalDesc,
+                            durationMs = finalDur,
                             languageCode = track.languageCode,
                             cues = cues,
+                            chapters = extractChaptersFromDescription(finalDesc, finalDur ?: 0L),
                         )
                     } else {
                         emptyDownloadAttempts++
@@ -124,7 +131,64 @@ object YouTubeCaptionFetcher {
             channelName = bestChannelName,
             description = bestDescription,
             durationMs = bestDurationMs,
+            chapters = extractChaptersFromDescription(bestDescription, bestDurationMs ?: 0L),
         )
+    }
+
+    private val chapterTimestampRegex = Regex(
+        """^\s*(?:\[\s*)?(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:\s*\])?\s*(?:[-–—|:\u2022]\s*)?(.+?)\s*$"""
+    )
+
+    /**
+     * Parses standard YouTube description chapter lists (e.g. "0:00 Intro", "02:15 Interview",
+     * "1:04:10 Closing Q&A"). Requires at least 2 valid strictly increasing timestamps, starting
+     * near the beginning of the video (within 15s) or spanning meaningful chapter intervals.
+     */
+    fun extractChaptersFromDescription(
+        description: String?,
+        durationMs: Long = 0L,
+    ): List<VideoChapter> {
+        if (description.isNullOrBlank()) return emptyList()
+        val rawEntries = mutableListOf<Pair<Long, String>>()
+        description.lineSequence().forEach { rawLine ->
+            val line = rawLine.trim()
+            if (line.length < 5) return@forEach
+            val match = chapterTimestampRegex.matchEntire(line) ?: return@forEach
+            val hours = match.groupValues[1].toLongOrNull() ?: 0L
+            val minutes = match.groupValues[2].toLongOrNull() ?: return@forEach
+            val seconds = match.groupValues[3].toLongOrNull() ?: return@forEach
+            if (seconds >= 60L || (match.groupValues[1].isNotEmpty() && minutes >= 60L)) return@forEach
+            val startMs = ((hours * 3600L) + (minutes * 60L) + seconds) * 1000L
+            val title = match.groupValues[4]
+                .replace(Regex("""^\s*[-–—|:]\s*"""), "")
+                .trim()
+                .take(80)
+            if (title.isBlank()) return@forEach
+            if (durationMs > 0L && startMs >= durationMs) return@forEach
+            if (rawEntries.isEmpty() || startMs > rawEntries.last().first + 3_000L) {
+                rawEntries.add(startMs to title)
+            }
+        }
+        if (rawEntries.size < 2) return emptyList()
+        // If first chapter begins after 15s, prepend an implicit Intro chapter so 0ms is covered cleanly
+        if (rawEntries.first().first > 15_000L) {
+            rawEntries.add(0, 0L to "Introduction")
+        }
+        val effectiveDuration = maxOf(durationMs, rawEntries.last().first + 30_000L)
+        return rawEntries.mapIndexed { idx, (startMs, title) ->
+            val endMs = if (idx < rawEntries.lastIndex) {
+                rawEntries[idx + 1].first
+            } else {
+                effectiveDuration
+            }
+            VideoChapter(
+                id = "chapter_${idx + 1}",
+                title = title,
+                startMs = startMs,
+                endMs = endMs.coerceAtLeast(startMs + 1_000L),
+                source = ChapterSource.YOUTUBE_DESCRIPTION,
+            )
+        }
     }
 
     /**

@@ -11,6 +11,7 @@ import com.example.data.model.NormalizedRect
 import com.example.data.model.PlacementMode
 import com.example.data.model.Speaker
 import com.example.data.model.isBubbleSpeakerUnknown
+import com.example.domain.analysis.HierarchicalContextEngine
 import com.example.domain.analysis.LiveFaceObservation
 import com.example.domain.analysis.SubtitleTimelineMatcher
 import kotlin.math.abs
@@ -43,6 +44,8 @@ data class PlacedBalloon(
     val isUnknownSpeaker: Boolean = false,
     val lowestDensityEdge: ScreenEdge? = null,
     val heatmapDensity: Float = 0f,
+    val identityConfidence: Float = 0f,
+    val locationConfidence: Float = 0f,
 )
 
 class BalloonLayoutEngine {
@@ -70,13 +73,24 @@ class BalloonLayoutEngine {
         currentMs: Long,
         styleSettings: BalloonStyleSettings = project.styleSettings,
         liveFaces: List<LiveFaceObservation> = emptyList(),
+        sceneEpoch: Int = 0,
+        hasLiveVisionSignal: Boolean = false,
+        liveFrameObservedEmpty: Boolean = false,
+        activeChapterId: String? = null,
     ): List<PlacedBalloon> {
         val activeEvents = timelineMatcher.matchActiveEvents(project.dialogueEvents, currentMs)
+            // Strict temporal validation: never allow stale dialogue to linger past its end boundary
+            .filter { evt -> currentMs <= evt.endTimeMs + 160L }
 
         if (activeEvents.isEmpty()) return emptyList()
 
         val activeShot = project.shots.firstOrNull { currentMs in it.startMs..it.endMs }
         val shotId = activeShot?.id ?: activeEvents.first().shotId
+        val effectiveSceneKey = if (sceneEpoch > 0 || !activeChapterId.isNullOrBlank()) {
+            "$shotId#ep$sceneEpoch#${activeChapterId.orEmpty()}"
+        } else {
+            shotId
+        }
         val shotLuminance = activeShot?.sceneLuminance ?: 0.25f
 
         // Fuse precomputed face tracks with real-time 6fps ML Kit live viewport observations
@@ -96,11 +110,15 @@ class BalloonLayoutEngine {
             )
         }
         val liveConvertedSamples = if (rawLiveSamples.isNotEmpty()) {
-            recentLiveFacesByShot[shotId] = currentMs to rawLiveSamples
+            recentLiveFacesByShot[effectiveSceneKey] = currentMs to rawLiveSamples
             rawLiveSamples
+        } else if (liveFrameObservedEmpty) {
+            // Live vision confirmed an empty / B-roll / title-card frame: do NOT recycle stale faces!
+            recentLiveFacesByShot.remove(effectiveSceneKey)
+            emptyList()
         } else {
-            val cached = recentLiveFacesByShot[shotId]
-            if (cached != null && abs(currentMs - cached.first) <= 950L) {
+            val cached = recentLiveFacesByShot[effectiveSceneKey]
+            if (cached != null && abs(currentMs - cached.first) <= 650L) {
                 cached.second
             } else {
                 emptyList()
@@ -144,7 +162,7 @@ class BalloonLayoutEngine {
         var offScreenCount = 0
 
         // Detect speaker movement from BOTH cross-frame cache AND recent ML Kit FaceTrack trajectory (currentMs - 400ms)
-        val priorFaceMap = previousFaceBoxesByShot[shotId].orEmpty()
+        val priorFaceMap = previousFaceBoxesByShot[effectiveSceneKey].orEmpty()
         val historyFallbackMap = if (priorFaceMap.isEmpty() && currentMs >= 200L) {
             project.faceTracks
                 .filter { it.shotId == shotId }
@@ -161,7 +179,9 @@ class BalloonLayoutEngine {
             previousFacesByKey = effectivePrevFaces,
         )
         if (faceBoxes.isNotEmpty()) {
-            previousFaceBoxesByShot[shotId] = faceBoxes.toMap()
+            previousFaceBoxesByShot[effectiveSceneKey] = faceBoxes.toMap()
+        } else if (liveFrameObservedEmpty) {
+            previousFaceBoxesByShot.remove(effectiveSceneKey)
         }
         // Compute base ML Kit occupancy heatmap for continuous edge dead-space evaluation
         val baseHeatmap = DeadSpaceHeatmapAnalyzer.computeHeatmap(
@@ -221,7 +241,7 @@ class BalloonLayoutEngine {
                 val rawFaceTarget = liveMatchedManual?.second?.let { computeMouthPoint(it) }
                 val faceTarget = applyTailTargetSmoothing(
                     eventId = event.id,
-                    shotId = shotId,
+                    shotId = effectiveSceneKey,
                     target = rawFaceTarget,
                     reducedMotion = styleSettings.reducedMotion,
                     hasLiveFaceTracking = liveFaces.isNotEmpty(),
@@ -244,6 +264,45 @@ class BalloonLayoutEngine {
                         sceneLuminance = shotLuminance,
                         speakerLineOrdinal = lineOrdinal,
                         isUnknownSpeaker = isBubbleSpeakerUnknown(event, speaker),
+                        identityConfidence = if (event.lockedByUser) 1f else event.speakerConfidence,
+                        locationConfidence = if (faceTarget != null) 0.9f else 0.7f,
+                    )
+                )
+                continue
+            }
+
+            // 1b. Accessibility Stable Positioning mode: calm, steady, tailless reading zone preserving speaker identity & color
+            if (styleSettings.stablePositioning && event.dialogueType == DialogueType.SPOKEN) {
+                val isUnknown = isBubbleSpeakerUnknown(event, speaker)
+                val stableRect = placeNeutralFallbackRect(
+                    w = estWidth,
+                    h = estHeight,
+                    occupied = occupiedBalloonRects + allSceneObstacles,
+                    faceExclusions = faceExclusionZones,
+                    lipCorridorZones = lipCorridorZones,
+                    speakerAccentIndex = speaker?.accentIndex,
+                    hasMultipleSpeakers = project.speakers.size >= 2,
+                )
+                occupiedBalloonRects.add(stableRect)
+                val emphasis = resolveEmphasis(event)
+                results.add(
+                    PlacedBalloon(
+                        event = event,
+                        speaker = speaker,
+                        rect = stableRect,
+                        tailTarget = null,
+                        tailDirection = TailDirection.NONE,
+                        placementMode = PlacementMode.NEUTRAL_FALLBACK,
+                        isOffScreenEdge = false,
+                        edgeSide = null,
+                        isAmbiguousFallback = isUnknown,
+                        emphasisScore = emphasis.first,
+                        isShouted = emphasis.second,
+                        sceneLuminance = shotLuminance,
+                        speakerLineOrdinal = lineOrdinal,
+                        isUnknownSpeaker = isUnknown,
+                        identityConfidence = if (isUnknown) 0.3f else event.speakerConfidence,
+                        locationConfidence = 0f,
                     )
                 )
                 continue
@@ -269,7 +328,7 @@ class BalloonLayoutEngine {
                 val edgeRect = if (resolvedEdgeType == DialogueType.SOUND_DESCRIPTION) {
                     val sfxW = estWidth.coerceIn(0.22f, 0.44f)
                     val sfxH = (estHeight * 0.78f).coerceIn(0.065f, 0.14f)
-                    val sameShotPrevCenter = smoothedPositions[event.id]?.takeIf { lastShotIds[event.id] == shotId }
+                    val sameShotPrevCenter = smoothedPositions[event.id]?.takeIf { lastShotIds[event.id] == effectiveSceneKey }
                     val targetSfxRect = placeSfxSafeRect(
                         w = sfxW,
                         h = sfxH,
@@ -282,9 +341,10 @@ class BalloonLayoutEngine {
                     )
                     val smoothedSfxCenter = applyTemporalSmoothing(
                         eventId = event.id,
-                        shotId = shotId,
+                        shotId = effectiveSceneKey,
                         target = NormalizedPoint(targetSfxRect.centerX, targetSfxRect.centerY),
                         reducedMotion = styleSettings.reducedMotion,
+                        movementSensitivity = styleSettings.movementSensitivity,
                     )
                     centeredRect(smoothedSfxCenter.x, smoothedSfxCenter.y, sfxW, sfxH)
                 } else {
@@ -393,7 +453,14 @@ class BalloonLayoutEngine {
                 continue
             }
 
-            if (trackSample == null && scoutAnchor != null && event.confidenceTier != ConfidenceTier.LOW) {
+            // Core Rendering Rule (1.0): Never point a directional tail at empty space / B-roll / unverified post-cut frames!
+            // If live vision confirms 0 visible faces (e.g., B-roll, title card, chapter bumper, empty studio),
+            // render a speaker-colored, tailless bubble when speaker is known, or neutral caption when unknown.
+            val liveVisionInvalidatesStaticAnchor = hasLiveVisionSignal &&
+                trackSample == null &&
+                (liveFrameObservedEmpty || liveConvertedSamples.isEmpty())
+
+            if (trackSample == null && scoutAnchor != null && event.confidenceTier != ConfidenceTier.LOW && !liveVisionInvalidatesStaticAnchor) {
                 val targetX = scoutAnchor.x.coerceIn(0.12f, 0.88f)
                 val targetY = scoutAnchor.y.coerceIn(0.14f, 0.72f)
                 // Synthesize a generous full Head/Forehead/Mouth box around the Scout's reported mouth/face anchor
@@ -435,7 +502,7 @@ class BalloonLayoutEngine {
                 val sideY = (targetY + 0.01f).coerceIn(0.055f + halfH, 0.78f - halfH)
                 val aboveY = synthFaceBox.top - 0.04f - halfH
                 val preferredZoneCenter = deadSpaceAnchorCenter(event.preferredDeadSpaceZone, halfW, halfH)
-                val sameShotPrev = smoothedPositions[event.id]?.takeIf { lastShotIds[event.id] == shotId }
+                val sameShotPrev = smoothedPositions[event.id]?.takeIf { lastShotIds[event.id] == effectiveSceneKey }
                 val scoutSynthList = listOf(synthFaceBox)
                 val scoutHeatmap = DeadSpaceHeatmapAnalyzer.computeHeatmap(
                     faceZones = if (faceExclusionZones.isNotEmpty()) faceExclusionZones + scoutSynthList else scoutSynthList,
@@ -576,22 +643,29 @@ class BalloonLayoutEngine {
 
                 val smoothedCenter = applyTemporalSmoothing(
                     eventId = event.id,
-                    shotId = shotId,
+                    shotId = effectiveSceneKey,
                     target = bestScoutCenter,
                     reducedMotion = styleSettings.reducedMotion,
                     forceResponsiveEdgeTracking = scoutHeatmap.speakerMoved,
+                    movementSensitivity = styleSettings.movementSensitivity,
                 )
                 val finalRect = centeredRect(smoothedCenter.x, smoothedCenter.y, scoutEstWidth, scoutEstHeight)
                 // Aim the rotating comic tail directly at the speaker's mouth/lips once speaker is confirmed
-                // without adding extra downward chest drift; unconfirmed dotted-gray bubbles stay tailless.
+                // AND within restrained tail reach; unconfirmed or excessively distant anchors drop to tailless.
                 val rawMouthY = targetY.coerceIn(0.14f, 0.78f)
-                val tailPt = if (isUnknown) {
+                val rawTailCandidate = NormalizedPoint(targetX, rawMouthY)
+                val withinTailReach = HierarchicalContextEngine.isDistanceWithinRestrainedTailReach(
+                    bubbleCenter = NormalizedPoint(finalRect.centerX, finalRect.centerY),
+                    tailTarget = rawTailCandidate,
+                    hasVerifiedFace = false,
+                )
+                val tailPt = if (isUnknown || !withinTailReach) {
                     null
                 } else {
                     applyTailTargetSmoothing(
                         eventId = event.id,
-                        shotId = shotId,
-                        target = NormalizedPoint(targetX, rawMouthY),
+                        shotId = effectiveSceneKey,
+                        target = rawTailCandidate,
                         reducedMotion = styleSettings.reducedMotion,
                         hasLiveFaceTracking = liveFaces.isNotEmpty(),
                     )
@@ -616,6 +690,8 @@ class BalloonLayoutEngine {
                         isUnknownSpeaker = isUnknown,
                         lowestDensityEdge = scoutHeatmap.lowestDensityEdge,
                         heatmapDensity = scoutHeatmap.sampleRectDensity(finalRect),
+                        identityConfidence = if (isUnknown) 0.35f else event.speakerConfidence,
+                        locationConfidence = if (tailPt != null) event.faceConfidence.coerceAtLeast(0.55f) else 0.25f,
                     )
                 )
                 continue
@@ -643,12 +719,14 @@ class BalloonLayoutEngine {
                         placementMode = PlacementMode.NEUTRAL_FALLBACK,
                         isOffScreenEdge = false,
                         edgeSide = null,
-                        isAmbiguousFallback = event.confidenceTier == ConfidenceTier.LOW,
+                        isAmbiguousFallback = event.confidenceTier == ConfidenceTier.LOW || isUnknown,
                         emphasisScore = emphasis.first,
                         isShouted = emphasis.second,
                         sceneLuminance = shotLuminance,
                         speakerLineOrdinal = lineOrdinal,
                         isUnknownSpeaker = isUnknown,
+                        identityConfidence = if (isUnknown) 0.3f else event.speakerConfidence,
+                        locationConfidence = 0f,
                     )
                 )
                 continue
@@ -708,7 +786,7 @@ class BalloonLayoutEngine {
                 }
             }
             // Include the prior locked anchor within the same shot (suppressed when speaker moved so bubble smoothly relocates)
-            val sameShotPrevious = smoothedPositions[event.id]?.takeIf { lastShotIds[event.id] == shotId }
+            val sameShotPrevious = smoothedPositions[event.id]?.takeIf { lastShotIds[event.id] == effectiveSceneKey }
             val candidates = if (sameShotPrevious != null && !liveHeatmap.speakerMoved) {
                 listOf(sameShotPrevious) + rawCandidates
             } else {
@@ -755,19 +833,20 @@ class BalloonLayoutEngine {
                 ) + candHeat * 110f + stabilityBonus + deadSpaceBonus + edgeMovementBias + tailCrossPenalty
             } ?: NormalizedPoint(trackSample.centerX, (trackSample.top - estHeight * 0.7f).coerceAtLeast(0.11f))
 
-            // 5. Temporal smoothing with instant snap on shot boundary changes and movement-responsive edge anchoring
+            // 5. Temporal smoothing with instant snap on shot/cut boundary changes and movement-responsive edge anchoring
             val smoothedCenter = applyTemporalSmoothing(
                 eventId = event.id,
-                shotId = shotId,
+                shotId = effectiveSceneKey,
                 target = bestCenter,
                 reducedMotion = styleSettings.reducedMotion,
                 forceResponsiveEdgeTracking = liveHeatmap.speakerMoved,
+                movementSensitivity = styleSettings.movementSensitivity,
             )
 
             val finalRect = centeredRect(smoothedCenter.x, smoothedCenter.y, estWidth, estHeight)
             val mouthTarget = applyTailTargetSmoothing(
                 eventId = event.id,
-                shotId = shotId,
+                shotId = effectiveSceneKey,
                 target = computeMouthPoint(matchedSample),
                 reducedMotion = styleSettings.reducedMotion,
                 hasLiveFaceTracking = liveFaces.isNotEmpty(),
@@ -793,6 +872,8 @@ class BalloonLayoutEngine {
                     isUnknownSpeaker = isBubbleSpeakerUnknown(event, speaker),
                     lowestDensityEdge = liveHeatmap.lowestDensityEdge,
                     heatmapDensity = liveHeatmap.sampleRectDensity(finalRect),
+                    identityConfidence = if (isUnknown) 0.35f else event.speakerConfidence,
+                    locationConfidence = maxOf(event.faceConfidence, 0.85f),
                 )
             )
         }
@@ -962,28 +1043,32 @@ class BalloonLayoutEngine {
         target: NormalizedPoint,
         reducedMotion: Boolean,
         forceResponsiveEdgeTracking: Boolean = false,
+        movementSensitivity: Float = 0.5f,
     ): NormalizedPoint {
         val previousShot = lastShotIds[eventId]
         val previousPoint = smoothedPositions[eventId]
         lastShotIds[eventId] = shotId
 
-        // Never animate/interpolate across a hard shot cut!
+        // Never animate/interpolate across a hard shot cut or chapter transition!
         if (reducedMotion || previousPoint == null || previousShot != shotId) {
             smoothedPositions[eventId] = target
             return target
         }
 
+        val sens = movementSensitivity.coerceIn(0f, 1f)
         val deltaDist = hypot(
             (target.x - previousPoint.x).toDouble(),
             (target.y - previousPoint.y).toDouble(),
         ).toFloat()
-        // Keep bubbles calm on sub-1% noise, while gliding fluidly whenever speakers move
-        val deadzone = if (forceResponsiveEdgeTracking) 0.003f else 0.012f
+        // Hysteresis deadzone scales smoothly with movementSensitivity (0 = calmest, 1 = most responsive)
+        val baseDeadzone = 0.024f - (sens * 0.018f) // 0.024 at 0.0 -> 0.015 at 0.5 -> 0.006 at 1.0
+        val deadzone = if (forceResponsiveEdgeTracking) (baseDeadzone * 0.35f).coerceAtLeast(0.003f) else baseDeadzone
         if (deltaDist < deadzone) {
             return previousPoint
         }
 
-        val alpha = if (forceResponsiveEdgeTracking) 0.56f else 0.24f
+        val baseAlpha = 0.14f + (sens * 0.24f) // 0.14 at 0.0 -> 0.26 at 0.5 -> 0.38 at 1.0
+        val alpha = if (forceResponsiveEdgeTracking) (baseAlpha + 0.24f).coerceAtMost(0.68f) else baseAlpha
         val smoothed = NormalizedPoint(
             x = previousPoint.x + (target.x - previousPoint.x) * alpha,
             y = previousPoint.y + (target.y - previousPoint.y) * alpha,

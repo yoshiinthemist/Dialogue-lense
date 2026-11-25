@@ -107,6 +107,9 @@ fun PlayerControlsBar(
     onOpenCastDrawer: () -> Unit = {},
     onOpenToolsDrawer: () -> Unit = {},
     showDrawerTriggers: Boolean = true,
+    onHealThisMoment: () -> Unit = {},
+    onInspectHealBeacon: (String) -> Unit = {},
+    activeChapterTitle: String? = null,
     modifier: Modifier = Modifier,
 ) {
     val duration = project.videoSource.durationMs.coerceAtLeast(1000L)
@@ -176,11 +179,24 @@ fun PlayerControlsBar(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(44.dp)
-                        .pointerInput(duration) {
+                        .height(48.dp)
+                        .pointerInput(duration, project.healBeacons) {
                             detectTapGestures { offset ->
-                                val frac = (offset.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
-                                onSeekTo((frac * duration).toLong())
+                                val widthF = size.width.toFloat().coerceAtLeast(1f)
+                                val hitRadiusPx = 18.dp.toPx()
+                                val tappedBeacon = project.healBeacons.minByOrNull { beacon ->
+                                    val bx = (beacon.timestampMs.toFloat() / duration.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f) * widthF
+                                    kotlin.math.abs(offset.x - bx)
+                                }?.takeIf { beacon ->
+                                    val bx = (beacon.timestampMs.toFloat() / duration.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f) * widthF
+                                    kotlin.math.abs(offset.x - bx) <= hitRadiusPx
+                                }
+                                if (tappedBeacon != null) {
+                                    onInspectHealBeacon(tappedBeacon.id)
+                                } else {
+                                    val frac = (offset.x / widthF).coerceIn(0f, 1f)
+                                    onSeekTo((frac * duration).toLong())
+                                }
                             }
                         }
                         .pointerInput(duration) {
@@ -320,6 +336,19 @@ fun PlayerControlsBar(
                         }
                         flushTickSpan()
 
+                        // Subtle chapter boundary notches
+                        if (project.chapters.size >= 2) {
+                            project.chapters.drop(1).forEach { chapter ->
+                                val cx = ((chapter.startMs.toFloat() / durF).coerceIn(0f, 1f)) * size.width
+                                drawLine(
+                                    color = Color.White.copy(alpha = 0.42f),
+                                    start = Offset(cx, trackTop - 2.dp.toPx()),
+                                    end = Offset(cx, trackTop + trackH + 2.dp.toPx()),
+                                    strokeWidth = 1.5.dp.toPx(),
+                                )
+                            }
+                        }
+
                         // Played progress bar
                         val headFrac = (currentTimeMs.toFloat() / durF).coerceIn(0f, 1f)
                         val headX = headFrac * size.width
@@ -329,6 +358,27 @@ fun PlayerControlsBar(
                                 topLeft = Offset(0f, trackTop),
                                 size = Size(headX, trackH),
                                 cornerRadius = corner,
+                            )
+                        }
+
+                        // Heal Beacon diamond markers (clearly distinct from chapter & speaker ticks)
+                        project.healBeacons.forEach { beacon ->
+                            val bx = ((beacon.timestampMs.toFloat() / durF).coerceIn(0f, 1f)) * size.width
+                            val by = trackTop - 6.dp.toPx()
+                            val r = 4.2.dp.toPx()
+                            val bColor = healBeaconColor(beacon.status)
+                            val diamond = Path().apply {
+                                moveTo(bx, by - r)
+                                lineTo(bx + r, by)
+                                lineTo(bx, by + r)
+                                lineTo(bx - r, by)
+                                close()
+                            }
+                            drawPath(path = diamond, color = bColor)
+                            drawPath(
+                                path = diamond,
+                                color = Color.White.copy(alpha = 0.85f),
+                                style = Stroke(width = 1.dp.toPx()),
                             )
                         }
 
@@ -369,6 +419,13 @@ fun PlayerControlsBar(
                             text = "Edit Mode · Drag bubbles to reposition",
                             style = MaterialTheme.typography.labelSmall,
                             color = LensSky,
+                        )
+                    } else if (!activeChapterTitle.isNullOrBlank()) {
+                        Text(
+                            text = activeChapterTitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
                         )
                     } else if (playbackSpeed != 1.0f) {
                         Text(
@@ -461,6 +518,17 @@ fun PlayerControlsBar(
                         contentDescription = if (isFullscreenTheater) "Exit theater fullscreen" else "Theater fullscreen",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            }
+
+            // 2b. Contextual Heal Beacon action — appears calmly whenever paused ("Pause. Mark. Heal. Continue.")
+            if (!isPlaying && !isEditMode) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    HealThisMomentPill(onClick = onHealThisMoment)
                 }
             }
 

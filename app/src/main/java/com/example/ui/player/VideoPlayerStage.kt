@@ -45,6 +45,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.OpenWith
 import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -108,6 +109,7 @@ import com.example.data.project.DemoScenarioFactory
 import com.example.data.subtitle.SubtitleParser
 import com.example.domain.analysis.LiveFaceObservation
 import com.example.domain.analysis.LiveStageFaceTracker
+import com.example.domain.analysis.LiveStageFrameSnapshot
 import com.example.domain.analysis.LookaheadWindowPlanner
 import com.example.domain.analysis.SniffedWebMediaStream
 import com.example.domain.analysis.WebNavCommand
@@ -197,9 +199,13 @@ fun VideoPlayerStage(
     onDragBalloonAnchor: (String, NormalizedPoint) -> Unit,
     quickPickerEventId: String? = null,
     onQuickAssignSpeaker: (String, String) -> Unit = { _, _ -> },
+    onQuickAssignSpeakerScoped: ((String, String, Boolean) -> Unit)? = null,
     onQuickNameSpeaker: (String, String?, String) -> Unit = { _, _, _ -> },
     onQuickMarkOffScreen: (String, DialogueType) -> Unit = { _, _ -> },
     onQuickToggleMoveMode: () -> Unit = {},
+    onQuickEditDialogue: ((String) -> Unit)? = null,
+    onQuickHealMoment: (() -> Unit)? = null,
+    onLiveFrameSnapshot: ((Long, LiveStageFrameSnapshot) -> Unit)? = null,
     onDismissQuickPicker: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -259,6 +265,11 @@ fun VideoPlayerStage(
         var stageBoundsInWindow by remember { mutableStateOf(Rect.Zero) }
         val latestTimeMs by rememberUpdatedState(currentTimeMs)
         val latestOnLiveFaces by rememberUpdatedState(onLiveFacesDetected)
+        val latestOnLiveSnapshot by rememberUpdatedState(onLiveFrameSnapshot)
+
+        LaunchedEffect(project.id) {
+            liveFaceTracker.resetSceneHistory()
+        }
 
         LaunchedEffect(project.id, isPlaying, displayMode, isCinemaIntroActive, isEditMode, project.videoSource.kind) {
             if (!isPlaying ||
@@ -272,13 +283,18 @@ fun VideoPlayerStage(
             while (isActive) {
                 if (stageBoundsInWindow.width >= 48f && stageBoundsInWindow.height >= 48f) {
                     val sampleTime = latestTimeMs
-                    val faces = liveFaceTracker.captureAndDetect(
+                    val snapshot = liveFaceTracker.captureFrameSnapshot(
                         hostView = hostView,
                         stageBoundsInWindow = stageBoundsInWindow,
                         videoTimeMs = sampleTime,
                     )
-                    if (faces != null) {
-                        latestOnLiveFaces(sampleTime, faces)
+                    if (snapshot != null) {
+                        val snapHandler = latestOnLiveSnapshot
+                        if (snapHandler != null) {
+                            snapHandler(sampleTime, snapshot)
+                        } else {
+                            latestOnLiveFaces(sampleTime, snapshot.faces)
+                        }
                     }
                 }
                 delay(135L)
@@ -1333,12 +1349,31 @@ fun VideoPlayerStage(
                     event = pickerEvent,
                     speakers = project.speakers,
                     anchorBottom = bubbleInUpperHalf,
-                    onAssignSpeaker = { spkId -> onQuickAssignSpeaker(pickerEvent.id, spkId) },
+                    onAssignSpeaker = { spkId, applyAll ->
+                        val scoped = onQuickAssignSpeakerScoped
+                        if (scoped != null) {
+                            scoped(pickerEvent.id, spkId, applyAll)
+                        } else {
+                            onQuickAssignSpeaker(pickerEvent.id, spkId)
+                        }
+                    },
                     onNameSpeaker = { targetSpkId, name -> onQuickNameSpeaker(pickerEvent.id, targetSpkId, name) },
                     onMarkOffScreen = { side -> onQuickMarkOffScreen(pickerEvent.id, side) },
                     onToggleMoveMode = {
                         onDismissQuickPicker()
                         onQuickToggleMoveMode()
+                    },
+                    onEditDialogue = onQuickEditDialogue?.let { handler ->
+                        {
+                            onDismissQuickPicker()
+                            handler(pickerEvent.id)
+                        }
+                    },
+                    onHealMoment = onQuickHealMoment?.let { handler ->
+                        {
+                            onDismissQuickPicker()
+                            handler()
+                        }
                     },
                     onDismiss = onDismissQuickPicker,
                     modifier = Modifier.fillMaxSize(),
@@ -1353,16 +1388,20 @@ private fun FloatingQuickSpeakerPicker(
     event: com.example.data.model.DialogueEvent,
     speakers: List<com.example.data.model.Speaker>,
     anchorBottom: Boolean,
-    onAssignSpeaker: (String) -> Unit,
+    onAssignSpeaker: (String, Boolean) -> Unit,
     onNameSpeaker: (String?, String) -> Unit,
     onMarkOffScreen: (DialogueType) -> Unit,
     onToggleMoveMode: () -> Unit,
+    onEditDialogue: (() -> Unit)? = null,
+    onHealMoment: (() -> Unit)? = null,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val currentSpeaker = speakers.firstOrNull { it.id == event.speakerId }
     val isCurrentUnknown = isBubbleSpeakerUnknown(event, currentSpeaker)
     var showNameField by remember(event.id) { mutableStateOf(isCurrentUnknown) }
+    // Default strictly to single-line reassignment so uncertain global edits never happen silently
+    var applyToAllLines by remember(event.id) { mutableStateOf(false) }
     var draftName by remember(event.id) {
         mutableStateOf(
             if (currentSpeaker != null && currentSpeaker.isConfirmedCharacter) currentSpeaker.displayName else ""
@@ -1417,7 +1456,7 @@ private fun FloatingQuickSpeakerPicker(
                     IconButton(
                         onClick = onDismiss,
                         modifier = Modifier
-                            .size(32.dp)
+                            .size(36.dp)
                             .testTag("quick_picker_close_button"),
                     ) {
                         Icon(
@@ -1429,7 +1468,42 @@ private fun FloatingQuickSpeakerPicker(
                     }
                 }
 
-                // 1-tap Cast chips row
+                // Explicit scope toggle: This line only (default safe) vs All lines by current speaker
+                if (currentSpeaker != null) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        FilterChip(
+                            selected = !applyToAllLines,
+                            onClick = { applyToAllLines = false },
+                            label = { Text("This line only", fontSize = 11.sp) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = LensSky.copy(alpha = 0.22f),
+                                selectedLabelColor = Color.White,
+                            ),
+                            modifier = Modifier.testTag("quick_picker_scope_single"),
+                        )
+                        FilterChip(
+                            selected = applyToAllLines,
+                            onClick = { applyToAllLines = true },
+                            label = {
+                                Text(
+                                    "All lines by ${currentSpeaker.displayName.take(14)}",
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = LensAmber.copy(alpha = 0.24f),
+                                selectedLabelColor = Color.White,
+                            ),
+                            modifier = Modifier.testTag("quick_picker_scope_all"),
+                        )
+                    }
+                }
+
+                // 1-tap Cast chips row (initials avatar + color so identity isn't color-only)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1444,10 +1518,16 @@ private fun FloatingQuickSpeakerPicker(
                         } else {
                             UnknownSpeakerGray
                         }
+                        val initials = spk.displayName
+                            .split(" ")
+                            .filter { it.isNotBlank() }
+                            .take(2)
+                            .joinToString("") { it.first().uppercaseChar().toString() }
+                            .ifBlank { "?" }
                         val isSelected = event.speakerId == spk.id
                         FilterChip(
                             selected = isSelected,
-                            onClick = { onAssignSpeaker(spk.id) },
+                            onClick = { onAssignSpeaker(spk.id, applyToAllLines) },
                             label = {
                                 Text(
                                     text = spk.displayName,
@@ -1458,10 +1538,18 @@ private fun FloatingQuickSpeakerPicker(
                             leadingIcon = {
                                 Box(
                                     modifier = Modifier
-                                        .size(8.dp)
+                                        .size(18.dp)
                                         .clip(CircleShape)
-                                        .background(chipAccent)
-                                )
+                                        .background(chipAccent),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = initials,
+                                        fontSize = 8.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = CinemaObsidian,
+                                    )
+                                }
                             },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = chipAccent.copy(alpha = 0.28f),
@@ -1526,9 +1614,11 @@ private fun FloatingQuickSpeakerPicker(
                     }
                 }
 
-                // Compact off-screen cutaway & move actions
+                // Contextual secondary actions: Off-screen, Edit dialogue, Move, Heal this moment
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -1543,7 +1633,7 @@ private fun FloatingQuickSpeakerPicker(
                             text = "◀ Off Left",
                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
                             color = Color.White.copy(alpha = 0.9f),
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
                         )
                     }
                     Surface(
@@ -1557,10 +1647,36 @@ private fun FloatingQuickSpeakerPicker(
                             text = "Off Right ▶",
                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
                             color = Color.White.copy(alpha = 0.9f),
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
                         )
                     }
-                    Spacer(Modifier.weight(1f))
+                    if (onEditDialogue != null) {
+                        Surface(
+                            color = Color.White.copy(alpha = 0.08f),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.16f)),
+                            onClick = onEditDialogue,
+                            modifier = Modifier.testTag("quick_picker_edit_dialogue"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Edit,
+                                    contentDescription = "Edit dialogue in Studio",
+                                    tint = Color.White.copy(alpha = 0.85f),
+                                    modifier = Modifier.size(12.dp),
+                                )
+                                Text(
+                                    text = "Edit",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
+                                    color = Color.White.copy(alpha = 0.9f),
+                                )
+                            }
+                        }
+                    }
                     Surface(
                         color = Color.White.copy(alpha = 0.08f),
                         shape = RoundedCornerShape(10.dp),
@@ -1569,7 +1685,7 @@ private fun FloatingQuickSpeakerPicker(
                         modifier = Modifier.testTag("quick_picker_move_bubble"),
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
@@ -1584,6 +1700,33 @@ private fun FloatingQuickSpeakerPicker(
                                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
                                 color = Color.White.copy(alpha = 0.9f),
                             )
+                        }
+                    }
+                    if (onHealMoment != null) {
+                        Surface(
+                            color = LensSky.copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, LensSky.copy(alpha = 0.55f)),
+                            onClick = onHealMoment,
+                            modifier = Modifier.testTag("quick_picker_heal_moment"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.AutoFixHigh,
+                                    contentDescription = "Heal this moment",
+                                    tint = LensSky,
+                                    modifier = Modifier.size(12.dp),
+                                )
+                                Text(
+                                    text = "Heal",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold),
+                                    color = Color.White,
+                                )
+                            }
                         }
                     }
                 }

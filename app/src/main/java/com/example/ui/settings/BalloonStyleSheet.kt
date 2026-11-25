@@ -114,6 +114,14 @@ fun BalloonStyleSheet(
             )
 
             StyleSwitchRow(
+                title = "Stable Positioning",
+                subtitle = "Keep dialogue in a calm reading area while preserving speaker names and colors",
+                checked = settings.stablePositioning,
+                onCheckedChange = { onUpdate(settings.copy(stablePositioning = it)) },
+                tag = "switch_stable_positioning",
+            )
+
+            StyleSwitchRow(
                 title = "Reduced Motion",
                 subtitle = "Disable smoothing animations & cross-fade transitions",
                 checked = settings.reducedMotion,
@@ -121,9 +129,26 @@ fun BalloonStyleSheet(
                 tag = "switch_reduced_motion",
             )
 
+            val sensLabel = when {
+                settings.movementSensitivity <= 0.25f -> "Calmest"
+                settings.movementSensitivity <= 0.65f -> "Balanced"
+                else -> "Responsive"
+            }
+            Text(
+                text = "Bubble Movement Sensitivity ($sensLabel)",
+                style = MaterialTheme.typography.labelMedium,
+            )
+            Slider(
+                value = settings.movementSensitivity,
+                onValueChange = { onUpdate(settings.copy(movementSensitivity = it.coerceIn(0f, 1f))) },
+                valueRange = 0f..1f,
+                enabled = !settings.stablePositioning,
+                modifier = Modifier.testTag("movement_sensitivity_slider"),
+            )
+
             StyleSwitchRow(
                 title = "Minimal Tail Pointer",
-                subtitle = "Point subtle tail toward speaker when confident",
+                subtitle = "Point subtle tail toward speaker only when position is verified",
                 checked = settings.showTail,
                 onCheckedChange = { onUpdate(settings.copy(showTail = it)) },
                 tag = "switch_tail",

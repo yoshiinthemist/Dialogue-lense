@@ -34,6 +34,11 @@ import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.AddCircleOutline
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.material.icons.filled.ChatBubble
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
@@ -44,13 +49,17 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.PrivacyTip
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Subtitles
+import androidx.compose.material.icons.filled.SubtitlesOff
 import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material.icons.filled.TravelExplore
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -61,6 +70,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -72,6 +87,7 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -91,7 +107,9 @@ import com.example.BuildConfig
 import com.example.data.ai.AppCheckDiagnostics
 import com.example.data.ai.ScoutHeartbeatStatus
 import com.example.data.model.BubbleVisualStyle
+import com.example.data.model.CaptionDisplayMode
 import com.example.data.model.DialogueLensProject
+import com.example.data.model.HealScope
 import com.example.data.model.QuotaSaverMode
 import com.example.data.model.SpeakerLabelMode
 import com.example.data.model.TranslationMode
@@ -101,7 +119,10 @@ import com.example.data.model.isNonSpeakerSpecificEvent
 import com.example.data.subtitle.SubtitleParser
 import com.example.ui.editor.InspectorTab
 import com.example.ui.editor.TimelineSubtitleEditor
+import com.example.ui.player.HealBeaconDetailSheet
+import com.example.ui.player.HealThisMomentPill
 import com.example.ui.player.PlayerControlsBar
+import com.example.ui.player.ReadinessStatusPill
 import com.example.ui.player.ScoutBrowserInspectorModal
 import com.example.ui.player.VideoPlayerStage
 import com.example.ui.player.WebBrowserControlStrip
@@ -111,6 +132,7 @@ import com.example.ui.setup.MediaImportSheet
 import com.example.ui.setup.ProjectAndPrivacySheet
 import com.example.ui.setup.StartLauncherScreen
 import com.example.ui.setup.SubtitleExportSheet
+import com.example.ui.state.AppDestination
 import com.example.ui.state.DialogueLensUiState
 import com.example.ui.state.DialogueLensViewModel
 import com.example.ui.state.ScoutCaptionState
@@ -125,6 +147,7 @@ import com.example.ui.theme.LensSky
 import com.example.ui.theme.NonSpeakerBubbleWhite
 import com.example.ui.theme.SpeakerAccentPalette
 import com.example.ui.theme.UnknownSpeakerGray
+import kotlinx.coroutines.delay
 
 private data class PendingSubtitleExport(
     val project: DialogueLensProject,
@@ -295,12 +318,13 @@ fun DialogueLensScreen(
         )
     }
 
-    if (state.showStartLauncher) {
+    if (state.showStartLauncher && state.activeDestination == AppDestination.LIBRARY) {
         StartLauncherScreen(
             savedProjects = state.savedProjects,
             onStartLocalProject = viewModel::createProjectFromMedia,
             onStartYouTubeProject = viewModel::createYouTubeProject,
             onStartWebStreamProject = viewModel::createWebStreamProject,
+            onStartDirectMediaUrl = viewModel::createDirectMediaUrlProject,
             onOpenSavedProject = viewModel::loadProject,
             onLoadDemoScenario = viewModel::loadDemoScenario,
             subtitlePrepState = state.subtitlePrepState,
@@ -353,6 +377,13 @@ fun DialogueLensScreen(
     }
 
     if (state.isFullscreenTheater) {
+        var fullscreenControlsVisible by remember { mutableStateOf(true) }
+        LaunchedEffect(fullscreenControlsVisible, state.isPlaying, state.quickPickerEventId) {
+            if (fullscreenControlsVisible && state.isPlaying && state.quickPickerEventId == null) {
+                delay(3_500L)
+                fullscreenControlsVisible = false
+            }
+        }
         BackHandler {
             if (state.quickPickerEventId != null) {
                 viewModel.dismissQuickSpeakerPicker(resumePlayback = true)
@@ -364,6 +395,12 @@ fun DialogueLensScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color.Black)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) {
+                    fullscreenControlsVisible = !fullscreenControlsVisible
+                }
                 .testTag("theater_fullscreen_container"),
             contentAlignment = Alignment.Center,
         ) {
@@ -394,7 +431,7 @@ fun DialogueLensScreen(
                 onOpenCastGlossary = {
                     viewModel.exitFullscreenTheater()
                     inspectorTabRequest = InspectorTab.CAST
-                    showToolsDrawer = true
+                    viewModel.selectDestination(AppDestination.STUDIO)
                 },
                 scoutPlayRequest = state.scoutPlayRequest,
                 scoutSeekRequest = state.scoutSeekRequest,
@@ -413,9 +450,13 @@ fun DialogueLensScreen(
                 scoutCompletedWindows = state.scoutCompletedWindows,
                 scoutTotalWindows = state.scoutTotalWindows,
                 onLiveFacesDetected = viewModel::onLiveStageFacesDetected,
+                onLiveFrameSnapshot = viewModel::onLiveStageFrameSnapshot,
                 isEditMode = state.isEditMode,
                 selectedEventId = state.selectedEventId,
-                onTogglePlayPause = viewModel::togglePlayPause,
+                onTogglePlayPause = {
+                    fullscreenControlsVisible = true
+                    viewModel.togglePlayPause()
+                },
                 onYouTubePlaybackState = viewModel::onYouTubePlaybackState,
                 onYouTubeCaptionTrackStatus = viewModel::onYouTubeCaptionTrackStatus,
                 onYouTubeEmbedFallback = viewModel::onYouTubeEmbedFallback,
@@ -438,154 +479,155 @@ fun DialogueLensScreen(
                 onTapFaceTrack = viewModel::assignActiveDialogueToFaceTrack,
                 onDragBalloonAnchor = viewModel::overrideBalloonAnchor,
                 quickPickerEventId = state.quickPickerEventId,
-                onQuickAssignSpeaker = viewModel::quickAssignSpeakerFromPicker,
+                onQuickAssignSpeaker = { eventId, spkId -> viewModel.quickAssignSpeakerFromPicker(eventId, spkId, false) },
+                onQuickAssignSpeakerScoped = viewModel::quickAssignSpeakerFromPicker,
                 onQuickNameSpeaker = viewModel::quickNameAndAssignSpeakerFromPicker,
                 onQuickMarkOffScreen = viewModel::quickMarkOffScreenFromPicker,
                 onQuickToggleMoveMode = {
                     if (!state.isEditMode) viewModel.toggleEditMode()
                 },
+                onQuickEditDialogue = { eventId ->
+                    viewModel.dismissQuickSpeakerPicker(resumePlayback = false)
+                    viewModel.exitFullscreenTheater()
+                    viewModel.selectEventForEditing(eventId)
+                    inspectorTabRequest = InspectorTab.TIMELINE
+                    viewModel.selectDestination(AppDestination.STUDIO)
+                },
+                onQuickHealMoment = {
+                    viewModel.dismissQuickSpeakerPicker(resumePlayback = false)
+                    viewModel.markHealBeaconAtCurrentTime()
+                },
                 onDismissQuickPicker = { viewModel.dismissQuickSpeakerPicker(resumePlayback = true) },
                 modifier = Modifier.fillMaxSize(),
             )
 
-            Row(
+            // Auto-fading Fullscreen Top Controls
+            AnimatedVisibility(
+                visible = fullscreenControlsVisible || !state.isPlaying,
+                enter = fadeIn(),
+                exit = fadeOut(),
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .statusBarsPadding()
                     .displayCutoutPadding()
                     .padding(horizontal = 14.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                if (state.project.videoSource.kind == VideoSourceKind.WEB_STREAM) {
-                    IconButton(
-                        onClick = viewModel::viewerWebGoBack,
-                        enabled = state.viewerWebNav.canGoBack,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(CinemaObsidian.copy(alpha = 0.72f))
-                            .testTag("theater_web_back_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Viewer back",
-                            tint = if (state.viewerWebNav.canGoBack) Color.White else Color.White.copy(alpha = 0.35f),
-                        )
-                    }
-                    IconButton(
-                        onClick = viewModel::viewerWebGoForward,
-                        enabled = state.viewerWebNav.canGoForward,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(CinemaObsidian.copy(alpha = 0.72f))
-                            .testTag("theater_web_forward_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                            contentDescription = "Viewer forward",
-                            tint = if (state.viewerWebNav.canGoForward) Color.White else Color.White.copy(alpha = 0.35f),
-                        )
-                    }
-                    IconButton(
-                        onClick = viewModel::viewerWebRefresh,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(CinemaObsidian.copy(alpha = 0.72f))
-                            .testTag("theater_web_refresh_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Refresh,
-                            contentDescription = "Viewer refresh",
-                            tint = Color.White,
-                        )
-                    }
-                    IconButton(
-                        onClick = viewModel::viewerWebResetSource,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(CinemaObsidian.copy(alpha = 0.72f))
-                            .testTag("theater_web_reset_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Replay,
-                            contentDescription = "Return to video page",
-                            tint = if (state.viewerWebNav.isAdRedirectSuspected) LensAmber else Color.White,
-                        )
-                    }
-                    if (state.dualInstanceEnabled) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (state.project.videoSource.kind == VideoSourceKind.WEB_STREAM) {
                         IconButton(
-                            onClick = viewModel::openScoutBrowserModal,
+                            onClick = viewModel::viewerWebGoBack,
+                            enabled = state.viewerWebNav.canGoBack,
                             modifier = Modifier
                                 .size(48.dp)
                                 .clip(CircleShape)
                                 .background(CinemaObsidian.copy(alpha = 0.72f))
-                                .testTag("theater_open_scout_button"),
+                                .testTag("theater_web_back_button"),
                         ) {
                             Icon(
-                                imageVector = Icons.Filled.TravelExplore,
-                                contentDescription = "Open interactive Scout browser",
-                                tint = if (state.scoutWebNav.isAdRedirectSuspected) LensAmber else LensSky,
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Viewer back",
+                                tint = if (state.viewerWebNav.canGoBack) Color.White else Color.White.copy(alpha = 0.35f),
+                            )
+                        }
+                        IconButton(
+                            onClick = viewModel::viewerWebRefresh,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(CinemaObsidian.copy(alpha = 0.72f))
+                                .testTag("theater_web_refresh_button"),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Refresh,
+                                contentDescription = "Viewer refresh",
+                                tint = Color.White,
                             )
                         }
                     }
-                }
-                IconButton(
-                    onClick = viewModel::togglePlayPause,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(CircleShape)
-                        .background(CinemaObsidian.copy(alpha = 0.72f)),
-                ) {
-                    Icon(
-                        imageVector = if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                        contentDescription = if (state.isPlaying) "Pause" else "Play",
-                        tint = Color.White,
-                    )
-                }
-                IconButton(
-                    onClick = viewModel::exitFullscreenTheater,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(CircleShape)
-                        .background(CinemaObsidian.copy(alpha = 0.72f))
-                        .testTag("exit_fullscreen_button"),
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.FullscreenExit,
-                        contentDescription = "Exit theater fullscreen",
-                        tint = Color.White,
-                    )
+                    IconButton(
+                        onClick = viewModel::togglePlayPause,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(CinemaObsidian.copy(alpha = 0.72f)),
+                    ) {
+                        Icon(
+                            imageVector = if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            contentDescription = if (state.isPlaying) "Pause" else "Play",
+                            tint = Color.White,
+                        )
+                    }
+                    IconButton(
+                        onClick = viewModel::exitFullscreenTheater,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(CinemaObsidian.copy(alpha = 0.72f))
+                            .testTag("exit_fullscreen_button"),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.FullscreenExit,
+                            contentDescription = "Exit theater fullscreen",
+                            tint = Color.White,
+                        )
+                    }
                 }
             }
 
-            val selectedEvent = state.project.dialogueEvents.firstOrNull { it.id == state.selectedEventId }
-            if (selectedEvent != null && selectedEvent.culturalNote.isNotBlank() && state.quickPickerEventId == null) {
-                Surface(
-                    color = CinemaElevated.copy(alpha = 0.94f),
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, LensMint.copy(alpha = 0.6f)),
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .navigationBarsPadding()
-                        .padding(16.dp),
+            // Auto-fading Fullscreen Bottom Strip: Display Mode Switch + Contextual Heal Beacon when paused
+            AnimatedVisibility(
+                visible = (fullscreenControlsVisible || !state.isPlaying) && state.quickPickerEventId == null,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    Surface(
+                        color = CinemaObsidian.copy(alpha = 0.82f),
+                        shape = RoundedCornerShape(999.dp),
+                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.16f)),
                     ) {
-                        Text(
-                            text = "文化 Note: ${selectedEvent.culturalNote}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = LensMint,
-                            modifier = Modifier.weight(1f, fill = false),
-                        )
-                        TextButton(onClick = { viewModel.selectEventForEditing(null) }) {
-                            Text("Close", fontSize = 11.sp)
+                        Row(
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            val activeMode = state.displayMode.normalizedPrimaryMode()
+                            listOf(
+                                Triple(CaptionDisplayMode.BALLOONS, Icons.Filled.ChatBubble, "Speech bubbles"),
+                                Triple(CaptionDisplayMode.CLASSIC, Icons.Filled.Subtitles, "Subtitles"),
+                                Triple(CaptionDisplayMode.OFF, Icons.Filled.SubtitlesOff, "Dialogue off"),
+                            ).forEach { (mode, icon, label) ->
+                                val selected = activeMode == mode
+                                IconButton(
+                                    onClick = { viewModel.setDisplayMode(mode) },
+                                    modifier = Modifier
+                                        .size(40.dp)
+                                        .clip(CircleShape)
+                                        .background(if (selected) LensSky else Color.Transparent)
+                                        .testTag("theater_mode_${mode.name.lowercase()}"),
+                                ) {
+                                    Icon(
+                                        imageVector = icon,
+                                        contentDescription = label,
+                                        tint = if (selected) CinemaObsidian else Color.White,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
+                            }
                         }
+                    }
+
+                    if (!state.isPlaying) {
+                        HealThisMomentPill(
+                            onClick = { viewModel.markHealBeaconAtCurrentTime() },
+                            isCompact = true,
+                        )
                     }
                 }
             }
@@ -593,392 +635,640 @@ fun DialogueLensScreen(
         return
     }
 
-    Scaffold(
-        contentWindowInsets = WindowInsets.safeDrawing,
-        containerColor = CinemaObsidian,
-        topBar = {
-            TopAppBar(
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = CinemaObsidian,
-                    titleContentColor = MaterialTheme.colorScheme.onSurface,
-                ),
-                navigationIcon = {
-                    IconButton(
-                        onClick = viewModel::openStartLauncher,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("open_start_launcher_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Home,
-                            contentDescription = "Home and media launcher",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+    if (state.activeDestination != AppDestination.WATCH) {
+        BackHandler {
+            viewModel.selectDestination(AppDestination.WATCH)
+        }
+    }
+
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(CinemaObsidian),
+    ) {
+        val isExpandedLayout = maxWidth >= 820.dp
+
+        val navDestinations = listOf(
+            Triple(AppDestination.WATCH, "Watch", Icons.Filled.PlayCircle),
+            Triple(AppDestination.LIBRARY, "Library", Icons.Filled.VideoLibrary),
+            Triple(AppDestination.STUDIO, "Studio", Icons.Filled.Tune),
+        )
+
+        Row(modifier = Modifier.fillMaxSize()) {
+            if (isExpandedLayout) {
+                NavigationRail(
+                    containerColor = CinemaSurface,
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .testTag("adaptive_navigation_rail"),
+                ) {
+                    Spacer(Modifier.size(12.dp))
+                    navDestinations.forEach { (dest, label, icon) ->
+                        val selected = state.activeDestination == dest
+                        NavigationRailItem(
+                            selected = selected,
+                            onClick = { viewModel.selectDestination(dest) },
+                            icon = { Icon(icon, contentDescription = label) },
+                            label = { Text(label, fontSize = 11.sp) },
+                            colors = NavigationRailItemDefaults.colors(
+                                selectedIconColor = CinemaObsidian,
+                                selectedTextColor = LensSky,
+                                indicatorColor = LensSky,
+                                unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            ),
+                            modifier = Modifier.testTag("nav_rail_${dest.name.lowercase()}"),
                         )
                     }
-                },
-                title = {
-                    Text(
-                        text = state.project.title,
-                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                    Spacer(Modifier.weight(1f))
+                    NavigationRailItem(
+                        selected = false,
+                        onClick = { showStyleSheet = true },
+                        icon = { Icon(Icons.Filled.Palette, contentDescription = "Appearance & Accessibility") },
+                        label = { Text("Style", fontSize = 11.sp) },
+                        modifier = Modifier.testTag("nav_rail_style"),
+                    )
+                    Spacer(Modifier.size(12.dp))
+                }
+            }
+
+            Scaffold(
+                modifier = Modifier.weight(1f),
+                contentWindowInsets = WindowInsets.safeDrawing,
+                containerColor = CinemaObsidian,
+                topBar = {
+                    TopAppBar(
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = CinemaObsidian,
+                            titleContentColor = MaterialTheme.colorScheme.onSurface,
+                        ),
+                        title = {
+                            Text(
+                                text = when (state.activeDestination) {
+                                    AppDestination.LIBRARY -> "Library"
+                                    AppDestination.STUDIO -> "Studio · ${state.project.title}"
+                                    AppDestination.WATCH -> state.project.title
+                                },
+                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        },
+                        actions = {
+                            if (state.activeDestination == AppDestination.WATCH &&
+                                state.project.videoSource.kind != VideoSourceKind.DEMO_SCENARIO
+                            ) {
+                                ReadinessStatusPill(
+                                    readiness = state.humanReadiness,
+                                    onClick = {
+                                        inspectorTabRequest = InspectorTab.DIAGNOSTICS
+                                        viewModel.selectDestination(AppDestination.STUDIO)
+                                    },
+                                    modifier = Modifier.padding(end = 4.dp),
+                                )
+                            }
+
+                            IconButton(
+                                onClick = { showStyleSheet = true },
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("open_appearance_button"),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Palette,
+                                    contentDescription = "Appearance and accessibility settings",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+
+                            IconButton(
+                                onClick = { showImportSheet = true },
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("open_media_import_button"),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.AddCircleOutline,
+                                    contentDescription = "Add video or captions",
+                                    tint = LensSky,
+                                )
+                            }
+                        },
                     )
                 },
-                actions = {
-                    // Subtle live Scout status pill (replaces the bulky telemetry strip below the video)
-                    if (state.project.videoSource.kind != VideoSourceKind.DEMO_SCENARIO) {
-                        QuietScoutTopPill(
-                            state = state,
-                            onClick = {
-                                expandScoutDiagInDrawer = true
-                                inspectorTabRequest = InspectorTab.TIMELINE
-                                showToolsDrawer = true
-                            },
-                        )
-                    }
-
-                    TextButton(
-                        onClick = { showImportSheet = true },
-                        contentPadding = PaddingValues(horizontal = 10.dp),
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("open_media_import_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.AddCircleOutline,
-                            contentDescription = "Load media",
-                            tint = LensSky,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text("Media", color = LensSky, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                    }
-                },
-            )
-        },
-    ) { innerPadding ->
-        BoxWithConstraints(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding),
-        ) {
-            val isExpandedLayout = maxWidth >= 820.dp
-
-            if (isExpandedLayout) {
-                // Desktop / Tablet Canonical Layout: Dominant Video + Clean Controls on Left, Inspector on Right
-                Row(modifier = Modifier.fillMaxSize()) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1.45f)
-                            .fillMaxHeight(),
-                    ) {
-                        StatusBannerStrip(
-                            banner = state.statusBanner,
-                            onDismiss = viewModel::clearStatusBanner,
-                        )
-
-                        VideoPlayerStage(
-                            project = state.project,
-                            exoPlayer = viewModel.exoPlayer,
-                            currentTimeMs = state.currentTimeMs,
-                            isPlaying = state.isPlaying,
-                            isMuted = state.isMuted,
-                            playbackSpeed = state.playbackSpeed,
-                            streamPlayRequest = state.streamPlayRequest,
-                            youtubeSeekRequest = state.youtubeSeekRequest,
-                            dualInstanceEnabled = state.dualInstanceEnabled,
-                            hasPendingPlayIntro = state.hasPendingPlayIntro,
-                            isCinemaIntroActive = state.isCinemaIntroActive,
-                            introRemainingMs = state.introRemainingMs,
-                            introTotalDurationMs = state.introTotalDurationMs,
-                            requiredOpeningWindows = state.requiredOpeningLeadWindows,
-                            isOpeningSpeakersReady = state.isOpeningSpeakersReady,
-                            isScoutCatchUpBuffering = state.isScoutCatchUpBuffering,
-                            onDismissCatchUpBuffering = viewModel::dismissScoutCatchUpBuffering,
-                            scoutTimeMs = state.scoutTimeMs,
-                            scoutedUpToMs = state.scoutedUpToMs,
-                            scoutStatusText = state.scoutStatusText,
-                            scoutCaptionState = state.scoutCaptionState,
-                            activeSpeakerToast = state.activeSpeakerToast,
-                            onDismissSpeakerToast = viewModel::dismissSpeakerToast,
-                            onOpenCastGlossary = { inspectorTabRequest = InspectorTab.CAST },
-                            scoutPlayRequest = state.scoutPlayRequest,
-                            scoutSeekRequest = state.scoutSeekRequest,
-                            showScoutMonitorPip = state.showScoutMonitorPip,
-                            onToggleScoutMonitorPip = viewModel::toggleScoutMonitorPip,
-                            onSkipIntro = viewModel::skipCinemaIntro,
-                            onRetryYouTubeAiTranscript = viewModel::retryYouTubeAiTranscription,
-                            onOpenAttachCaptions = { showImportSheet = true },
-                            onSwitchToZeroCloudMode = viewModel::switchToZeroCloudFallback,
-                            displayMode = state.displayMode,
-                            placedBalloons = state.placedBalloons,
-                            liveFaceExclusionRects = state.liveFaceExclusionRects,
-                            scoutCompletedWindows = state.scoutCompletedWindows,
-                            scoutTotalWindows = state.scoutTotalWindows,
-                            onLiveFacesDetected = viewModel::onLiveStageFacesDetected,
-                            isEditMode = state.isEditMode,
-                            selectedEventId = state.selectedEventId,
-                            onTogglePlayPause = viewModel::togglePlayPause,
-                            onYouTubePlaybackState = viewModel::onYouTubePlaybackState,
-                            onYouTubeCaptionTrackStatus = viewModel::onYouTubeCaptionTrackStatus,
-                            onYouTubeEmbedFallback = viewModel::onYouTubeEmbedFallback,
-                            onYouTubeTimedTextCaptured = viewModel::onYouTubeTimedTextCaptured,
-                            onWebStreamPlaybackState = viewModel::onWebStreamPlaybackState,
-                            onWebStreamCapturedCaptions = viewModel::onWebStreamCapturedCaptions,
-                            onWebStreamPageMetadata = viewModel::onWebStreamPageMetadata,
-                            viewerWebNavCommand = state.viewerWebNavCommand,
-                            onViewerWebNavChanged = viewModel::onViewerWebNavChanged,
-                            scoutWebNavCommand = state.scoutWebNavCommand,
-                            onScoutWebNavChanged = viewModel::onScoutWebNavChanged,
-                            scoutSessionHolder = scoutSessionHolder,
-                            showScoutBrowserModal = state.showScoutBrowserModal,
-                            onScoutYouTubePlaybackState = viewModel::onScoutYouTubePlaybackState,
-                            onScoutWebStreamPlaybackState = viewModel::onScoutWebStreamPlaybackState,
-                            onScoutWebStreamDirectMediaUrl = viewModel::onScoutWebStreamDirectMediaUrl,
-                            onWebStreamSniffedMediaStream = viewModel::onWebStreamSniffedMediaStream,
-                            onScoutWebStreamAudioSlice = viewModel::onScoutWebStreamAudioSlice,
-                            onTapBalloon = { eventId -> viewModel.openQuickSpeakerPicker(eventId) },
-                            onTapFaceTrack = viewModel::assignActiveDialogueToFaceTrack,
-                            onDragBalloonAnchor = viewModel::overrideBalloonAnchor,
-                            quickPickerEventId = state.quickPickerEventId,
-                            onQuickAssignSpeaker = viewModel::quickAssignSpeakerFromPicker,
-                            onQuickNameSpeaker = viewModel::quickNameAndAssignSpeakerFromPicker,
-                            onQuickMarkOffScreen = viewModel::quickMarkOffScreenFromPicker,
-                            onQuickToggleMoveMode = {
-                                if (!state.isEditMode) viewModel.toggleEditMode()
-                            },
-                            onDismissQuickPicker = { viewModel.dismissQuickSpeakerPicker(resumePlayback = true) },
-                            modifier = Modifier.weight(1f),
-                        )
-
-                        PlayerControlsBar(
-                            project = state.project,
-                            currentTimeMs = state.currentTimeMs,
-                            isPlaying = state.isPlaying,
-                            isMuted = state.isMuted,
-                            playbackSpeed = state.playbackSpeed,
-                            isFullscreenTheater = state.isFullscreenTheater,
-                            displayMode = state.displayMode,
-                            styleSettings = state.styleSettings,
-                            isEditMode = state.isEditMode,
-                            dualInstanceEnabled = state.dualInstanceEnabled,
-                            scoutedUpToMs = state.scoutedUpToMs,
-                            bufferedRanges = state.bufferedWindowRanges,
-                            analysisStatus = state.analysisStatus,
-                            onTogglePlayPause = viewModel::togglePlayPause,
-                            onSeekTo = viewModel::seekTo,
-                            onToggleMute = viewModel::toggleMute,
-                            onCyclePlaybackSpeed = viewModel::cyclePlaybackSpeed,
-                            onToggleFullscreenTheater = viewModel::toggleFullscreenTheater,
-                            onToggleDualInstance = viewModel::toggleDualInstanceLookahead,
-                            onSelectDisplayMode = viewModel::setDisplayMode,
-                            onToggleEditMode = viewModel::toggleEditMode,
-                            onOpenStyleSheet = { showStyleSheet = true },
-                            onOpenCastDrawer = { inspectorTabRequest = InspectorTab.CAST },
-                            onOpenToolsDrawer = {
-                                expandScoutDiagInDrawer = false
-                                showToolsDrawer = true
-                            },
-                            showDrawerTriggers = false,
-                        )
-
-                        if (state.project.videoSource.kind == VideoSourceKind.WEB_STREAM) {
-                            WebBrowserControlStrip(
-                                seedUrl = state.project.videoSource.uriString,
-                                viewerNav = state.viewerWebNav,
-                                scoutNav = state.scoutWebNav,
-                                scoutTimeMs = state.scoutTimeMs,
-                                dualInstanceEnabled = state.dualInstanceEnabled,
-                                onViewerBack = viewModel::viewerWebGoBack,
-                                onViewerForward = viewModel::viewerWebGoForward,
-                                onViewerRefresh = viewModel::viewerWebRefresh,
-                                onViewerResetSource = viewModel::viewerWebResetSource,
-                                onViewerAllowOnce = viewModel::viewerWebAllowOnce,
-                                onOpenScoutModal = viewModel::openScoutBrowserModal,
-                            )
+                bottomBar = {
+                    if (!isExpandedLayout) {
+                        NavigationBar(
+                            containerColor = CinemaSurface,
+                            tonalElevation = 0.dp,
+                            modifier = Modifier.testTag("compact_navigation_bar"),
+                        ) {
+                            navDestinations.forEach { (dest, label, icon) ->
+                                val selected = state.activeDestination == dest
+                                NavigationBarItem(
+                                    selected = selected,
+                                    onClick = { viewModel.selectDestination(dest) },
+                                    icon = { Icon(icon, contentDescription = label) },
+                                    label = { Text(label, fontSize = 11.5.sp) },
+                                    colors = NavigationBarItemDefaults.colors(
+                                        selectedIconColor = CinemaObsidian,
+                                        selectedTextColor = LensSky,
+                                        indicatorColor = LensSky,
+                                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    ),
+                                    modifier = Modifier.testTag("nav_bar_${dest.name.lowercase()}"),
+                                )
+                            }
                         }
                     }
+                },
+            ) { innerPadding ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding),
+                ) {
+                    when (state.activeDestination) {
+                        AppDestination.LIBRARY -> {
+                            StartLauncherScreen(
+                                savedProjects = state.savedProjects,
+                                onStartLocalProject = viewModel::createProjectFromMedia,
+                                onStartYouTubeProject = viewModel::createYouTubeProject,
+                                onStartWebStreamProject = viewModel::createWebStreamProject,
+                                onStartDirectMediaUrl = viewModel::createDirectMediaUrlProject,
+                                onOpenSavedProject = viewModel::loadProject,
+                                onLoadDemoScenario = viewModel::loadDemoScenario,
+                                subtitlePrepState = state.subtitlePrepState,
+                                selectedPrepFormat = state.selectedPrepFormat,
+                                onSelectPrepFormat = viewModel::setSubtitlePrepFormat,
+                                onGenerateSubtitlesFromUrl = viewModel::generateSubtitlesForUrl,
+                                onGenerateSubtitlesFromLocal = viewModel::generateSubtitlesForLocalVideo,
+                                onCancelSubtitlePrep = viewModel::cancelSubtitlePreGeneration,
+                                onClearSubtitlePrep = viewModel::clearSubtitlePrepState,
+                                onDownloadPreparedSubtitles = {
+                                    val ready = state.subtitlePrepState as? SubtitlePrepState.Ready ?: return@StartLauncherScreen
+                                    val fmt = state.selectedPrepFormat
+                                    val filename = SubtitleParser.suggestedExportFilename(ready.generatedProject.title, fmt)
+                                    when (fmt) {
+                                        SubtitleParser.SubtitleExportFormat.SRT -> exportPrepSrtLauncher.launch(filename)
+                                        SubtitleParser.SubtitleExportFormat.VTT -> exportPrepVttLauncher.launch(filename)
+                                        SubtitleParser.SubtitleExportFormat.ASS -> exportPrepAssLauncher.launch(filename)
+                                    }
+                                },
+                                onLaunchPreparedProject = viewModel::launchPreparedProject,
+                                onExportSavedProjectSubtitles = { proj -> subtitleExportProject = proj },
+                                embeddedInNavigation = true,
+                            )
+                        }
 
-                    TimelineSubtitleEditor(
-                        project = state.project,
-                        currentTimeMs = state.currentTimeMs,
-                        selectedEventId = state.selectedEventId,
-                        isTranslatingAi = state.isTranslatingAi,
-                        canUndo = state.canUndo,
-                        glossaryEntries = state.glossaryEntries,
-                        initialTab = inspectorTabRequest,
-                        onSelectEvent = viewModel::selectEventForEditing,
-                        onSeekTo = viewModel::seekTo,
-                        onAssignSpeaker = viewModel::assignSpeakerToEvent,
-                        onUpdateEvent = viewModel::updateDialogueEvent,
-                        onMergeWithNext = viewModel::mergeWithNextEvent,
-                        onSplitEvent = viewModel::splitEvent,
-                        onResetAnchor = viewModel::resetBalloonAnchor,
-                        onRenameSpeaker = viewModel::renameSpeaker,
-                        onTranslateWithAi = { viewModel.translateCurrentProjectWithAi() },
-                        onAutoTranscribeAudio = viewModel::autoTranscribeCurrentVideoWithAi,
-                        onAnalyzeSpeakers = { viewModel.analyzeSpeakersWithContextAndAudio() },
-                        onAddManualLine = viewModel::addManualDialogueLine,
-                        onUndo = viewModel::undoLastEdit,
-                        onShiftTiming = viewModel::shiftAllDialogueTimings,
-                        onAddGlossaryEntry = viewModel::addGlossaryEntry,
-                        onRemoveGlossaryEntry = viewModel::removeGlossaryEntry,
-                        onExportSubtitles = { subtitleExportProject = state.project },
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight(),
-                    )
-                }
-            } else {
-                // Mobile / Compact Theater-First Layout: Dominant Video + Serene Controls + Quiet Ambient Dock
-                Column(modifier = Modifier.fillMaxSize()) {
-                    StatusBannerStrip(
-                        banner = state.statusBanner,
-                        onDismiss = viewModel::clearStatusBanner,
-                    )
+                        AppDestination.STUDIO -> {
+                            Column(modifier = Modifier.fillMaxSize()) {
+                                ToolsQuickSettingsHeader(
+                                    state = state,
+                                    expandScoutDiag = expandScoutDiagInDrawer,
+                                    onToggleExpandScoutDiag = { expandScoutDiagInDrawer = !expandScoutDiagInDrawer },
+                                    onToggleEditMode = viewModel::toggleEditMode,
+                                    onCyclePlaybackSpeed = viewModel::cyclePlaybackSpeed,
+                                    onCycleTranslationMode = {
+                                        val next = when (state.project.translationMode) {
+                                            TranslationMode.NATURAL -> TranslationMode.LITERAL
+                                            TranslationMode.LITERAL -> TranslationMode.LEARNING
+                                            TranslationMode.LEARNING -> TranslationMode.NATURAL
+                                        }
+                                        viewModel.setTranslationMode(next)
+                                    },
+                                    onCycleSpeakerLabels = viewModel::cycleSpeakerLabelMode,
+                                    onToggleBubbleStyle = {
+                                        val nextStyle = when (state.styleSettings.visualStyle) {
+                                            BubbleVisualStyle.CINEMA_SUBTLE -> BubbleVisualStyle.MANGA_INK
+                                            BubbleVisualStyle.MANGA_INK -> BubbleVisualStyle.STREAMING_CLEAN
+                                            BubbleVisualStyle.STREAMING_CLEAN -> BubbleVisualStyle.CINEMA_SUBTLE
+                                        }
+                                        viewModel.updateStyleSettings(state.styleSettings.copy(visualStyle = nextStyle))
+                                    },
+                                    onOpenStyleSheet = { showStyleSheet = true },
+                                    onOpenProjectAndPrivacy = { showPrivacySheet = true },
+                                    onOpenSubtitleExport = { subtitleExportProject = state.project },
+                                    onRetryAi = viewModel::retryYouTubeAiTranscription,
+                                    onOpenAttachSrt = { showImportSheet = true },
+                                    onSelectQuotaMode = viewModel::setQuotaSaverMode,
+                                    onSwitchToZeroCloud = viewModel::switchToZeroCloudFallback,
+                                )
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                                TimelineSubtitleEditor(
+                                    project = state.project,
+                                    currentTimeMs = state.currentTimeMs,
+                                    selectedEventId = state.selectedEventId,
+                                    isTranslatingAi = state.isTranslatingAi,
+                                    canUndo = state.canUndo,
+                                    glossaryEntries = state.glossaryEntries,
+                                    initialTab = inspectorTabRequest,
+                                    onSelectEvent = viewModel::selectEventForEditing,
+                                    onSeekTo = { ms ->
+                                        viewModel.seekTo(ms)
+                                        viewModel.selectDestination(AppDestination.WATCH)
+                                    },
+                                    onAssignSpeaker = viewModel::assignSpeakerToEvent,
+                                    onUpdateEvent = viewModel::updateDialogueEvent,
+                                    onMergeWithNext = viewModel::mergeWithNextEvent,
+                                    onSplitEvent = viewModel::splitEvent,
+                                    onResetAnchor = viewModel::resetBalloonAnchor,
+                                    onRenameSpeaker = viewModel::renameSpeaker,
+                                    onTranslateWithAi = { viewModel.translateCurrentProjectWithAi() },
+                                    onAutoTranscribeAudio = viewModel::autoTranscribeCurrentVideoWithAi,
+                                    onAnalyzeSpeakers = { viewModel.analyzeSpeakersWithContextAndAudio() },
+                                    onAddManualLine = viewModel::addManualDialogueLine,
+                                    onUndo = viewModel::undoLastEdit,
+                                    onShiftTiming = viewModel::shiftAllDialogueTimings,
+                                    onAddGlossaryEntry = viewModel::addGlossaryEntry,
+                                    onRemoveGlossaryEntry = viewModel::removeGlossaryEntry,
+                                    onExportSubtitles = { subtitleExportProject = state.project },
+                                    onMergeSpeakers = viewModel::mergeSpeakers,
+                                    onMarkHealBeaconHere = { scope -> viewModel.markHealBeaconAtCurrentTime(scope = scope) },
+                                    onRetryHealBeacon = viewModel::retryHealBeacon,
+                                    onUndoHealBeacon = viewModel::undoHealBeacon,
+                                    onDismissHealBeacon = viewModel::dismissHealBeacon,
+                                    onChapterHealAt = { ts ->
+                                        viewModel.seekTo(ts)
+                                        viewModel.markHealBeaconAtCurrentTime(scope = HealScope.CHAPTER)
+                                    },
+                                    mediaCapabilities = state.mediaCapabilities,
+                                    transcriptDiagnostics = state.transcriptDiagnostics,
+                                    quotaSaverMode = state.quotaSaverMode,
+                                    onSelectQuotaMode = viewModel::setQuotaSaverMode,
+                                    onRetryAiTranscription = viewModel::retryYouTubeAiTranscription,
+                                    onAttachSubtitleFile = { showImportSheet = true },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .weight(1f),
+                                )
+                            }
+                        }
 
-                    VideoPlayerStage(
-                        project = state.project,
-                        exoPlayer = viewModel.exoPlayer,
-                        currentTimeMs = state.currentTimeMs,
-                        isPlaying = state.isPlaying,
-                        isMuted = state.isMuted,
-                        playbackSpeed = state.playbackSpeed,
-                        streamPlayRequest = state.streamPlayRequest,
-                        youtubeSeekRequest = state.youtubeSeekRequest,
-                        dualInstanceEnabled = state.dualInstanceEnabled,
-                        hasPendingPlayIntro = state.hasPendingPlayIntro,
-                        isCinemaIntroActive = state.isCinemaIntroActive,
-                        introRemainingMs = state.introRemainingMs,
-                        introTotalDurationMs = state.introTotalDurationMs,
-                        requiredOpeningWindows = state.requiredOpeningLeadWindows,
-                        isOpeningSpeakersReady = state.isOpeningSpeakersReady,
-                        isScoutCatchUpBuffering = state.isScoutCatchUpBuffering,
-                        onDismissCatchUpBuffering = viewModel::dismissScoutCatchUpBuffering,
-                        scoutTimeMs = state.scoutTimeMs,
-                        scoutedUpToMs = state.scoutedUpToMs,
-                        scoutStatusText = state.scoutStatusText,
-                        scoutCaptionState = state.scoutCaptionState,
-                        activeSpeakerToast = state.activeSpeakerToast,
-                        onDismissSpeakerToast = viewModel::dismissSpeakerToast,
-                        onOpenCastGlossary = {
-                            inspectorTabRequest = InspectorTab.CAST
-                            expandScoutDiagInDrawer = false
-                            showToolsDrawer = true
-                        },
-                        scoutPlayRequest = state.scoutPlayRequest,
-                        scoutSeekRequest = state.scoutSeekRequest,
-                        showScoutMonitorPip = state.showScoutMonitorPip,
-                        onToggleScoutMonitorPip = viewModel::toggleScoutMonitorPip,
-                        onSkipIntro = viewModel::skipCinemaIntro,
-                        onRetryYouTubeAiTranscript = viewModel::retryYouTubeAiTranscription,
-                        onOpenAttachCaptions = { showImportSheet = true },
-                        onSwitchToZeroCloudMode = viewModel::switchToZeroCloudFallback,
-                        displayMode = state.displayMode,
-                        placedBalloons = state.placedBalloons,
-                        liveFaceExclusionRects = state.liveFaceExclusionRects,
-                        scoutCompletedWindows = state.scoutCompletedWindows,
-                        scoutTotalWindows = state.scoutTotalWindows,
-                        onLiveFacesDetected = viewModel::onLiveStageFacesDetected,
-                        isEditMode = state.isEditMode,
-                        selectedEventId = state.selectedEventId,
-                        onTogglePlayPause = viewModel::togglePlayPause,
-                        onYouTubePlaybackState = viewModel::onYouTubePlaybackState,
-                        onYouTubeCaptionTrackStatus = viewModel::onYouTubeCaptionTrackStatus,
-                        onYouTubeEmbedFallback = viewModel::onYouTubeEmbedFallback,
-                        onYouTubeTimedTextCaptured = viewModel::onYouTubeTimedTextCaptured,
-                        onWebStreamPlaybackState = viewModel::onWebStreamPlaybackState,
-                        onWebStreamCapturedCaptions = viewModel::onWebStreamCapturedCaptions,
-                        onWebStreamPageMetadata = viewModel::onWebStreamPageMetadata,
-                        viewerWebNavCommand = state.viewerWebNavCommand,
-                        onViewerWebNavChanged = viewModel::onViewerWebNavChanged,
-                        scoutWebNavCommand = state.scoutWebNavCommand,
-                        onScoutWebNavChanged = viewModel::onScoutWebNavChanged,
-                        scoutSessionHolder = scoutSessionHolder,
-                        showScoutBrowserModal = state.showScoutBrowserModal,
-                        onScoutYouTubePlaybackState = viewModel::onScoutYouTubePlaybackState,
-                        onScoutWebStreamPlaybackState = viewModel::onScoutWebStreamPlaybackState,
-                        onScoutWebStreamDirectMediaUrl = viewModel::onScoutWebStreamDirectMediaUrl,
-                        onWebStreamSniffedMediaStream = viewModel::onWebStreamSniffedMediaStream,
-                        onScoutWebStreamAudioSlice = viewModel::onScoutWebStreamAudioSlice,
-                        onTapBalloon = { eventId -> viewModel.openQuickSpeakerPicker(eventId) },
-                        onTapFaceTrack = viewModel::assignActiveDialogueToFaceTrack,
-                        onDragBalloonAnchor = viewModel::overrideBalloonAnchor,
-                        quickPickerEventId = state.quickPickerEventId,
-                        onQuickAssignSpeaker = viewModel::quickAssignSpeakerFromPicker,
-                        onQuickNameSpeaker = viewModel::quickNameAndAssignSpeakerFromPicker,
-                        onQuickMarkOffScreen = viewModel::quickMarkOffScreenFromPicker,
-                        onQuickToggleMoveMode = {
-                            if (!state.isEditMode) viewModel.toggleEditMode()
-                        },
-                        onDismissQuickPicker = { viewModel.dismissQuickSpeakerPicker(resumePlayback = true) },
-                    )
+                        AppDestination.WATCH -> {
+                            if (isExpandedLayout) {
+                                // Tablet / Foldable Canonical Layout: Video + Controls Left, Calm Inspector/Dialogue Right
+                                Row(modifier = Modifier.fillMaxSize()) {
+                                    Column(
+                                        modifier = Modifier
+                                            .weight(1.45f)
+                                            .fillMaxHeight(),
+                                    ) {
+                                        StatusBannerStrip(
+                                            banner = state.statusBanner,
+                                            onDismiss = viewModel::clearStatusBanner,
+                                        )
 
-                    PlayerControlsBar(
-                        project = state.project,
-                        currentTimeMs = state.currentTimeMs,
-                        isPlaying = state.isPlaying,
-                        isMuted = state.isMuted,
-                        playbackSpeed = state.playbackSpeed,
-                        isFullscreenTheater = state.isFullscreenTheater,
-                        displayMode = state.displayMode,
-                        styleSettings = state.styleSettings,
-                        isEditMode = state.isEditMode,
-                        dualInstanceEnabled = state.dualInstanceEnabled,
-                        scoutedUpToMs = state.scoutedUpToMs,
-                        bufferedRanges = state.bufferedWindowRanges,
-                        failedRanges = state.coverageSummary.failedRanges,
-                        analysisStatus = state.analysisStatus,
-                        onTogglePlayPause = viewModel::togglePlayPause,
-                        onSeekTo = viewModel::seekTo,
-                        onToggleMute = viewModel::toggleMute,
-                        onCyclePlaybackSpeed = viewModel::cyclePlaybackSpeed,
-                        onToggleFullscreenTheater = viewModel::toggleFullscreenTheater,
-                        onToggleDualInstance = viewModel::toggleDualInstanceLookahead,
-                        onSelectDisplayMode = viewModel::setDisplayMode,
-                        onToggleEditMode = viewModel::toggleEditMode,
-                        onOpenStyleSheet = { showStyleSheet = true },
-                        onOpenCastDrawer = {
-                            inspectorTabRequest = InspectorTab.CAST
-                            expandScoutDiagInDrawer = false
-                            showToolsDrawer = true
-                        },
-                        onOpenToolsDrawer = {
-                            inspectorTabRequest = InspectorTab.TIMELINE
-                            expandScoutDiagInDrawer = false
-                            showToolsDrawer = true
-                        },
-                    )
+                                        VideoPlayerStage(
+                                            project = state.project,
+                                            exoPlayer = viewModel.exoPlayer,
+                                            currentTimeMs = state.currentTimeMs,
+                                            isPlaying = state.isPlaying,
+                                            isMuted = state.isMuted,
+                                            playbackSpeed = state.playbackSpeed,
+                                            streamPlayRequest = state.streamPlayRequest,
+                                            youtubeSeekRequest = state.youtubeSeekRequest,
+                                            dualInstanceEnabled = state.dualInstanceEnabled,
+                                            hasPendingPlayIntro = state.hasPendingPlayIntro,
+                                            isCinemaIntroActive = state.isCinemaIntroActive,
+                                            introRemainingMs = state.introRemainingMs,
+                                            introTotalDurationMs = state.introTotalDurationMs,
+                                            requiredOpeningWindows = state.requiredOpeningLeadWindows,
+                                            isOpeningSpeakersReady = state.isOpeningSpeakersReady,
+                                            isScoutCatchUpBuffering = state.isScoutCatchUpBuffering,
+                                            onDismissCatchUpBuffering = viewModel::dismissScoutCatchUpBuffering,
+                                            scoutTimeMs = state.scoutTimeMs,
+                                            scoutedUpToMs = state.scoutedUpToMs,
+                                            scoutStatusText = state.scoutStatusText,
+                                            scoutCaptionState = state.scoutCaptionState,
+                                            activeSpeakerToast = state.activeSpeakerToast,
+                                            onDismissSpeakerToast = viewModel::dismissSpeakerToast,
+                                            onOpenCastGlossary = { inspectorTabRequest = InspectorTab.CAST },
+                                            scoutPlayRequest = state.scoutPlayRequest,
+                                            scoutSeekRequest = state.scoutSeekRequest,
+                                            showScoutMonitorPip = state.showScoutMonitorPip,
+                                            onToggleScoutMonitorPip = viewModel::toggleScoutMonitorPip,
+                                            onSkipIntro = viewModel::skipCinemaIntro,
+                                            onRetryYouTubeAiTranscript = viewModel::retryYouTubeAiTranscription,
+                                            onOpenAttachCaptions = { showImportSheet = true },
+                                            onSwitchToZeroCloudMode = viewModel::switchToZeroCloudFallback,
+                                            displayMode = state.displayMode,
+                                            placedBalloons = state.placedBalloons,
+                                            liveFaceExclusionRects = state.liveFaceExclusionRects,
+                                            scoutCompletedWindows = state.scoutCompletedWindows,
+                                            scoutTotalWindows = state.scoutTotalWindows,
+                                            onLiveFacesDetected = viewModel::onLiveStageFacesDetected,
+                                            onLiveFrameSnapshot = viewModel::onLiveStageFrameSnapshot,
+                                            isEditMode = state.isEditMode,
+                                            selectedEventId = state.selectedEventId,
+                                            onTogglePlayPause = viewModel::togglePlayPause,
+                                            onYouTubePlaybackState = viewModel::onYouTubePlaybackState,
+                                            onYouTubeCaptionTrackStatus = viewModel::onYouTubeCaptionTrackStatus,
+                                            onYouTubeEmbedFallback = viewModel::onYouTubeEmbedFallback,
+                                            onYouTubeTimedTextCaptured = viewModel::onYouTubeTimedTextCaptured,
+                                            onWebStreamPlaybackState = viewModel::onWebStreamPlaybackState,
+                                            onWebStreamCapturedCaptions = viewModel::onWebStreamCapturedCaptions,
+                                            onWebStreamPageMetadata = viewModel::onWebStreamPageMetadata,
+                                            viewerWebNavCommand = state.viewerWebNavCommand,
+                                            onViewerWebNavChanged = viewModel::onViewerWebNavChanged,
+                                            scoutWebNavCommand = state.scoutWebNavCommand,
+                                            onScoutWebNavChanged = viewModel::onScoutWebNavChanged,
+                                            scoutSessionHolder = scoutSessionHolder,
+                                            showScoutBrowserModal = state.showScoutBrowserModal,
+                                            onScoutYouTubePlaybackState = viewModel::onScoutYouTubePlaybackState,
+                                            onScoutWebStreamPlaybackState = viewModel::onScoutWebStreamPlaybackState,
+                                            onScoutWebStreamDirectMediaUrl = viewModel::onScoutWebStreamDirectMediaUrl,
+                                            onWebStreamSniffedMediaStream = viewModel::onWebStreamSniffedMediaStream,
+                                            onScoutWebStreamAudioSlice = viewModel::onScoutWebStreamAudioSlice,
+                                            onTapBalloon = { eventId -> viewModel.openQuickSpeakerPicker(eventId) },
+                                            onTapFaceTrack = viewModel::assignActiveDialogueToFaceTrack,
+                                            onDragBalloonAnchor = viewModel::overrideBalloonAnchor,
+                                            quickPickerEventId = state.quickPickerEventId,
+                                            onQuickAssignSpeaker = { eventId, spkId -> viewModel.quickAssignSpeakerFromPicker(eventId, spkId, false) },
+                                            onQuickAssignSpeakerScoped = viewModel::quickAssignSpeakerFromPicker,
+                                            onQuickNameSpeaker = viewModel::quickNameAndAssignSpeakerFromPicker,
+                                            onQuickMarkOffScreen = viewModel::quickMarkOffScreenFromPicker,
+                                            onQuickToggleMoveMode = {
+                                                if (!state.isEditMode) viewModel.toggleEditMode()
+                                            },
+                                            onQuickEditDialogue = { eventId ->
+                                                viewModel.dismissQuickSpeakerPicker(resumePlayback = false)
+                                                viewModel.selectEventForEditing(eventId)
+                                                inspectorTabRequest = InspectorTab.TIMELINE
+                                            },
+                                            onQuickHealMoment = {
+                                                viewModel.dismissQuickSpeakerPicker(resumePlayback = false)
+                                                viewModel.markHealBeaconAtCurrentTime()
+                                            },
+                                            onDismissQuickPicker = { viewModel.dismissQuickSpeakerPicker(resumePlayback = true) },
+                                            modifier = Modifier.weight(1f),
+                                        )
 
-                    if (state.project.videoSource.kind == VideoSourceKind.WEB_STREAM) {
-                        WebBrowserControlStrip(
-                            seedUrl = state.project.videoSource.uriString,
-                            viewerNav = state.viewerWebNav,
-                            scoutNav = state.scoutWebNav,
-                            scoutTimeMs = state.scoutTimeMs,
-                            dualInstanceEnabled = state.dualInstanceEnabled,
-                            onViewerBack = viewModel::viewerWebGoBack,
-                            onViewerForward = viewModel::viewerWebGoForward,
-                            onViewerRefresh = viewModel::viewerWebRefresh,
-                            onViewerResetSource = viewModel::viewerWebResetSource,
-                            onViewerAllowOnce = viewModel::viewerWebAllowOnce,
-                            onOpenScoutModal = viewModel::openScoutBrowserModal,
-                        )
+                                        PlayerControlsBar(
+                                            project = state.project,
+                                            currentTimeMs = state.currentTimeMs,
+                                            isPlaying = state.isPlaying,
+                                            isMuted = state.isMuted,
+                                            playbackSpeed = state.playbackSpeed,
+                                            isFullscreenTheater = state.isFullscreenTheater,
+                                            displayMode = state.displayMode,
+                                            styleSettings = state.styleSettings,
+                                            isEditMode = state.isEditMode,
+                                            dualInstanceEnabled = state.dualInstanceEnabled,
+                                            scoutedUpToMs = state.scoutedUpToMs,
+                                            bufferedRanges = state.bufferedWindowRanges,
+                                            failedRanges = state.coverageSummary.failedRanges,
+                                            analysisStatus = state.analysisStatus,
+                                            activeChapterTitle = state.activeChapter?.title,
+                                            onTogglePlayPause = viewModel::togglePlayPause,
+                                            onSeekTo = viewModel::seekTo,
+                                            onToggleMute = viewModel::toggleMute,
+                                            onCyclePlaybackSpeed = viewModel::cyclePlaybackSpeed,
+                                            onToggleFullscreenTheater = viewModel::toggleFullscreenTheater,
+                                            onToggleDualInstance = viewModel::toggleDualInstanceLookahead,
+                                            onSelectDisplayMode = viewModel::setDisplayMode,
+                                            onToggleEditMode = viewModel::toggleEditMode,
+                                            onOpenStyleSheet = { showStyleSheet = true },
+                                            onOpenCastDrawer = { inspectorTabRequest = InspectorTab.CAST },
+                                            onOpenToolsDrawer = {
+                                                expandScoutDiagInDrawer = false
+                                                showToolsDrawer = true
+                                            },
+                                            onHealThisMoment = { viewModel.markHealBeaconAtCurrentTime() },
+                                            onInspectHealBeacon = viewModel::inspectHealBeacon,
+                                            showDrawerTriggers = false,
+                                        )
+
+                                        if (state.project.videoSource.kind == VideoSourceKind.WEB_STREAM) {
+                                            WebBrowserControlStrip(
+                                                seedUrl = state.project.videoSource.uriString,
+                                                viewerNav = state.viewerWebNav,
+                                                scoutNav = state.scoutWebNav,
+                                                scoutTimeMs = state.scoutTimeMs,
+                                                dualInstanceEnabled = state.dualInstanceEnabled,
+                                                onViewerBack = viewModel::viewerWebGoBack,
+                                                onViewerForward = viewModel::viewerWebGoForward,
+                                                onViewerRefresh = viewModel::viewerWebRefresh,
+                                                onViewerResetSource = viewModel::viewerWebResetSource,
+                                                onViewerAllowOnce = viewModel::viewerWebAllowOnce,
+                                                onOpenScoutModal = viewModel::openScoutBrowserModal,
+                                            )
+                                        }
+                                    }
+
+                                    TimelineSubtitleEditor(
+                                        project = state.project,
+                                        currentTimeMs = state.currentTimeMs,
+                                        selectedEventId = state.selectedEventId,
+                                        isTranslatingAi = state.isTranslatingAi,
+                                        canUndo = state.canUndo,
+                                        glossaryEntries = state.glossaryEntries,
+                                        initialTab = inspectorTabRequest,
+                                        onSelectEvent = viewModel::selectEventForEditing,
+                                        onSeekTo = viewModel::seekTo,
+                                        onAssignSpeaker = viewModel::assignSpeakerToEvent,
+                                        onUpdateEvent = viewModel::updateDialogueEvent,
+                                        onMergeWithNext = viewModel::mergeWithNextEvent,
+                                        onSplitEvent = viewModel::splitEvent,
+                                        onResetAnchor = viewModel::resetBalloonAnchor,
+                                        onRenameSpeaker = viewModel::renameSpeaker,
+                                        onTranslateWithAi = { viewModel.translateCurrentProjectWithAi() },
+                                        onAutoTranscribeAudio = viewModel::autoTranscribeCurrentVideoWithAi,
+                                        onAnalyzeSpeakers = { viewModel.analyzeSpeakersWithContextAndAudio() },
+                                        onAddManualLine = viewModel::addManualDialogueLine,
+                                        onUndo = viewModel::undoLastEdit,
+                                        onShiftTiming = viewModel::shiftAllDialogueTimings,
+                                        onAddGlossaryEntry = viewModel::addGlossaryEntry,
+                                        onRemoveGlossaryEntry = viewModel::removeGlossaryEntry,
+                                        onExportSubtitles = { subtitleExportProject = state.project },
+                                        onMergeSpeakers = viewModel::mergeSpeakers,
+                                        onMarkHealBeaconHere = { scope -> viewModel.markHealBeaconAtCurrentTime(scope = scope) },
+                                        onRetryHealBeacon = viewModel::retryHealBeacon,
+                                        onUndoHealBeacon = viewModel::undoHealBeacon,
+                                        onDismissHealBeacon = viewModel::dismissHealBeacon,
+                                        onChapterHealAt = { ts ->
+                                            viewModel.seekTo(ts)
+                                            viewModel.markHealBeaconAtCurrentTime(scope = HealScope.CHAPTER)
+                                        },
+                                        mediaCapabilities = state.mediaCapabilities,
+                                        transcriptDiagnostics = state.transcriptDiagnostics,
+                                        quotaSaverMode = state.quotaSaverMode,
+                                        onSelectQuotaMode = viewModel::setQuotaSaverMode,
+                                        onRetryAiTranscription = viewModel::retryYouTubeAiTranscription,
+                                        onAttachSubtitleFile = { showImportSheet = true },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxHeight(),
+                                    )
+                                }
+                            } else {
+                                // Mobile / Compact Theater-First Layout: Dominant Video + Serene Controls + Collapsible Dialogue Dock
+                                Column(modifier = Modifier.fillMaxSize()) {
+                                    StatusBannerStrip(
+                                        banner = state.statusBanner,
+                                        onDismiss = viewModel::clearStatusBanner,
+                                    )
+
+                                    VideoPlayerStage(
+                                        project = state.project,
+                                        exoPlayer = viewModel.exoPlayer,
+                                        currentTimeMs = state.currentTimeMs,
+                                        isPlaying = state.isPlaying,
+                                        isMuted = state.isMuted,
+                                        playbackSpeed = state.playbackSpeed,
+                                        streamPlayRequest = state.streamPlayRequest,
+                                        youtubeSeekRequest = state.youtubeSeekRequest,
+                                        dualInstanceEnabled = state.dualInstanceEnabled,
+                                        hasPendingPlayIntro = state.hasPendingPlayIntro,
+                                        isCinemaIntroActive = state.isCinemaIntroActive,
+                                        introRemainingMs = state.introRemainingMs,
+                                        introTotalDurationMs = state.introTotalDurationMs,
+                                        requiredOpeningWindows = state.requiredOpeningLeadWindows,
+                                        isOpeningSpeakersReady = state.isOpeningSpeakersReady,
+                                        isScoutCatchUpBuffering = state.isScoutCatchUpBuffering,
+                                        onDismissCatchUpBuffering = viewModel::dismissScoutCatchUpBuffering,
+                                        scoutTimeMs = state.scoutTimeMs,
+                                        scoutedUpToMs = state.scoutedUpToMs,
+                                        scoutStatusText = state.scoutStatusText,
+                                        scoutCaptionState = state.scoutCaptionState,
+                                        activeSpeakerToast = state.activeSpeakerToast,
+                                        onDismissSpeakerToast = viewModel::dismissSpeakerToast,
+                                        onOpenCastGlossary = {
+                                            inspectorTabRequest = InspectorTab.CAST
+                                            viewModel.selectDestination(AppDestination.STUDIO)
+                                        },
+                                        scoutPlayRequest = state.scoutPlayRequest,
+                                        scoutSeekRequest = state.scoutSeekRequest,
+                                        showScoutMonitorPip = state.showScoutMonitorPip,
+                                        onToggleScoutMonitorPip = viewModel::toggleScoutMonitorPip,
+                                        onSkipIntro = viewModel::skipCinemaIntro,
+                                        onRetryYouTubeAiTranscript = viewModel::retryYouTubeAiTranscription,
+                                        onOpenAttachCaptions = { showImportSheet = true },
+                                        onSwitchToZeroCloudMode = viewModel::switchToZeroCloudFallback,
+                                        displayMode = state.displayMode,
+                                        placedBalloons = state.placedBalloons,
+                                        liveFaceExclusionRects = state.liveFaceExclusionRects,
+                                        scoutCompletedWindows = state.scoutCompletedWindows,
+                                        scoutTotalWindows = state.scoutTotalWindows,
+                                        onLiveFacesDetected = viewModel::onLiveStageFacesDetected,
+                                        onLiveFrameSnapshot = viewModel::onLiveStageFrameSnapshot,
+                                        isEditMode = state.isEditMode,
+                                        selectedEventId = state.selectedEventId,
+                                        onTogglePlayPause = viewModel::togglePlayPause,
+                                        onYouTubePlaybackState = viewModel::onYouTubePlaybackState,
+                                        onYouTubeCaptionTrackStatus = viewModel::onYouTubeCaptionTrackStatus,
+                                        onYouTubeEmbedFallback = viewModel::onYouTubeEmbedFallback,
+                                        onYouTubeTimedTextCaptured = viewModel::onYouTubeTimedTextCaptured,
+                                        onWebStreamPlaybackState = viewModel::onWebStreamPlaybackState,
+                                        onWebStreamCapturedCaptions = viewModel::onWebStreamCapturedCaptions,
+                                        onWebStreamPageMetadata = viewModel::onWebStreamPageMetadata,
+                                        viewerWebNavCommand = state.viewerWebNavCommand,
+                                        onViewerWebNavChanged = viewModel::onViewerWebNavChanged,
+                                        scoutWebNavCommand = state.scoutWebNavCommand,
+                                        onScoutWebNavChanged = viewModel::onScoutWebNavChanged,
+                                        scoutSessionHolder = scoutSessionHolder,
+                                        showScoutBrowserModal = state.showScoutBrowserModal,
+                                        onScoutYouTubePlaybackState = viewModel::onScoutYouTubePlaybackState,
+                                        onScoutWebStreamPlaybackState = viewModel::onScoutWebStreamPlaybackState,
+                                        onScoutWebStreamDirectMediaUrl = viewModel::onScoutWebStreamDirectMediaUrl,
+                                        onWebStreamSniffedMediaStream = viewModel::onWebStreamSniffedMediaStream,
+                                        onScoutWebStreamAudioSlice = viewModel::onScoutWebStreamAudioSlice,
+                                        onTapBalloon = { eventId -> viewModel.openQuickSpeakerPicker(eventId) },
+                                        onTapFaceTrack = viewModel::assignActiveDialogueToFaceTrack,
+                                        onDragBalloonAnchor = viewModel::overrideBalloonAnchor,
+                                        quickPickerEventId = state.quickPickerEventId,
+                                        onQuickAssignSpeaker = { eventId, spkId -> viewModel.quickAssignSpeakerFromPicker(eventId, spkId, false) },
+                                        onQuickAssignSpeakerScoped = viewModel::quickAssignSpeakerFromPicker,
+                                        onQuickNameSpeaker = viewModel::quickNameAndAssignSpeakerFromPicker,
+                                        onQuickMarkOffScreen = viewModel::quickMarkOffScreenFromPicker,
+                                        onQuickToggleMoveMode = {
+                                            if (!state.isEditMode) viewModel.toggleEditMode()
+                                        },
+                                        onQuickEditDialogue = { eventId ->
+                                            viewModel.dismissQuickSpeakerPicker(resumePlayback = false)
+                                            viewModel.selectEventForEditing(eventId)
+                                            inspectorTabRequest = InspectorTab.TIMELINE
+                                            viewModel.selectDestination(AppDestination.STUDIO)
+                                        },
+                                        onQuickHealMoment = {
+                                            viewModel.dismissQuickSpeakerPicker(resumePlayback = false)
+                                            viewModel.markHealBeaconAtCurrentTime()
+                                        },
+                                        onDismissQuickPicker = { viewModel.dismissQuickSpeakerPicker(resumePlayback = true) },
+                                    )
+
+                                    PlayerControlsBar(
+                                        project = state.project,
+                                        currentTimeMs = state.currentTimeMs,
+                                        isPlaying = state.isPlaying,
+                                        isMuted = state.isMuted,
+                                        playbackSpeed = state.playbackSpeed,
+                                        isFullscreenTheater = state.isFullscreenTheater,
+                                        displayMode = state.displayMode,
+                                        styleSettings = state.styleSettings,
+                                        isEditMode = state.isEditMode,
+                                        dualInstanceEnabled = state.dualInstanceEnabled,
+                                        scoutedUpToMs = state.scoutedUpToMs,
+                                        bufferedRanges = state.bufferedWindowRanges,
+                                        failedRanges = state.coverageSummary.failedRanges,
+                                        analysisStatus = state.analysisStatus,
+                                        activeChapterTitle = state.activeChapter?.title,
+                                        onTogglePlayPause = viewModel::togglePlayPause,
+                                        onSeekTo = viewModel::seekTo,
+                                        onToggleMute = viewModel::toggleMute,
+                                        onCyclePlaybackSpeed = viewModel::cyclePlaybackSpeed,
+                                        onToggleFullscreenTheater = viewModel::toggleFullscreenTheater,
+                                        onToggleDualInstance = viewModel::toggleDualInstanceLookahead,
+                                        onSelectDisplayMode = viewModel::setDisplayMode,
+                                        onToggleEditMode = viewModel::toggleEditMode,
+                                        onOpenStyleSheet = { showStyleSheet = true },
+                                        onOpenCastDrawer = {
+                                            inspectorTabRequest = InspectorTab.CAST
+                                            viewModel.selectDestination(AppDestination.STUDIO)
+                                        },
+                                        onOpenToolsDrawer = {
+                                            inspectorTabRequest = InspectorTab.TIMELINE
+                                            viewModel.selectDestination(AppDestination.STUDIO)
+                                        },
+                                        onHealThisMoment = { viewModel.markHealBeaconAtCurrentTime() },
+                                        onInspectHealBeacon = viewModel::inspectHealBeacon,
+                                    )
+
+                                    if (state.project.videoSource.kind == VideoSourceKind.WEB_STREAM) {
+                                        WebBrowserControlStrip(
+                                            seedUrl = state.project.videoSource.uriString,
+                                            viewerNav = state.viewerWebNav,
+                                            scoutNav = state.scoutWebNav,
+                                            scoutTimeMs = state.scoutTimeMs,
+                                            dualInstanceEnabled = state.dualInstanceEnabled,
+                                            onViewerBack = viewModel::viewerWebGoBack,
+                                            onViewerForward = viewModel::viewerWebGoForward,
+                                            onViewerRefresh = viewModel::viewerWebRefresh,
+                                            onViewerResetSource = viewModel::viewerWebResetSource,
+                                            onViewerAllowOnce = viewModel::viewerWebAllowOnce,
+                                            onOpenScoutModal = viewModel::openScoutBrowserModal,
+                                        )
+                                    }
+
+                                    // Collapsible Ambient Now-Speaking Dock (calm breathing room below controls)
+                                    AmbientNowSpeakingDock(
+                                        state = state,
+                                        isExpanded = state.isDialoguePanelExpanded,
+                                        onToggleExpanded = viewModel::toggleDialoguePanelExpanded,
+                                        onTapActiveCue = { eventId -> viewModel.openQuickSpeakerPicker(eventId) },
+                                        onOpenCastTab = {
+                                            inspectorTabRequest = InspectorTab.CAST
+                                            viewModel.selectDestination(AppDestination.STUDIO)
+                                        },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .weight(1f),
+                                    )
+                                }
+                            }
+                        }
                     }
-
-                    // Quiet Ambient Now-Speaking Dock (calm breathing room below controls; zero clutter!)
-                    AmbientNowSpeakingDock(
-                        state = state,
-                        onTapActiveCue = { eventId -> viewModel.openQuickSpeakerPicker(eventId) },
-                        onOpenCastTab = {
-                            inspectorTabRequest = InspectorTab.CAST
-                            expandScoutDiagInDrawer = false
-                            showToolsDrawer = true
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f),
-                    )
                 }
             }
         }
@@ -1148,6 +1438,21 @@ fun DialogueLensScreen(
             onDismiss = { showStyleSheet = false },
         )
     }
+
+    val inspectedBeacon = state.selectedHealBeaconId?.let { id ->
+        state.project.healBeacons.firstOrNull { it.id == id }
+    }
+    if (inspectedBeacon != null) {
+        HealBeaconDetailSheet(
+            beacon = inspectedBeacon,
+            hasChapters = state.project.chapters.isNotEmpty(),
+            onDismissSheet = { viewModel.inspectHealBeacon(null) },
+            onJumpToMoment = viewModel::seekTo,
+            onRetry = viewModel::retryHealBeacon,
+            onUndo = viewModel::undoHealBeacon,
+            onRemoveBeacon = viewModel::dismissHealBeacon,
+        )
+    }
 }
 
 @Composable
@@ -1232,6 +1537,8 @@ private fun QuietScoutTopPill(
 @Composable
 private fun AmbientNowSpeakingDock(
     state: DialogueLensUiState,
+    isExpanded: Boolean,
+    onToggleExpanded: () -> Unit,
     onTapActiveCue: (String) -> Unit,
     onOpenCastTab: () -> Unit,
     modifier: Modifier = Modifier,
@@ -1251,108 +1558,138 @@ private fun AmbientNowSpeakingDock(
         else -> LensSky
     }
 
-    Box(
+    Column(
         modifier = modifier
             .background(CinemaObsidian)
-            .padding(horizontal = 16.dp, vertical = 14.dp)
+            .padding(horizontal = 16.dp, vertical = 8.dp)
             .testTag("ambient_now_speaking_dock"),
-        contentAlignment = Alignment.TopStart,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        if (activeCue != null) {
-            Surface(
-                color = CinemaSurface.copy(alpha = 0.72f),
-                shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.dp, activeAccent.copy(alpha = 0.35f)),
-                onClick = { onTapActiveCue(activeCue.id) },
-                modifier = Modifier.fillMaxWidth(),
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = state.activeChapter?.title ?: "Live Dialogue",
+                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(
+                onClick = onToggleExpanded,
+                modifier = Modifier
+                    .size(36.dp)
+                    .testTag("toggle_dialogue_panel_button"),
             ) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                Icon(
+                    imageVector = if (isExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                    contentDescription = if (isExpanded) "Collapse dialogue panel" else "Expand dialogue panel",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+
+        AnimatedVisibility(visible = isExpanded) {
+            if (activeCue != null) {
+                Surface(
+                    color = CinemaSurface.copy(alpha = 0.72f),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, activeAccent.copy(alpha = 0.35f)),
+                    onClick = { onTapActiveCue(activeCue.id) },
+                    modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(7.dp),
+                    Column(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(5.dp),
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(activeAccent)
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(7.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(activeAccent)
+                            )
+                            Text(
+                                text = if (isNonSpeakerSpecificEvent(activeCue)) {
+                                    activeCue.dialogueType.label
+                                } else if (isBubbleSpeakerUnknown(activeCue, activeSpeaker)) {
+                                    "Unconfirmed · Tap to name"
+                                } else {
+                                    activeSpeaker?.displayName ?: "Speaker"
+                                },
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                color = activeAccent,
+                            )
+                        }
                         Text(
-                            text = if (isNonSpeakerSpecificEvent(activeCue)) {
-                                activeCue.dialogueType.label
-                            } else if (isBubbleSpeakerUnknown(activeCue, activeSpeaker)) {
-                                "Unconfirmed · Tap to name"
-                            } else {
-                                activeSpeaker?.displayName ?: "Speaker"
-                            },
-                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                            color = activeAccent,
+                            text = activeCue.activeText(state.project.translationMode).ifBlank { activeCue.sourceText },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.92f),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    Text(
-                        text = activeCue.activeText(state.project.translationMode).ifBlank { activeCue.sourceText },
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.92f),
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
                 }
-            }
-        } else {
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                if (state.project.speakers.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        state.project.speakers.take(8).forEach { spk ->
-                            val accent = if (spk.isConfirmedCharacter) {
-                                SpeakerAccentPalette[spk.accentIndex % SpeakerAccentPalette.size]
-                            } else {
-                                UnknownSpeakerGray
-                            }
-                            Surface(
-                                color = CinemaSurface,
-                                shape = RoundedCornerShape(12.dp),
-                                border = BorderStroke(1.dp, accent.copy(alpha = 0.42f)),
-                                onClick = onOpenCastTab,
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+            } else {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    if (state.project.speakers.isNotEmpty()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            state.project.speakers.take(8).forEach { spk ->
+                                val accent = if (spk.isConfirmedCharacter) {
+                                    SpeakerAccentPalette[spk.accentIndex % SpeakerAccentPalette.size]
+                                } else {
+                                    UnknownSpeakerGray
+                                }
+                                Surface(
+                                    color = CinemaSurface,
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, accent.copy(alpha = 0.42f)),
+                                    onClick = onOpenCastTab,
                                 ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(7.dp)
-                                            .clip(CircleShape)
-                                            .background(accent)
-                                    )
-                                    Text(
-                                        text = spk.displayName,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurface,
-                                        maxLines = 1,
-                                    )
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(7.dp)
+                                                .clip(CircleShape)
+                                                .background(accent)
+                                        )
+                                        Text(
+                                            text = spk.displayName,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 1,
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
+                    Text(
+                        text = "Tap any speech bubble to confirm or rename a speaker. Pause to place a Heal Beacon.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                    )
                 }
-                Text(
-                    text = "Tap any speech bubble while watching to confirm, rename, or adjust a speaker.",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
-                )
             }
         }
     }
