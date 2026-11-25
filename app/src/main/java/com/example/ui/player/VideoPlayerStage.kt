@@ -862,7 +862,8 @@ fun VideoPlayerStage(
                 staleSfx.forEach { measuredSfxBounds.remove(it) }
             }
 
-            if (displayMode == CaptionDisplayMode.BALLOONS || displayMode == CaptionDisplayMode.BOTH) {
+            val isFixedZonesMode = displayMode == CaptionDisplayMode.FIXED_ZONES
+            if (displayMode == CaptionDisplayMode.BALLOONS || isFixedZonesMode || displayMode == CaptionDisplayMode.BOTH) {
                 val nonSfxBalloons = placedBalloons
                     .filter { it.event.dialogueType != DialogueType.SOUND_DESCRIPTION }
                 nonSfxBalloons.forEachIndexed { idx, placed ->
@@ -888,13 +889,14 @@ fun VideoPlayerStage(
                             },
                             onClick = { onTapBalloon(placed.event.id) },
                             onDragCommit = { newCenter -> onDragBalloonAnchor(placed.event.id, newCenter) },
+                            forceTaillessFixedZone = isFixedZonesMode,
                         )
                     }
                 }
             }
 
-            // 4. SFX Spatial Notes (in BALLOONS mode: dynamically dodge sketch bubbles & faces) or Classic Subtitle Bar
-            if (displayMode == CaptionDisplayMode.BALLOONS) {
+            // 4. SFX Spatial Notes (in BALLOONS / FIXED_ZONES mode) or Classic Subtitle Bar
+            if (displayMode == CaptionDisplayMode.BALLOONS || isFixedZonesMode) {
                 val bubbleObstacles = activeNonSfxIds.mapNotNull { measuredBubbleBounds[it] }
                 val sfxList = placedBalloons.filter { it.event.dialogueType == DialogueType.SOUND_DESCRIPTION }
                 sfxList.forEachIndexed { idx, sfxPlaced ->

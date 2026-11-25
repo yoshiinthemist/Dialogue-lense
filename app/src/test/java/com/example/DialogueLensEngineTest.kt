@@ -1522,6 +1522,7 @@ class DialogueLensEngineTest {
         assertEquals(
             listOf(
                 com.example.data.model.CaptionDisplayMode.BALLOONS,
+                com.example.data.model.CaptionDisplayMode.FIXED_ZONES,
                 com.example.data.model.CaptionDisplayMode.CLASSIC,
                 com.example.data.model.CaptionDisplayMode.OFF,
             ),
@@ -1530,6 +1531,10 @@ class DialogueLensEngineTest {
         assertEquals(
             com.example.data.model.CaptionDisplayMode.BALLOONS,
             com.example.data.model.CaptionDisplayMode.BOTH.normalizedPrimaryMode(),
+        )
+        assertEquals(
+            com.example.data.model.CaptionDisplayMode.FIXED_ZONES,
+            com.example.data.model.CaptionDisplayMode.FIXED_ZONES.normalizedPrimaryMode(),
         )
         assertEquals(
             com.example.data.model.CaptionDisplayMode.CLASSIC,

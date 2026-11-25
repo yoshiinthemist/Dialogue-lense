@@ -322,9 +322,9 @@ fun StartLauncherScreen(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             FilterChip(
-                                selected = extractedYoutubeId == "3AFJtcP2cp0",
+                                selected = extractedYoutubeId == "RzagPoxaolQ",
                                 onClick = {
-                                    urlInput = "https://youtu.be/3AFJtcP2cp0?is=Fd7HSQvVvb3qyMVC"
+                                    urlInput = "https://youtu.be/RzagPoxaolQ"
                                 },
                                 label = { Text("Load Test Video", fontSize = 12.sp) },
                                 modifier = Modifier.testTag("start_test_youtube_chip"),

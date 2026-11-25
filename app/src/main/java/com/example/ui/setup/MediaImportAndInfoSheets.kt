@@ -275,11 +275,11 @@ fun MediaImportSheet(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 FilterChip(
-                    selected = extractedYoutubeId == "3AFJtcP2cp0",
+                    selected = extractedYoutubeId == "RzagPoxaolQ",
                     onClick = {
-                        youtubeUrlInput = "https://youtu.be/3AFJtcP2cp0?is=Fd7HSQvVvb3qyMVC"
+                        youtubeUrlInput = "https://youtu.be/RzagPoxaolQ"
                     },
-                    label = { Text("Load Test Video (youtu.be/3AFJtcP2cp0)", fontSize = 12.sp) },
+                    label = { Text("Load Test Video (youtu.be/RzagPoxaolQ)", fontSize = 12.sp) },
                     modifier = Modifier.testTag("test_youtube_chip"),
                 )
             }

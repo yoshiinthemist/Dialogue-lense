@@ -59,6 +59,7 @@ enum class TranslationMode(val label: String) {
 
 enum class CaptionDisplayMode(val label: String) {
     BALLOONS("Balloons"),
+    FIXED_ZONES("Fixed Zones"),
     CLASSIC("Classic"),
     BOTH("Both"),
     OFF("Off");
@@ -67,7 +68,7 @@ enum class CaptionDisplayMode(val label: String) {
         if (this == BOTH) BALLOONS else this
 
     companion object {
-        val primaryModes: List<CaptionDisplayMode> = listOf(BALLOONS, CLASSIC, OFF)
+        val primaryModes: List<CaptionDisplayMode> = listOf(BALLOONS, FIXED_ZONES, CLASSIC, OFF)
     }
 }
 

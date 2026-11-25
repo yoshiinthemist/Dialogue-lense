@@ -420,6 +420,10 @@ class SubtitlePreGenerator(
             }
 
             val hintMap = mutableMapOf<String, AiTranslatedLine>()
+            val preGenSettledIds = workingProj.dialogueEvents
+                .filter { it.speakerId != null || it.attributionSummary == "Unidentified speaker" }
+                .map { it.id }
+                .toMutableSet()
             var currentColorMemory = characterColorMemory
             val ledger = TranscriptCoverageLedger(
                 initialDurationMs = workingProj.videoSource.durationMs,
@@ -737,6 +741,10 @@ class SubtitlePreGenerator(
                         windowEndMs = sliceEndMs,
                     )
                     ledger.recordDuplicateDecisions(mergeReport.decisions)
+                    val sceneBoundaries = workingProj.chapters
+                        .map { it.startMs }
+                        .filter { it > 0L }
+                        .sorted()
                     val (attributedSpeakers, attributedEvents) = attributionEngine.assignSpeakers(
                         events = mergeReport.events,
                         shots = workingProj.shots,
@@ -744,7 +752,14 @@ class SubtitlePreGenerator(
                         existingSpeakers = workingProj.speakers,
                         turnHints = hintMap,
                         rememberedCharacterColors = currentColorMemory,
+                        settledEventIds = preGenSettledIds,
+                        sceneBoundaryMs = sceneBoundaries,
                     )
+                    attributedEvents.forEach { evt ->
+                        if (evt.speakerId != null || evt.attributionSummary == "Unidentified speaker") {
+                            preGenSettledIds.add(evt.id)
+                        }
+                    }
                     val maxCueEnd = attributedEvents.maxOfOrNull { it.endTimeMs } ?: 0L
                     val expandedDur = maxOf(workingProj.videoSource.durationMs, maxCueEnd, sliceEndMs)
                     ledger.updateDuration(expandedDur)

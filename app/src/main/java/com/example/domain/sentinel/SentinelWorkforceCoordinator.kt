@@ -5,6 +5,7 @@ import com.example.data.model.CoverageStatus
 import com.example.data.model.DialogueLensProject
 import com.example.data.model.QuotaSaverMode
 import com.example.data.model.VideoChapter
+import com.example.domain.analysis.LookaheadWindowPlanner
 import com.example.domain.analysis.TranscriptCoverageLedger
 import kotlin.math.abs
 
@@ -22,6 +23,7 @@ enum class SentinelTaskKind {
     PLAYBACK_LOOKAHEAD,
     USER_HEAL_BEACON,
     CHAPTER_BOUNDARY_PATROL,
+    CHANGEOVER_PRELISTEN,
     EDITORIAL_TRANSITION_CHECK,
     BACKGROUND_GAP_FILL,
 }
@@ -144,6 +146,7 @@ class SentinelWorkforceCoordinator {
         WORKER_2_ID to SentinelWorkerState(workerId = WORKER_2_ID, isActive = false),
     )
     private val chapterRecords = linkedMapOf<String, ChapterPatrolRecord>()
+    private val preListenedSeamKeys = mutableSetOf<String>()
 
     private var quotaMode: QuotaSaverMode = QuotaSaverMode.QUOTA_SAVER
     private var consecutiveQuotaErrors: Int = 0
@@ -162,6 +165,7 @@ class SentinelWorkforceCoordinator {
             workers[WORKER_1_ID] = SentinelWorkerState(workerId = WORKER_1_ID, isActive = false)
             workers[WORKER_2_ID] = SentinelWorkerState(workerId = WORKER_2_ID, isActive = false)
             chapterRecords.clear()
+            preListenedSeamKeys.clear()
             consecutiveQuotaErrors = 0
             totalCompletedRepairs = 0
             totalLocalCleanChapterChecks = 0
@@ -284,6 +288,148 @@ class SentinelWorkforceCoordinator {
     }
 
     /**
+     * Proactively plans dedicated 2nd-Scout audio pre-listening for EVERY upcoming known
+     * changeover seam ahead of [playheadMs] — combining BOTH:
+     * 1. YouTube chapter boundaries (`project.chapters`)
+     * 2. Nominal Scout analysis window boundaries (`35s, 75s, 115s, ...`)
+     *
+     * Merges seams within 12s of each other into one straddling `[seam - 6s, seam + 8s]`
+     * pre-listen slice so Worker 2 catches and repairs changeover dropouts, echoes, and
+     * speaker swaps BEFORE playback reaches the seam.
+     */
+    fun planUpcomingChangeoverPreListens(
+        project: DialogueLensProject,
+        playheadMs: Long,
+        lookaheadMinMs: Long = CHANGEOVER_LOOKAHEAD_MIN_MS,
+        lookaheadMaxMs: Long = CHANGEOVER_LOOKAHEAD_MAX_MS,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): List<SentinelWorkItem> = synchronized(lock) {
+        if (projectId != project.id) {
+            projectId = project.id
+            chapterRecords.clear()
+            preListenedSeamKeys.clear()
+        }
+        val durationMs = maxOf(
+            project.videoSource.durationMs,
+            project.chapters.maxOfOrNull { it.endMs } ?: 0L,
+            project.dialogueEvents.maxOfOrNull { it.endTimeMs } ?: 0L,
+        )
+        if (durationMs <= 15_000L) return@synchronized emptyList()
+
+        val durationSec = (durationMs / 1000L).toInt().coerceAtLeast(35)
+        val chapterBoundaries = project.chapters
+            .filter { it.startMs > 0L && it.startMs < durationMs }
+            .map { it.startMs to (it as VideoChapter?) }
+        val windowBoundaries = LookaheadWindowPlanner.buildSequentialPreGenWindows(durationSec)
+            .drop(1)
+            .map { (startSec, _) -> (startSec * 1000L) to (null as VideoChapter?) }
+            .filter { (ms, _) -> ms in 10_000L until durationMs }
+
+        val rawSeams = (chapterBoundaries + windowBoundaries).sortedBy { it.first }
+        if (rawSeams.isEmpty()) return@synchronized emptyList()
+
+        // Merge seams within 12s so a chapter boundary near a nominal 40s seam produces one clean straddling slice
+        val mergedSeams = mutableListOf<Pair<Long, VideoChapter?>>()
+        for ((seamMs, chapter) in rawSeams) {
+            val prev = mergedSeams.lastOrNull()
+            if (prev != null && abs(seamMs - prev.first) <= CHANGEOVER_MERGE_PROXIMITY_MS) {
+                if (prev.second == null && chapter != null) {
+                    mergedSeams[mergedSeams.lastIndex] = seamMs to chapter
+                }
+            } else {
+                mergedSeams.add(seamMs to chapter)
+            }
+        }
+
+        val minHorizon = (playheadMs + 2_000L).coerceAtLeast(0L)
+        val maxHorizon = (playheadMs + lookaheadMaxMs).coerceAtMost(durationMs)
+        val preferredMin = playheadMs + lookaheadMinMs
+
+        val newlyQueued = mutableListOf<SentinelWorkItem>()
+        val candidates = mergedSeams
+            .filter { (seamMs, _) -> seamMs in minHorizon..maxHorizon }
+            .sortedBy { (seamMs, _) ->
+                if (seamMs >= preferredMin) seamMs - preferredMin else seamMs - minHorizon
+            }
+
+        for ((seamMs, chapter) in candidates) {
+            val seamKey = changeoverSeamKey(seamMs)
+            if (seamKey in preListenedSeamKeys) continue
+            val winStart = (seamMs - CHANGEOVER_PRE_MS).coerceAtLeast(0L)
+            val winEnd = (seamMs + CHANGEOVER_POST_MS).coerceAtMost(durationMs)
+            if (winEnd - winStart < 4_000L) continue
+
+            val item = SentinelWorkItem(
+                id = seamKey,
+                tier = SentinelPriorityTier.PREVENTIVE_MAINTENANCE,
+                kind = SentinelTaskKind.CHANGEOVER_PRELISTEN,
+                startMs = winStart,
+                endMs = winEnd,
+                chapterId = chapter?.id,
+                chapterTitle = chapter?.title ?: "Transition ${seamMs / 1000L}s",
+                createdAtEpochMs = nowEpochMs + (seamMs / 1000L),
+            )
+            if (enqueueLocked(item)) {
+                newlyQueued.add(item)
+            }
+        }
+        newlyQueued
+    }
+
+    fun markChangeoverPreListenCompleted(seamItemId: String) {
+        synchronized(lock) {
+            preListenedSeamKeys.add(seamItemId)
+        }
+    }
+
+    fun markChangeoverPreListenFailed(seamItemId: String) {
+        synchronized(lock) {
+            preListenedSeamKeys.remove(seamItemId)
+        }
+    }
+
+    fun isChangeoverSeamPreListened(seamMs: Long): Boolean = synchronized(lock) {
+        changeoverSeamKey(seamMs) in preListenedSeamKeys
+    }
+
+    /**
+     * Claims the next queued [SentinelTaskKind.CHANGEOVER_PRELISTEN] task for the dedicated
+     * 2nd Scout worker while honoring interval reservations, quota gates, and patrol suspension.
+     */
+    fun claimChangeoverPreListenWork(
+        workerId: String = WORKER_2_ID,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): Pair<SentinelWorkItem, IntervalReservation>? = synchronized(lock) {
+        val activeCount = workers.values.count { it.isActive }
+        val isWorkerAlreadyActive = workers[workerId]?.isActive == true
+        if (!isWorkerAlreadyActive && activeCount >= maxAllowedWorkersLocked()) {
+            return@synchronized null
+        }
+        if (isPatrolSuspendedLocked()) return@synchronized null
+
+        val iterator = queue.iterator()
+        while (iterator.hasNext()) {
+            val item = iterator.next()
+            if (item.kind != SentinelTaskKind.CHANGEOVER_PRELISTEN) continue
+            val reservation = tryReserveInterval(workerId, item.startMs, item.endMs, item.tier, nowEpochMs)
+                ?: continue
+            iterator.remove()
+            workers[workerId] = SentinelWorkerState(
+                workerId = workerId,
+                isActive = true,
+                currentTaskLabel = "Pre-listening ${item.chapterTitle ?: "scene changeover"}",
+                activeStartMs = item.startMs,
+                activeEndMs = item.endMs,
+                tier = item.tier,
+            )
+            return@synchronized item to reservation
+        }
+        null
+    }
+
+    private fun changeoverSeamKey(seamMs: Long): String = "prelisten_${seamMs / 5_000L}"
+
+    /**
      * Explicit Studio user action: queue or re-queue a chapter boundary for immediate inspection.
      */
     fun requestManualChapterInspection(
@@ -397,11 +543,12 @@ class SentinelWorkforceCoordinator {
     private fun maxAllowedWorkersLocked(): Int {
         if (quotaMode == QuotaSaverMode.ZERO_CLOUD) return 1
         if (consecutiveQuotaErrors > 0 || isBatteryOrThermalConstrained) return 1
-        val hasHighPriorityWork = queue.any {
+        val hasHighPriorityOrPreListenWork = queue.any {
             it.tier == SentinelPriorityTier.CRITICAL_PLAYBACK_RECOVERY ||
-                it.tier == SentinelPriorityTier.USER_DIRECTED_REPAIR
+                it.tier == SentinelPriorityTier.USER_DIRECTED_REPAIR ||
+                it.kind == SentinelTaskKind.CHANGEOVER_PRELISTEN
         }
-        return if (hasHighPriorityWork) 2 else 1
+        return if (hasHighPriorityOrPreListenWork) 2 else 1
     }
 
     fun canActivateSecondWorker(): Boolean = synchronized(lock) {
@@ -442,6 +589,7 @@ class SentinelWorkforceCoordinator {
                     SentinelTaskKind.PLAYBACK_LOOKAHEAD -> "Preparing playback window"
                     SentinelTaskKind.USER_HEAL_BEACON -> "Healing marked moment"
                     SentinelTaskKind.CHAPTER_BOUNDARY_PATROL -> "Inspecting ${item.chapterTitle ?: "chapter"}"
+                    SentinelTaskKind.CHANGEOVER_PRELISTEN -> "Pre-listening ${item.chapterTitle ?: "scene changeover"}"
                     SentinelTaskKind.EDITORIAL_TRANSITION_CHECK -> "Checking scene transition"
                     SentinelTaskKind.BACKGROUND_GAP_FILL -> "Completing background coverage"
                 },
@@ -636,5 +784,10 @@ class SentinelWorkforceCoordinator {
         const val CHAPTER_PATROL_PRE_MS = 10_000L
         const val CHAPTER_PATROL_POST_MS = 15_000L
         const val PATROL_MIN_HEALTHY_LEAD_MS = 15_000L
+        const val CHANGEOVER_PRE_MS = 6_000L
+        const val CHANGEOVER_POST_MS = 8_000L
+        const val CHANGEOVER_MERGE_PROXIMITY_MS = 12_000L
+        const val CHANGEOVER_LOOKAHEAD_MIN_MS = 10_000L
+        const val CHANGEOVER_LOOKAHEAD_MAX_MS = 55_000L
     }
 }

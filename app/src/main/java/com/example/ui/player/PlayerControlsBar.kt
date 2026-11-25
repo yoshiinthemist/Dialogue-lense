@@ -8,6 +8,7 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -71,6 +72,7 @@ import com.example.ui.theme.CinemaElevated
 import com.example.ui.theme.CinemaObsidian
 import com.example.ui.theme.CinemaSurface
 import com.example.ui.theme.LensAmber
+import com.example.ui.theme.LensMint
 import com.example.ui.theme.LensSky
 import com.example.ui.theme.NonSpeakerBubbleWhite
 import com.example.ui.theme.SpeakerAccentPalette
@@ -533,157 +535,174 @@ fun PlayerControlsBar(
                 }
             }
 
-            // 3. Calm Essential Watching Dock: 3-Icon Caption Switcher + Cast + Tools Drawer
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                val activePrimaryMode = displayMode.normalizedPrimaryMode()
-                Surface(
-                    color = CinemaElevated,
-                    shape = RoundedCornerShape(14.dp),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                    modifier = Modifier.testTag("caption_mode_icon_group"),
+            // 3. Calm Essential Watching Dock: 4-Icon Caption Switcher (Balloons, Fixed Zones, Classic, Off) + Cast + Tools Drawer
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                val isCompactDock = maxWidth < 388.dp
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    Row(
-                        modifier = Modifier.padding(3.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    val activePrimaryMode = displayMode.normalizedPrimaryMode()
+                    Surface(
+                        color = CinemaElevated,
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                        modifier = Modifier.testTag("caption_mode_icon_group"),
                     ) {
-                        CaptionDisplayMode.primaryModes.forEach { mode ->
-                            val isSelected = activePrimaryMode == mode
-                            val a11yLabel = when (mode) {
-                                CaptionDisplayMode.BALLOONS -> "Speech bubbles mode"
-                                CaptionDisplayMode.CLASSIC -> "Standard subtitle bar mode"
-                                CaptionDisplayMode.OFF -> "No subtitles"
-                                CaptionDisplayMode.BOTH -> "Speech bubbles mode"
-                            }
-                            val selectedBg = when (mode) {
-                                CaptionDisplayMode.BALLOONS -> LensSky
-                                CaptionDisplayMode.CLASSIC -> LensAmber
-                                CaptionDisplayMode.OFF -> Color(0xFFEF4444)
-                                CaptionDisplayMode.BOTH -> LensSky
-                            }
-                            val fgColor = if (isSelected) {
-                                if (mode == CaptionDisplayMode.OFF) Color.White else CinemaObsidian
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            }
-                            Surface(
-                                color = if (isSelected) selectedBg else Color.Transparent,
-                                shape = RoundedCornerShape(10.dp),
-                                onClick = { onSelectDisplayMode(mode) },
-                                modifier = Modifier
-                                    .minimumInteractiveComponentSize()
-                                    .semantics {
-                                        contentDescription = a11yLabel
-                                        role = Role.RadioButton
-                                        selected = isSelected
-                                    }
-                                    .testTag("display_mode_${mode.name.lowercase()}"),
-                            ) {
-                                Box(
-                                    modifier = Modifier.size(width = 48.dp, height = 36.dp),
-                                    contentAlignment = Alignment.Center,
+                        Row(
+                            modifier = Modifier.padding(2.dp),
+                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            CaptionDisplayMode.primaryModes.forEach { mode ->
+                                val isSelected = activePrimaryMode == mode
+                                val a11yLabel = when (mode) {
+                                    CaptionDisplayMode.BALLOONS -> "Speech bubbles mode"
+                                    CaptionDisplayMode.FIXED_ZONES -> "Fixed zones tailless captions mode"
+                                    CaptionDisplayMode.CLASSIC -> "Standard subtitle bar mode"
+                                    CaptionDisplayMode.OFF -> "No subtitles"
+                                    CaptionDisplayMode.BOTH -> "Speech bubbles mode"
+                                }
+                                val selectedBg = when (mode) {
+                                    CaptionDisplayMode.BALLOONS -> LensSky
+                                    CaptionDisplayMode.FIXED_ZONES -> LensMint
+                                    CaptionDisplayMode.CLASSIC -> LensAmber
+                                    CaptionDisplayMode.OFF -> Color(0xFFEF4444)
+                                    CaptionDisplayMode.BOTH -> LensSky
+                                }
+                                val fgColor = if (isSelected) {
+                                    if (mode == CaptionDisplayMode.OFF) Color.White else CinemaObsidian
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                                Surface(
+                                    color = if (isSelected) selectedBg else Color.Transparent,
+                                    shape = RoundedCornerShape(10.dp),
+                                    onClick = { onSelectDisplayMode(mode) },
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .semantics {
+                                            contentDescription = a11yLabel
+                                            role = Role.RadioButton
+                                            selected = isSelected
+                                        }
+                                        .testTag("display_mode_${mode.name.lowercase()}"),
                                 ) {
-                                    when (mode) {
-                                        CaptionDisplayMode.BALLOONS,
-                                        CaptionDisplayMode.BOTH -> SpeechBubblesModeIcon(
-                                            tint = fgColor,
-                                            modifier = Modifier.size(24.dp),
-                                        )
-                                        CaptionDisplayMode.CLASSIC -> ScreenSubtitleBarIcon(
-                                            tint = fgColor,
-                                            modifier = Modifier.size(24.dp),
-                                        )
-                                        CaptionDisplayMode.OFF -> BigXOffIcon(
-                                            tint = fgColor,
-                                            modifier = Modifier.size(22.dp),
-                                        )
+                                    Box(
+                                        modifier = Modifier.size(
+                                            width = if (isCompactDock) 40.dp else 44.dp,
+                                            height = 36.dp,
+                                        ),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        when (mode) {
+                                            CaptionDisplayMode.BALLOONS,
+                                            CaptionDisplayMode.BOTH -> SpeechBubblesModeIcon(
+                                                tint = fgColor,
+                                                modifier = Modifier.size(22.dp),
+                                            )
+                                            CaptionDisplayMode.FIXED_ZONES -> FixedZonesModeIcon(
+                                                tint = fgColor,
+                                                modifier = Modifier.size(22.dp),
+                                            )
+                                            CaptionDisplayMode.CLASSIC -> ScreenSubtitleBarIcon(
+                                                tint = fgColor,
+                                                modifier = Modifier.size(22.dp),
+                                            )
+                                            CaptionDisplayMode.OFF -> BigXOffIcon(
+                                                tint = fgColor,
+                                                modifier = Modifier.size(20.dp),
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                if (showDrawerTriggers) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Surface(
-                            color = CinemaElevated,
-                            shape = RoundedCornerShape(14.dp),
-                            border = BorderStroke(
-                                1.dp,
-                                if (unconfirmedCount > 0) LensAmber.copy(alpha = 0.55f) else MaterialTheme.colorScheme.outlineVariant,
-                            ),
-                            onClick = onOpenCastDrawer,
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("open_cast_glossary_button"),
+                    if (showDrawerTriggers) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            Surface(
+                                color = CinemaElevated,
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (unconfirmedCount > 0) LensAmber.copy(alpha = 0.55f) else MaterialTheme.colorScheme.outlineVariant,
+                                ),
+                                onClick = onOpenCastDrawer,
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("open_cast_glossary_button"),
                             ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Groups,
-                                    contentDescription = "Open speaker cast glossary",
-                                    tint = LensSky,
-                                    modifier = Modifier.size(18.dp),
-                                )
-                                Text(
-                                    text = "Cast (${project.speakers.size})",
-                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                )
-                                if (unconfirmedCount > 0) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(6.dp)
-                                            .clip(CircleShape)
-                                            .background(LensAmber)
+                                Row(
+                                    modifier = Modifier.padding(
+                                        horizontal = if (isCompactDock) 8.dp else 11.dp,
+                                        vertical = 10.dp,
+                                    ),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Groups,
+                                        contentDescription = "Open speaker cast glossary",
+                                        tint = LensSky,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                    Text(
+                                        text = if (isCompactDock) "${project.speakers.size}" else "Cast (${project.speakers.size})",
+                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                    )
+                                    if (unconfirmedCount > 0) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(6.dp)
+                                                .clip(CircleShape)
+                                                .background(LensAmber)
+                                        )
+                                    }
+                                }
+                            }
+
+                            Surface(
+                                color = if (hasActiveToolBadges) LensSky.copy(alpha = 0.16f) else CinemaElevated,
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (hasActiveToolBadges) LensSky.copy(alpha = 0.65f) else MaterialTheme.colorScheme.outlineVariant,
+                                ),
+                                onClick = onOpenToolsDrawer,
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("open_tools_drawer_button"),
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(
+                                        horizontal = if (isCompactDock) 9.dp else 11.dp,
+                                        vertical = 10.dp,
+                                    ),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Tune,
+                                        contentDescription = "Open tools, lines, and style drawer",
+                                        tint = if (hasActiveToolBadges) LensSky else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                    Text(
+                                        text = "Tools",
+                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                        color = MaterialTheme.colorScheme.onSurface,
                                     )
                                 }
                             }
                         }
-
-                        Surface(
-                            color = if (hasActiveToolBadges) LensSky.copy(alpha = 0.16f) else CinemaElevated,
-                            shape = RoundedCornerShape(14.dp),
-                            border = BorderStroke(
-                                1.dp,
-                                if (hasActiveToolBadges) LensSky.copy(alpha = 0.65f) else MaterialTheme.colorScheme.outlineVariant,
-                            ),
-                            onClick = onOpenToolsDrawer,
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("open_tools_drawer_button"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Tune,
-                                    contentDescription = "Open tools, lines, and style drawer",
-                                    tint = if (hasActiveToolBadges) LensSky else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(18.dp),
-                                )
-                                Text(
-                                    text = "Tools",
-                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                )
-                            }
-                        }
-                    }
-                } else {
+                    } else {
                     // Expanded tablet layout: keep quick Tools & Style trigger right beside the caption switcher
                     Surface(
                         color = if (hasActiveToolBadges) LensSky.copy(alpha = 0.16f) else CinemaElevated,
@@ -716,8 +735,39 @@ fun PlayerControlsBar(
                         }
                     }
                 }
+                }
             }
         }
+    }
+}
+
+/**
+ * Clean dual tailless fixed-zone caption pills icon for Fixed Zones mode (no speech tail).
+ */
+@Composable
+private fun FixedZonesModeIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val stroke = Stroke(width = w * 0.085f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Upper-right fixed tailless pill
+        drawRoundRect(
+            color = tint.copy(alpha = 0.72f),
+            topLeft = Offset(w * 0.34f, h * 0.16f),
+            size = Size(w * 0.58f, h * 0.28f),
+            cornerRadius = CornerRadius(w * 0.14f, w * 0.14f),
+            style = stroke,
+        )
+        // Lower-left fixed tailless pill (zero tail)
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset(w * 0.08f, h * 0.54f),
+            size = Size(w * 0.62f, h * 0.30f),
+            cornerRadius = CornerRadius(w * 0.15f, w * 0.15f),
+        )
     }
 }
 

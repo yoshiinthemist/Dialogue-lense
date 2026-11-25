@@ -24,6 +24,8 @@ class SpeakerAttributionEngine {
         existingSpeakers: List<Speaker>,
         turnHints: Map<String, AiTranslatedLine> = emptyMap(),
         rememberedCharacterColors: Map<String, Int> = emptyMap(),
+        settledEventIds: Set<String> = emptySet(),
+        sceneBoundaryMs: List<Long> = emptyList(),
     ): Pair<List<Speaker>, List<DialogueEvent>> {
         val speakers = existingSpeakers.toMutableList()
         if (speakers.isEmpty()) {
@@ -42,19 +44,51 @@ class SpeakerAttributionEngine {
             speakers.add(Speaker(id = "spk_${letter.lowercaseChar()}", defaultLabel = "Speaker $letter", accentIndex = idx))
         }
 
+        val sortedBoundaries = sceneBoundaryMs.filter { it > 0L }.distinct().sorted()
         val updatedEvents = mutableListOf<DialogueEvent>()
         var lastEvent: DialogueEvent? = null
+        var activeSceneBucket: String? = null
+        var sceneBucketIndex = 0
+
+        // Per-scene spatial side memory: reset cleanly whenever a shot or chapter changeover occurs
+        // so Scene 1 left/right seating NEVER forces misattributions in Scene 2.
+        val sceneSpeakerSideX = mutableMapOf<String, Float>()
 
         // Track running acoustic cluster -> speakerId associations within this video session
         val clusterToSpeaker = mutableMapOf<String, String>()
 
         for (event in events.sortedBy { it.startTimeMs }) {
-            if (event.lockedByUser) {
-                val lockedSpeakerIdx = speakers.indexOfFirst { it.id == event.speakerId }
-                if (lockedSpeakerIdx >= 0) {
-                    val updatedSpk = updateSpeakerVoiceCentroid(speakers[lockedSpeakerIdx], event.audioFeatures)
-                    speakers[lockedSpeakerIdx] = updatedSpk
+            val midMs = (event.startTimeMs + event.endTimeMs) / 2L
+            val shot = shots.firstOrNull { midMs in it.startMs..it.endMs }
+                ?: shots.minByOrNull { abs(((it.startMs + it.endMs) / 2L) - midMs) }
+            val resolvedShotId = shot?.id ?: event.shotId
+            val chapterBucket = sortedBoundaries.count { it <= event.startTimeMs }
+            val sceneBucket = "$resolvedShotId#ch$chapterBucket"
+            if (activeSceneBucket != null && activeSceneBucket != sceneBucket) {
+                sceneSpeakerSideX.clear()
+                sceneBucketIndex++
+                // Across a chapter changeover, clear conversational carryover from the prior scene
+                if (activeSceneBucket.substringAfter("#ch") != chapterBucket.toString()) {
+                    lastEvent = null
+                }
+            }
+            activeSceneBucket = sceneBucket
+
+            val isSettledLine = event.id in settledEventIds && (
+                event.speakerId != null ||
+                    event.attributionSummary == "Unidentified speaker" ||
+                    event.dialogueType != DialogueType.SPOKEN
+                )
+            if (event.lockedByUser || isSettledLine) {
+                val keptSpeakerIdx = speakers.indexOfFirst { it.id == event.speakerId }
+                if (keptSpeakerIdx >= 0) {
+                    val updatedSpk = updateSpeakerVoiceCentroid(speakers[keptSpeakerIdx], event.audioFeatures)
+                    speakers[keptSpeakerIdx] = updatedSpk
                     event.audioFeatures?.voiceClusterId?.let { cid -> clusterToSpeaker[cid] = updatedSpk.id }
+                    val anchorX = event.anchorPosition?.x
+                    if (anchorX != null && event.dialogueType == DialogueType.SPOKEN && event.speakerConfidence >= 0.70f) {
+                        sceneSpeakerSideX[updatedSpk.id] = anchorX
+                    }
                 }
                 updatedEvents.add(event)
                 lastEvent = event
@@ -76,10 +110,7 @@ class SpeakerAttributionEngine {
                 continue
             }
 
-            val midMs = (event.startTimeMs + event.endTimeMs) / 2L
-            val shot = shots.firstOrNull { midMs in it.startMs..it.endMs }
-                ?: shots.minByOrNull { abs(((it.startMs + it.endMs) / 2L) - midMs) }
-            val shotId = shot?.id ?: event.shotId
+            val shotId = resolvedShotId
             val shotTracks = faceTracks.filter { it.shotId == shotId }
             val aiHint = turnHints[event.id]
 
@@ -228,7 +259,14 @@ class SpeakerAttributionEngine {
                 }
 
                 val center = track.averageCenter()
-                val mappedSpeaker = resolveSpeakerForTrack(track, speakers, center.x, faceTracks)
+                val mappedSpeaker = resolveSpeakerForTrack(
+                    track = track,
+                    speakers = speakers,
+                    centerX = center.x,
+                    allTracks = faceTracks,
+                    sceneSpeakerSideX = sceneSpeakerSideX,
+                    allowGlobalPreferredSideFallback = (sceneBucketIndex == 0 && sortedBoundaries.isEmpty()),
+                )
                 val voiceMatch = computeVoiceMatchScore(event.audioFeatures, mappedSpeaker, clusterToSpeaker)
                 val (contextScore, contextNote) = computeConversationalContextScore(
                     event = event,
@@ -238,7 +276,9 @@ class SpeakerAttributionEngine {
                     aiHint = aiHint,
                 )
 
-                val spatialContinuity = mappedSpeaker.preferredScreenSideX?.let { prefX ->
+                val scenePrefX = sceneSpeakerSideX[mappedSpeaker.id]
+                    ?: if (sceneBucketIndex == 0 && sortedBoundaries.isEmpty()) mappedSpeaker.preferredScreenSideX else null
+                val spatialContinuity = scenePrefX?.let { prefX ->
                     (1f - abs(prefX - center.x) * 1.4f).coerceIn(0f, 1f)
                 } ?: 0.5f
 
@@ -274,12 +314,13 @@ class SpeakerAttributionEngine {
                 else -> best.totalScore
             }
 
-            // Update speaker's acoustic voice centroid when confidence is high
+            // Update speaker's acoustic voice centroid and per-scene side memory when confidence is high
             if (calibratedConfidence >= 0.72f) {
                 val spkIdx = speakers.indexOfFirst { it.id == best.speaker.id }
                 if (spkIdx >= 0) {
                     speakers[spkIdx] = updateSpeakerVoiceCentroid(speakers[spkIdx], event.audioFeatures)
                 }
+                sceneSpeakerSideX[best.speaker.id] = best.track.averageCenter().x
                 event.audioFeatures?.voiceClusterId?.let { cid ->
                     clusterToSpeaker[cid] = best.speaker.id
                 }
@@ -750,6 +791,8 @@ class SpeakerAttributionEngine {
         speakers: MutableList<Speaker>,
         centerX: Float,
         allTracks: List<FaceTrack>,
+        sceneSpeakerSideX: Map<String, Float> = emptyMap(),
+        allowGlobalPreferredSideFallback: Boolean = true,
     ): Speaker {
         track.speakerId?.let { id ->
             speakers.firstOrNull { it.id == id }?.let { return it }
@@ -775,9 +818,12 @@ class SpeakerAttributionEngine {
         }
 
         if (shotTrackCount == 1 && speakers.size >= 2) {
-            return speakers.minByOrNull { spk ->
-                spk.preferredScreenSideX?.let { abs(it - centerX) } ?: 0.5f
-            } ?: speakers.first()
+            val sideAware = speakers.minByOrNull { spk ->
+                val sideX = sceneSpeakerSideX[spk.id]
+                    ?: if (allowGlobalPreferredSideFallback) spk.preferredScreenSideX else null
+                sideX?.let { abs(it - centerX) } ?: 0.5f
+            }
+            if (sideAware != null) return sideAware
         }
 
         return speakers[rank.coerceIn(0, speakers.lastIndex)]

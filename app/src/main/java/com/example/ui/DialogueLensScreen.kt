@@ -60,6 +60,7 @@ import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material.icons.filled.TravelExplore
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.filled.ViewAgenda
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -616,6 +617,7 @@ fun DialogueLensScreen(
                             val activeMode = state.displayMode.normalizedPrimaryMode()
                             listOf(
                                 Triple(CaptionDisplayMode.BALLOONS, Icons.Filled.ChatBubble, "Speech bubbles"),
+                                Triple(CaptionDisplayMode.FIXED_ZONES, Icons.Filled.ViewAgenda, "Fixed zones (no tails)"),
                                 Triple(CaptionDisplayMode.CLASSIC, Icons.Filled.Subtitles, "Subtitles"),
                                 Triple(CaptionDisplayMode.OFF, Icons.Filled.SubtitlesOff, "Dialogue off"),
                             ).forEach { (mode, icon, label) ->

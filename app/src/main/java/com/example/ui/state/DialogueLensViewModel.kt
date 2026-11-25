@@ -317,6 +317,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     private val sentinelCoordinator = SentinelWorkforceCoordinator()
     private val measuredBubbleSizes = mutableMapOf<String, Pair<Float, Float>>()
     private var lastPatrolSweepAtMs = 0L
+    private var changeoverPreListenJob: Job? = null
+    private var lastChangeoverPreListenSweepAtMs = 0L
+    private val settledAttributedEventIds = mutableSetOf<String>()
+    private var lastSceneSideResetKey: String = ""
 
     private fun nextSessionToken(): Long = activeSessionToken.incrementAndGet()
 
@@ -468,10 +472,18 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             projectStore.styleSettingsFlow.collect { style ->
                 _uiState.update { state ->
                     val updatedProject = state.project.copy(styleSettings = style)
+                    val (balloons, activeChapter) = computeContextAwareLayout(
+                        project = updatedProject,
+                        timeMs = state.currentTimeMs,
+                        styleSettings = style,
+                        liveFaces = currentLiveFaces,
+                        displayMode = state.displayMode,
+                    )
                     state.copy(
                         styleSettings = style,
                         project = updatedProject,
-                        placedBalloons = layoutEngine.computeLayout(updatedProject, state.currentTimeMs, style, currentLiveFaces),
+                        placedBalloons = balloons,
+                        activeChapter = activeChapter,
                     )
                 }
             }
@@ -482,7 +494,20 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             projectStore.displayModeFlow.collect { rawMode ->
                 val mode = rawMode.normalizedPrimaryMode()
                 if (mode != CaptionDisplayMode.OFF && !_uiState.value.showStartLauncher && !_uiState.value.hasPendingPlayIntro) {
-                    _uiState.update { it.copy(displayMode = mode) }
+                    _uiState.update { state ->
+                        val (balloons, activeChapter) = computeContextAwareLayout(
+                            project = state.project,
+                            timeMs = state.currentTimeMs,
+                            styleSettings = state.styleSettings,
+                            liveFaces = currentLiveFaces,
+                            displayMode = mode,
+                        )
+                        state.copy(
+                            displayMode = mode,
+                            placedBalloons = balloons,
+                            activeChapter = activeChapter,
+                        )
+                    }
                 }
             }
         }
@@ -496,10 +521,18 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         rememberedColors = remembered,
                     )
                     val updatedProj = state.project.copy(speakers = reconciledSpeakers)
+                    val (balloons, activeChapter) = computeContextAwareLayout(
+                        project = updatedProj,
+                        timeMs = state.currentTimeMs,
+                        styleSettings = state.styleSettings,
+                        liveFaces = currentLiveFaces,
+                        displayMode = state.displayMode,
+                    )
                     state.copy(
                         characterColorMemory = updatedMemory,
                         project = updatedProj,
-                        placedBalloons = layoutEngine.computeLayout(updatedProj, state.currentTimeMs, state.styleSettings, currentLiveFaces),
+                        placedBalloons = balloons,
+                        activeChapter = activeChapter,
                     )
                 }
             }
@@ -645,6 +678,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         }
         if (mode == QuotaSaverMode.ZERO_CLOUD) {
             youtubeTranscriptJob?.cancel()
+            changeoverPreListenJob?.cancel()
             aiTranslationJob?.cancel()
             speakerAnalysisJob?.cancel()
             castDiscoveryJob?.cancel()
@@ -866,11 +900,288 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         _uiState.update { it.copy(sentinelSnapshot = sentinelCoordinator.inspectorSnapshot()) }
     }
 
+    private fun maybeDispatchChangeoverPreListenScout(timeMs: Long) {
+        val now = System.currentTimeMillis()
+        if (now - lastChangeoverPreListenSweepAtMs < 3_000L) return
+        lastChangeoverPreListenSweepAtMs = now
+
+        val state = _uiState.value
+        if (state.showStartLauncher || state.isCinemaIntroActive) return
+        if (!state.dualInstanceEnabled) return
+        if (state.quotaSaverMode == QuotaSaverMode.ZERO_CLOUD || quotaCircuitBreakerTripped) return
+        val proj = state.project
+        val ytId = proj.videoSource.youtubeVideoId
+        if (proj.videoSource.kind != VideoSourceKind.YOUTUBE_COMPLIANT || ytId.isNullOrBlank()) return
+        if (LookaheadWindowPlanner.hasLoadedSubtitlesLocked(proj.subtitleSource, proj.dialogueEvents)) return
+        if (changeoverPreListenJob?.isActive == true) return
+
+        val leadMs = coverageLedger.continuousVerifiedLeadFrom(timeMs)
+        sentinelCoordinator.updateRuntimeConditions(
+            quotaMode = state.quotaSaverMode,
+            isPlaybackBuffering = state.readinessSnapshot.isBufferingHoldActive || state.isCinemaIntroActive,
+            contiguousPlayheadLeadMs = leadMs,
+        )
+        sentinelCoordinator.planUpcomingChangeoverPreListens(
+            project = proj,
+            playheadMs = timeMs,
+            nowEpochMs = now,
+        )
+        val claimed = sentinelCoordinator.claimChangeoverPreListenWork(
+            workerId = SentinelWorkforceCoordinator.WORKER_2_ID,
+            nowEpochMs = now,
+        )
+        if (claimed == null) {
+            _uiState.update { it.copy(sentinelSnapshot = sentinelCoordinator.inspectorSnapshot()) }
+            return
+        }
+
+        val (item, reservation) = claimed
+        val sessionToken = activeSessionToken.get()
+        val projectId = proj.id
+        _uiState.update { it.copy(sentinelSnapshot = sentinelCoordinator.inspectorSnapshot()) }
+
+        changeoverPreListenJob = viewModelScope.launch {
+            var didRepair = false
+            try {
+                val startSec = (item.startMs / 1000L).toInt().coerceAtLeast(0)
+                val endSec = ((item.endMs + 999L) / 1000L).toInt().coerceAtLeast(startSec + 6)
+                val initialTier = if (_uiState.value.quotaSaverMode == QuotaSaverMode.QUOTA_SAVER || downgradedToLiteForStream) {
+                    ScoutExecutionTier.LITE_AI
+                } else {
+                    ScoutExecutionTier.BEST_AI
+                }
+                val mergedGlossary = (_uiState.value.project.glossary + _uiState.value.glossaryEntries)
+                    .distinctBy { it.term.trim().lowercase() }
+
+                val segOutcome = segmentExecutor.executeSegmentDetailed(
+                    startSec = startSec,
+                    endSec = endSec,
+                    initialTier = initialTier,
+                    onStatusUpdate = {},
+                    onDowngradedToLite = { downgradedToLiteForStream = true },
+                ) { sliceStart, sliceEnd, preferLite, clarificationRetry ->
+                    val snapProj = _uiState.value.project
+                    translationAiService.transcribeYouTubeVideoWindow(
+                        videoId = ytId,
+                        windowStartSec = sliceStart,
+                        windowEndSec = sliceEnd,
+                        totalDurationSec = (snapProj.videoSource.durationMs / 1000L).toInt().coerceAtLeast(60),
+                        sourceLanguage = snapProj.sourceLanguage,
+                        targetLanguage = snapProj.targetLanguage,
+                        videoContext = buildVideoContextString(snapProj),
+                        knownSpeakers = snapProj.speakers,
+                        glossary = mergedGlossary,
+                        preferLiteModel = preferLite,
+                        timestampClarificationRetry = clarificationRetry,
+                    )
+                }
+
+                if (!isCurrentSession(sessionToken, projectId)) return@launch
+                when (segOutcome) {
+                    is SegmentExecutionOutcome.QuotaExhausted -> {
+                        sentinelCoordinator.markChangeoverPreListenFailed(item.id)
+                        sentinelCoordinator.recordQuotaError()
+                    }
+                    is SegmentExecutionOutcome.Completed -> {
+                        lookaheadMutex.withLock {
+                            if (!isCurrentSession(sessionToken, projectId)) return@withLock
+                            val liveProj = _uiState.value.project
+                            if (liveProj.id != projectId ||
+                                LookaheadWindowPlanner.hasLoadedSubtitlesLocked(liveProj.subtitleSource, liveProj.dialogueEvents)
+                            ) {
+                                return@withLock
+                            }
+
+                            var workingProj = liveProj
+                            val (reconciledCues, reconciledUpdates, _) = reconcileWindowOutcomeSpeakersAndCues(
+                                existingSpeakers = workingProj.speakers,
+                                cues = segOutcome.cues,
+                                speakerUpdates = segOutcome.speakerUpdates,
+                            )
+                            if (reconciledUpdates.isNotEmpty() || segOutcome.summary.isNotBlank()) {
+                                val (castMerged, updatedMem) = mergeCastSlotAssignments(
+                                    project = workingProj,
+                                    assignments = reconciledUpdates,
+                                    rememberedColors = _uiState.value.characterColorMemory,
+                                    reconcileColors = attributionEngine::reconcileCharacterColors,
+                                    summary = segOutcome.summary,
+                                    discoveryTimestampMs = item.startMs,
+                                )
+                                if (updatedMem != _uiState.value.characterColorMemory) {
+                                    persistCharacterColorMemory(updatedMem)
+                                }
+                                workingProj = castMerged
+                            }
+
+                            val seamStartMs = startSec * 1000L
+                            val seamEndMs = (endSec * 1000L).coerceAtLeast(seamStartMs + 1_000L)
+                            if (reconciledCues.isNotEmpty()) {
+                                val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
+                                val hintMap = mutableMapOf<String, AiTranslatedLine>()
+                                val incomingEvents = reconciledCues.map { cue ->
+                                    val eventId = SubtitleParser.newEventId()
+                                    val isOffOrNonSpoken = cue.dialogueType != DialogueType.SPOKEN
+                                    val spatialAnchor = if (!isOffOrNonSpoken && cue.anchorX != null && cue.anchorY != null) {
+                                        NormalizedPoint(cue.anchorX, cue.anchorY)
+                                    } else {
+                                        null
+                                    }
+                                    val slotUpper = cue.suggestedSpeakerSlot.trim().uppercase()
+                                    hintMap[eventId] = AiTranslatedLine(
+                                        id = eventId,
+                                        naturalTranslation = cue.naturalTranslation,
+                                        literalTranslation = cue.literalTranslation,
+                                        romanization = cue.romanization,
+                                        dialogueTypeHint = cue.dialogueType,
+                                        speakerTurnHint = "UNCERTAIN",
+                                        suggestedSpeakerSlot = slotUpper.ifBlank { "UNCERTAIN" },
+                                        contextReason = cue.contextReason,
+                                        culturalNote = cue.culturalNote,
+                                    )
+                                    DialogueEvent(
+                                        id = eventId,
+                                        startTimeMs = cue.startMs,
+                                        endTimeMs = cue.endMs,
+                                        sourceText = cue.sourceText,
+                                        translatedText = cue.naturalTranslation,
+                                        literalText = cue.literalTranslation,
+                                        romanization = cue.romanization,
+                                        speakerId = null,
+                                        speakerConfidence = if (slotUpper in validSlots) 0.86f else 0.44f,
+                                        faceTrackId = null,
+                                        faceConfidence = if (spatialAnchor != null) 0.78f else 0f,
+                                        shotId = workingProj.shots.firstOrNull { cue.startMs in it.startMs..it.endMs }?.id ?: "shot_1",
+                                        dialogueType = cue.dialogueType,
+                                        anchorPosition = spatialAnchor,
+                                        placementMode = when {
+                                            isOffOrNonSpoken -> PlacementMode.EDGE_DOCKED
+                                            spatialAnchor != null -> PlacementMode.AUTO
+                                            else -> PlacementMode.NEUTRAL_FALLBACK
+                                        },
+                                        contextCueReason = cue.contextReason,
+                                        culturalNote = cue.culturalNote,
+                                        preferredDeadSpaceZone = cue.deadSpaceZone,
+                                        avoidBoxes = cue.avoidBoxes,
+                                    )
+                                }
+
+                                val pacedSeam = SubtitleParser.applyReadingPacingGuardrails(incomingEvents)
+                                    .filter { it.startTimeMs in seamStartMs until seamEndMs }
+                                    .map { evt ->
+                                        evt.copy(endTimeMs = evt.endTimeMs.coerceIn(evt.startTimeMs + 350L, seamEndMs))
+                                    }
+                                val priorExisting = workingProj.dialogueEvents.filter { it.startTimeMs < seamStartMs }
+                                val antiEchoedSeam = LookaheadWindowPlanner.filterEchoedOpeningCues(
+                                    existing = priorExisting,
+                                    incoming = pacedSeam,
+                                    windowStartMs = seamStartMs,
+                                )
+                                if (antiEchoedSeam.isNotEmpty()) {
+                                    // Unfreeze ONLY cues strictly inside this changeover seam slice; keep all other cues frozen
+                                    val replacedIds = workingProj.dialogueEvents
+                                        .filter { it.startTimeMs in seamStartMs until seamEndMs }
+                                        .map { it.id }
+                                        .toSet()
+                                    settledAttributedEventIds.removeAll(replacedIds)
+
+                                    val mergeReport = LookaheadWindowPlanner.mergeWindowDialogueEventsWithReport(
+                                        existing = workingProj.dialogueEvents,
+                                        incoming = antiEchoedSeam,
+                                        windowStartMs = seamStartMs,
+                                        windowEndMs = seamEndMs,
+                                    )
+                                    cachedAiTurnHints.putAll(hintMap)
+                                    antiEchoedSeam.forEach { autoAnalyzedEventIds.add(it.id) }
+
+                                    val sceneBoundaries = workingProj.chapters
+                                        .map { it.startMs }
+                                        .filter { it > 0L }
+                                        .sorted()
+                                    val (attributedSpeakers, attributedEvents) = attributionEngine.assignSpeakers(
+                                        events = mergeReport.events,
+                                        shots = workingProj.shots,
+                                        faceTracks = emptyList(),
+                                        existingSpeakers = workingProj.speakers,
+                                        turnHints = cachedAiTurnHints,
+                                        rememberedCharacterColors = _uiState.value.characterColorMemory,
+                                        settledEventIds = settledAttributedEventIds,
+                                        sceneBoundaryMs = sceneBoundaries,
+                                    )
+                                    val finalEvents = applyCutawayOffScreenSideMemory(
+                                        events = attributedEvents,
+                                        speakers = attributedSpeakers,
+                                        sceneBoundaryMs = sceneBoundaries,
+                                    )
+                                    finalEvents.forEach { evt ->
+                                        if (evt.speakerId != null || evt.attributionSummary == "Unidentified speaker") {
+                                            settledAttributedEventIds.add(evt.id)
+                                        }
+                                    }
+                                    val changedIds = replacedIds + antiEchoedSeam.map { it.id }
+                                    layoutEngine.invalidateEventsOnly(changedIds)
+
+                                    val updatedProj = workingProj.copy(
+                                        subtitleSource = SubtitleSourceKind.AI_DRAFT,
+                                        speakers = attributedSpeakers,
+                                        dialogueEvents = finalEvents,
+                                    )
+                                    coverageLedger.recordOutcome(
+                                        startMs = seamStartMs,
+                                        endMs = minOf(updatedProj.videoSource.durationMs.coerceAtLeast(seamEndMs), seamEndMs),
+                                        status = CoverageStatus.VERIFIED_DIALOGUE,
+                                        source = SubtitleSourceKind.AI_DRAFT,
+                                        dialogueCount = antiEchoedSeam.size,
+                                    )
+                                    updateProject(updatedProj)
+                                    persistYouTubeVideoCache(
+                                        updatedProj,
+                                        coverageLedger.continuousVerifiedUpToMs(),
+                                        sessionToken,
+                                    )
+                                    didRepair = true
+                                }
+                            } else if (segOutcome.verifiedSilentRanges.isNotEmpty() && segOutcome.failedRanges.isEmpty()) {
+                                coverageLedger.recordOutcome(
+                                    startMs = seamStartMs,
+                                    endMs = minOf(workingProj.videoSource.durationMs.coerceAtLeast(seamEndMs), seamEndMs),
+                                    status = CoverageStatus.VERIFIED_SILENCE,
+                                    source = SubtitleSourceKind.AI_DRAFT,
+                                    dialogueCount = 0,
+                                )
+                            }
+
+                            sentinelCoordinator.markChangeoverPreListenCompleted(item.id)
+                            item.chapterId?.let { chId ->
+                                sentinelCoordinator.markChapterRepairVerified(
+                                    chId,
+                                    if (didRepair) "Pre-listened & stabilized changeover ahead of playback" else "Pre-listened clean",
+                                )
+                            }
+                        }
+                    }
+                }
+            } catch (ce: CancellationException) {
+                sentinelCoordinator.markChangeoverPreListenFailed(item.id)
+                throw ce
+            } catch (_: Throwable) {
+                sentinelCoordinator.markChangeoverPreListenFailed(item.id)
+            } finally {
+                sentinelCoordinator.markWorkerIdle(
+                    workerId = SentinelWorkforceCoordinator.WORKER_2_ID,
+                    reservationId = reservation.reservationId,
+                    repairCompleted = didRepair,
+                )
+                _uiState.update { it.copy(sentinelSnapshot = sentinelCoordinator.inspectorSnapshot()) }
+            }
+        }
+    }
+
     private fun computeContextAwareLayout(
         project: DialogueLensProject,
         timeMs: Long,
         styleSettings: BalloonStyleSettings,
         liveFaces: List<LiveFaceObservation> = currentLiveFaces,
+        displayMode: CaptionDisplayMode = _uiState.value.displayMode,
     ): Pair<List<PlacedBalloon>, VideoChapter?> {
         val ctx = contextEngine.onPlaybackPosition(project, timeMs)
         val balloons = layoutEngine.computeLayout(
@@ -883,6 +1194,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             liveFrameObservedEmpty = ctx.sceneMemory.liveFrameObservedEmpty,
             activeChapterId = ctx.chapterMemory.activeChapter?.id,
             measuredNormalizedSizes = measuredBubbleSizes,
+            fixedZoneTaillessMode = displayMode == CaptionDisplayMode.FIXED_ZONES,
         )
         return balloons to ctx.chapterMemory.activeChapter
     }
@@ -902,6 +1214,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 timeMs = timeMs,
                 styleSettings = state.styleSettings,
                 liveFaces = currentLiveFaces,
+                displayMode = state.displayMode,
             )
             latestBalloons = balloons
             val readiness = HumanReadableStatus.resolve(
@@ -923,6 +1236,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         maybePersistPlaybackProgress(timeMs)
         maybeRunAutomaticSelfHealCheck(timeMs, latestBalloons)
         maybeRunProactiveChapterPatrol(timeMs)
+        maybeDispatchChangeoverPreListenScout(timeMs)
     }
 
     private fun recomputeBalloons() {
@@ -932,6 +1246,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 timeMs = state.currentTimeMs,
                 styleSettings = state.styleSettings,
                 liveFaces = currentLiveFaces,
+                displayMode = state.displayMode,
             )
             state.copy(
                 placedBalloons = balloons,
@@ -951,9 +1266,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         val state = _uiState.value
         if (state.showStartLauncher || state.isCinemaIntroActive || state.isEditMode) return
         val ctx = contextEngine.onLiveFrameSnapshot(snapshot, timeMs)
+        val sceneResetKey = "${ctx.chapterMemory.activeChapter?.id ?: "ch0"}:${ctx.sceneMemory.sceneEpoch}"
+        val didCrossSceneBoundary = snapshot.visualCutDetected ||
+            (lastSceneSideResetKey.isNotEmpty() && lastSceneSideResetKey != sceneResetKey)
         if (snapshot.visualCutDetected) {
-            layoutEngine.clearSmoothing()
+            layoutEngine.onVisualCutBoundary()
         }
+        lastSceneSideResetKey = sceneResetKey
         val faces = snapshot.faces
         currentLiveFaces = faces
         val lipSafe = state.styleSettings.lipReadingSafeZone
@@ -970,10 +1289,19 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             if (cur.showStartLauncher || cur.isCinemaIntroActive || cur.isEditMode) {
                 cur
             } else {
+                // Reset spatial side memory per scene so seating in Scene 1 never pulls Scene 2 cues
+                val sceneProject = if (didCrossSceneBoundary && cur.project.speakers.any { it.preferredScreenSideX != null }) {
+                    cur.project.copy(
+                        speakers = cur.project.speakers.map { it.copy(preferredScreenSideX = null) }
+                    )
+                } else {
+                    cur.project
+                }
                 cur.copy(
+                    project = sceneProject,
                     liveFaceExclusionRects = liveExclusions,
                     placedBalloons = layoutEngine.computeLayout(
-                        project = cur.project,
+                        project = sceneProject,
                         currentMs = cur.currentTimeMs,
                         styleSettings = cur.styleSettings,
                         liveFaces = faces,
@@ -982,6 +1310,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         liveFrameObservedEmpty = ctx.sceneMemory.liveFrameObservedEmpty,
                         activeChapterId = ctx.chapterMemory.activeChapter?.id,
                         measuredNormalizedSizes = measuredBubbleSizes,
+                        fixedZoneTaillessMode = cur.displayMode == CaptionDisplayMode.FIXED_ZONES,
                     ),
                     visualStabilitySnapshot = layoutEngine.stabilityDiagnostics.snapshot(),
                 )
@@ -1270,6 +1599,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 shouldTriggerCatchUpPause = true
                 playbackClockAnchor.reset(safePos, state.playbackSpeed, playing = false)
                 val pauseSeq = ++nextStreamCommandSeq
+                val (balloons, activeChapter) = computeContextAwareLayout(
+                    project = updatedProj,
+                    timeMs = safePos,
+                    styleSettings = state.styleSettings,
+                    liveFaces = currentLiveFaces,
+                    displayMode = state.displayMode,
+                )
                 state.copy(
                     project = updatedProj,
                     isPlaying = false,
@@ -1277,7 +1613,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     hasPendingPlayIntro = false,
                     currentTimeMs = safePos,
                     streamPlayRequest = pauseSeq to false,
-                    placedBalloons = layoutEngine.computeLayout(updatedProj, safePos, state.styleSettings, currentLiveFaces),
+                    placedBalloons = balloons,
+                    activeChapter = activeChapter,
                 )
             } else {
                 val clearedBuffering = if (state.isScoutCatchUpBuffering && !isScoutActivelyBuffering) {
@@ -1294,13 +1631,21 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 val presentationMs = playbackClockAnchor.sampleInterpolatedMs(
                     maxDurationMs = updatedProj.videoSource.durationMs.takeIf { it > 0L } ?: Long.MAX_VALUE,
                 )
+                val (balloons, activeChapter) = computeContextAwareLayout(
+                    project = updatedProj,
+                    timeMs = presentationMs,
+                    styleSettings = state.styleSettings,
+                    liveFaces = currentLiveFaces,
+                    displayMode = state.displayMode,
+                )
                 state.copy(
                     project = updatedProj,
                     isPlaying = resolvedPlaying,
                     isScoutCatchUpBuffering = clearedBuffering,
                     hasPendingPlayIntro = if (isPlaying) false else state.hasPendingPlayIntro,
                     currentTimeMs = presentationMs,
-                    placedBalloons = layoutEngine.computeLayout(updatedProj, presentationMs, state.styleSettings, currentLiveFaces),
+                    placedBalloons = balloons,
+                    activeChapter = activeChapter,
                 )
             }
         }
@@ -1315,6 +1660,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             )
             _uiState.update { cur -> cur.copy(readinessSnapshot = readinessSnap) }
             maybeTriggerRollingWindowEnhancement(latestState.currentTimeMs)
+            maybeRunProactiveChapterPatrol(latestState.currentTimeMs)
+            maybeDispatchChangeoverPreListenScout(latestState.currentTimeMs)
         }
     }
 
@@ -1435,15 +1782,24 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             val presentationMs = playbackClockAnchor.sampleInterpolatedMs(
                 maxDurationMs = updatedProj.videoSource.durationMs.takeIf { it > 0L } ?: Long.MAX_VALUE,
             )
+            val (balloons, activeChapter) = computeContextAwareLayout(
+                project = updatedProj,
+                timeMs = presentationMs,
+                styleSettings = state.styleSettings,
+                liveFaces = currentLiveFaces,
+                displayMode = state.displayMode,
+            )
             state.copy(
                 project = updatedProj,
                 isPlaying = isPlaying,
                 currentTimeMs = presentationMs,
-                placedBalloons = layoutEngine.computeLayout(updatedProj, presentationMs, state.styleSettings, currentLiveFaces),
+                placedBalloons = balloons,
+                activeChapter = activeChapter,
             )
         }
         maybeTriggerRollingWindowEnhancement(_uiState.value.currentTimeMs)
         maybeAutoSyncScoutFromViewer()
+        maybeRunProactiveChapterPatrol(_uiState.value.currentTimeMs)
     }
 
     fun onWebStreamCapturedCaptions(rawJson: String) {
@@ -2348,7 +2704,24 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
     fun setDisplayMode(mode: CaptionDisplayMode) {
         val normalized = mode.normalizedPrimaryMode()
-        _uiState.update { it.copy(displayMode = normalized) }
+        val previous = _uiState.value.displayMode
+        if ((previous == CaptionDisplayMode.FIXED_ZONES) != (normalized == CaptionDisplayMode.FIXED_ZONES)) {
+            layoutEngine.clearSmoothing()
+        }
+        _uiState.update { state ->
+            val (balloons, activeChapter) = computeContextAwareLayout(
+                project = state.project,
+                timeMs = state.currentTimeMs,
+                styleSettings = state.styleSettings,
+                liveFaces = currentLiveFaces,
+                displayMode = normalized,
+            )
+            state.copy(
+                displayMode = normalized,
+                placedBalloons = balloons,
+                activeChapter = activeChapter,
+            )
+        }
         viewModelScope.launch { projectStore.saveDisplayMode(normalized) }
     }
 
@@ -2359,10 +2732,18 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     fun updateStyleSettings(settings: BalloonStyleSettings) {
         _uiState.update { state ->
             val proj = state.project.copy(styleSettings = settings)
+            val (balloons, activeChapter) = computeContextAwareLayout(
+                project = proj,
+                timeMs = state.currentTimeMs,
+                styleSettings = settings,
+                liveFaces = currentLiveFaces,
+                displayMode = state.displayMode,
+            )
             state.copy(
                 styleSettings = settings,
                 project = proj,
-                placedBalloons = layoutEngine.computeLayout(proj, state.currentTimeMs, settings, currentLiveFaces),
+                placedBalloons = balloons,
+                activeChapter = activeChapter,
             )
         }
         viewModelScope.launch { projectStore.saveStyleSettings(settings) }
@@ -2427,10 +2808,18 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         val previous = if (undoStack.isNotEmpty()) undoStack.removeLast() else return
         layoutEngine.clearSmoothing()
         _uiState.update { state ->
+            val (balloons, activeChapter) = computeContextAwareLayout(
+                project = previous,
+                timeMs = state.currentTimeMs,
+                styleSettings = state.styleSettings,
+                liveFaces = currentLiveFaces,
+                displayMode = state.displayMode,
+            )
             state.copy(
                 project = previous,
                 canUndo = undoStack.isNotEmpty(),
-                placedBalloons = layoutEngine.computeLayout(previous, state.currentTimeMs, state.styleSettings, currentLiveFaces),
+                placedBalloons = balloons,
+                activeChapter = activeChapter,
                 statusBanner = "Undid last timeline edit",
             )
         }
@@ -2898,11 +3287,14 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         speakerAnalysisJob?.cancel()
         castDiscoveryJob?.cancel()
         youtubeTranscriptJob?.cancel()
+        changeoverPreListenJob?.cancel()
         introJob?.cancel()
         lookaheadJob?.cancel()
         scoutCompletedWindows.clear()
         scoutAudioSliceTimestamps.clear()
         autoAnalyzedEventIds.clear()
+        settledAttributedEventIds.clear()
+        lastSceneSideResetKey = ""
         cachedAiTurnHints.clear()
         lastAutoAiTriggerElapsedMs = 0L
         discoveredWebMediaUrl = null
@@ -2982,6 +3374,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         speakerAnalysisJob?.cancel()
         castDiscoveryJob?.cancel()
         youtubeTranscriptJob?.cancel()
+        changeoverPreListenJob?.cancel()
         introJob?.cancel()
         lookaheadJob?.cancel()
         downgradedToLiteForStream = false
@@ -2993,6 +3386,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         scoutCompletedWindows.clear()
         scoutAudioSliceTimestamps.clear()
         autoAnalyzedEventIds.clear()
+        settledAttributedEventIds.clear()
+        lastSceneSideResetKey = ""
         cachedAiTurnHints.clear()
         lastAutoAiTriggerElapsedMs = 0L
         discoveredWebMediaUrl = null
@@ -3117,6 +3512,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 contextEngine.resetForProject(newProject)
                 autoSelfHealDetector.resetForProject(newProject.id)
                 _uiState.update {
+                    val (balloons, activeChapter) = computeContextAwareLayout(
+                        project = newProject,
+                        timeMs = 0L,
+                        styleSettings = it.styleSettings,
+                        liveFaces = currentLiveFaces,
+                        displayMode = CaptionDisplayMode.BALLOONS,
+                    )
                     it.copy(
                         project = newProject,
                         activeDestination = AppDestination.WATCH,
@@ -3131,7 +3533,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         scoutTimeMs = 0L,
                         scoutedUpToMs = 0L,
                         scoutStatusText = "Scout buffering opening 7s context in background...",
-                        placedBalloons = layoutEngine.computeLayout(newProject, 0L, it.styleSettings, currentLiveFaces),
+                        placedBalloons = balloons,
+                        activeChapter = activeChapter,
                         statusBanner = "Video loaded · Scout pre-buffering transcript & faces. Press Play for Smart Pre-Roll.",
                     )
                 }
@@ -4799,12 +5202,15 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         speakerAnalysisJob?.cancel()
         castDiscoveryJob?.cancel()
         youtubeTranscriptJob?.cancel()
+        changeoverPreListenJob?.cancel()
         lastScoutSeekSentAtMs = 0L
         lastScoutSeekTargetMs = -1L
         scoutCompletedWindows.clear()
         scoutAudioSliceTimestamps.clear()
         capturedYouTubeTimedTextKeys.clear()
         autoAnalyzedEventIds.clear()
+        settledAttributedEventIds.clear()
+        lastSceneSideResetKey = ""
         cachedAiTurnHints.clear()
         lastAutoAiTriggerElapsedMs = 0L
         discoveredWebMediaUrl = null
@@ -4827,6 +5233,11 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             )
         } else {
             project
+        }
+        baseCleanedProject.dialogueEvents.forEach { evt ->
+            if (evt.speakerId != null || evt.attributionSummary == "Unidentified speaker") {
+                settledAttributedEventIds.add(evt.id)
+            }
         }
         val restoredBeaconsProject = HealBeaconEngine.restoreInterruptedBeacons(baseCleanedProject)
         val inferredChapters = if (restoredBeaconsProject.chapters.isEmpty()) {
@@ -5439,6 +5850,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         speakerAnalysisJob?.cancel()
         castDiscoveryJob?.cancel()
         youtubeTranscriptJob?.cancel()
+        changeoverPreListenJob?.cancel()
         introJob?.cancel()
         lookaheadJob?.cancel()
         downgradedToLiteForStream = false
@@ -5453,6 +5865,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         scoutAudioSliceTimestamps.clear()
         capturedYouTubeTimedTextKeys.clear()
         autoAnalyzedEventIds.clear()
+        settledAttributedEventIds.clear()
+        lastSceneSideResetKey = ""
         cachedAiTurnHints.clear()
         lastAutoAiTriggerElapsedMs = 0L
         discoveredWebMediaUrl = null
@@ -5640,6 +6054,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             undoStack.clear()
             catchUpBufferDismissedUntilMs = 0L
             val verifiedPct = (initialSummary.verifiedFraction * 100).toInt()
+            if (restoredFromCache || cues.isNotEmpty()) {
+                ytProject.dialogueEvents.forEach { evt ->
+                    if (evt.speakerId != null || evt.attributionSummary == "Unidentified speaker") {
+                        settledAttributedEventIds.add(evt.id)
+                    }
+                }
+            }
             _uiState.update {
                 val initialTier = LookaheadWindowPlanner.initialExecutionTier(
                     quotaSaverMode = it.quotaSaverMode,
@@ -5655,6 +6076,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 }
                 contextEngine.resetForProject(ytProject)
                 autoSelfHealDetector.resetForProject(ytProject.id)
+                val (balloons, activeChapter) = computeContextAwareLayout(
+                    project = ytProject,
+                    timeMs = 0L,
+                    styleSettings = it.styleSettings,
+                    liveFaces = currentLiveFaces,
+                    displayMode = CaptionDisplayMode.BALLOONS,
+                )
                 it.copy(
                     project = ytProject,
                     activeDestination = AppDestination.WATCH,
@@ -5700,7 +6128,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     scoutFailedSliceCount = initialSummary.failedIntervalCount,
                     coverageSummary = initialSummary,
                     transcriptDiagnostics = initialDiag,
-                    placedBalloons = layoutEngine.computeLayout(ytProject, 0L, it.styleSettings, currentLiveFaces),
+                    placedBalloons = balloons,
+                    activeChapter = activeChapter,
                     statusBanner = when {
                         cues.isNotEmpty() -> "Attached ${events.size} subtitles — DialogueLens balloons active"
                         restoredFromCache && fullyCached -> "Restored ${events.size} verified cached bubbles ($0 credits)"
@@ -6031,6 +6460,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         // Decouple dialogue acquisition from attribution/placement: even if attribution throws,
                         // preserve every merged spoken dialogue event with safe neutral fallback placement.
                         val (enrichedSpeakers, finalEvents) = runCatching {
+                            val sceneBoundaries = workingProj.chapters
+                                .map { it.startMs }
+                                .filter { it > 0L }
+                                .sorted()
                             val (attributedSpeakers, attributedEvents) = attributionEngine.assignSpeakers(
                                 events = mergeReport.events,
                                 shots = workingProj.shots,
@@ -6038,25 +6471,35 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                 existingSpeakers = workingProj.speakers,
                                 turnHints = cachedAiTurnHints,
                                 rememberedCharacterColors = _uiState.value.characterColorMemory,
+                                settledEventIds = settledAttributedEventIds,
+                                sceneBoundaryMs = sceneBoundaries,
                             )
+                            val latestSceneStartMs = sceneBoundaries.lastOrNull { it <= wStartMs } ?: 0L
                             val updatedSpk = attributedSpeakers.map { spk ->
                                 val spkEvents = attributedEvents.filter { it.speakerId == spk.id }
                                 val earliest = spkEvents.minOfOrNull { it.startTimeMs }
-                                val avgX = spkEvents
-                                    .filter { it.dialogueType == DialogueType.SPOKEN }
+                                val currentSceneAvgX = spkEvents
+                                    .filter { it.dialogueType == DialogueType.SPOKEN && it.startTimeMs >= latestSceneStartMs }
                                     .mapNotNull { it.anchorPosition?.x }
                                     .takeIf { it.isNotEmpty() }
                                     ?.average()
                                     ?.toFloat()
                                 spk.copy(
                                     firstAppearedMs = spk.firstAppearedMs ?: earliest,
-                                    preferredScreenSideX = avgX ?: spk.preferredScreenSideX,
+                                    preferredScreenSideX = currentSceneAvgX,
                                 )
                             }
-                            updatedSpk to applyCutawayOffScreenSideMemory(
+                            val offScreenResolved = applyCutawayOffScreenSideMemory(
                                 events = attributedEvents,
                                 speakers = updatedSpk,
+                                sceneBoundaryMs = sceneBoundaries,
                             )
+                            offScreenResolved.forEach { evt ->
+                                if (evt.speakerId != null || evt.attributionSummary == "Unidentified speaker") {
+                                    settledAttributedEventIds.add(evt.id)
+                                }
+                            }
+                            updatedSpk to offScreenResolved
                         }.getOrElse { err ->
                             Log.w(TAG, "Attribution fallback preserved ${mergeReport.events.size} cues", err)
                             workingProj.speakers to mergeReport.events
@@ -6863,6 +7306,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         youtubeTranscriptJob?.cancel()
         introJob?.cancel()
         lookaheadJob?.cancel()
+        changeoverPreListenJob?.cancel()
         downgradedToLiteForStream = false
         pendingWebTimedTextFallback = null
         scoutHeartbeatService.resetForNewStream(
@@ -6875,6 +7319,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         scoutCompletedWindows.clear()
         scoutAudioSliceTimestamps.clear()
         autoAnalyzedEventIds.clear()
+        settledAttributedEventIds.clear()
+        lastSceneSideResetKey = ""
         cachedAiTurnHints.clear()
         lastAutoAiTriggerElapsedMs = 0L
         discoveredWebMediaUrl = null
@@ -6984,6 +7430,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             contextEngine.resetForProject(webProject)
             autoSelfHealDetector.resetForProject(webProject.id)
             _uiState.update {
+                val (balloons, activeChapter) = computeContextAwareLayout(
+                    project = webProject,
+                    timeMs = 0L,
+                    styleSettings = it.styleSettings,
+                    liveFaces = currentLiveFaces,
+                    displayMode = CaptionDisplayMode.BALLOONS,
+                )
                 it.copy(
                     project = webProject,
                     activeDestination = AppDestination.WATCH,
@@ -7021,7 +7474,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     viewerWebNavCommand = null,
                     scoutWebNavCommand = null,
                     showScoutBrowserModal = false,
-                    placedBalloons = layoutEngine.computeLayout(webProject, 0L, it.styleSettings, currentLiveFaces),
+                    placedBalloons = balloons,
+                    activeChapter = activeChapter,
                     statusBanner = "Opened in Web Cinema ($hostLabel) · Scout gathering in background",
                 )
             }
@@ -7598,6 +8052,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                             silenceExplicitlyConfirmed = silenceConfirmed,
                             expectedRepairRevision = beacon.repairRevision,
                         )
+                        settledAttributedEventIds.removeAll(repairOutcome.modifiedEventIds)
+                        repairOutcome.updatedProject.dialogueEvents
+                            .filter { it.id in repairOutcome.modifiedEventIds && (it.speakerId != null || it.attributionSummary == "Unidentified speaker") }
+                            .forEach { settledAttributedEventIds.add(it.id) }
                         layoutEngine.invalidateEventsOnly(repairOutcome.modifiedEventIds)
                         beacon.patrolChapterId?.let { chId ->
                             sentinelCoordinator.markChapterRepairVerified(chId, repairOutcome.reason)
@@ -8203,13 +8661,21 @@ internal fun mergeCastSlotAssignments(
 internal fun applyCutawayOffScreenSideMemory(
     events: List<DialogueEvent>,
     speakers: List<Speaker>,
+    sceneBoundaryMs: List<Long> = emptyList(),
 ): List<DialogueEvent> {
     if (events.isEmpty()) return events
+    val sortedBoundaries = sceneBoundaryMs.filter { it > 0L }.sorted()
+    fun sceneKeyFor(event: DialogueEvent): String {
+        val chapterBucket = sortedBoundaries.count { event.startTimeMs >= it }
+        return "${event.shotId}:$chapterBucket"
+    }
+
     val speakerById = speakers.associateBy { it.id }
-    val spokenAvgSideBySpeakerId = events
+    val spokenAvgSideBySceneAndSpeaker = events
         .filter { it.dialogueType == DialogueType.SPOKEN && it.speakerId != null && it.anchorPosition != null }
-        .groupBy { it.speakerId!! }
+        .groupBy { sceneKeyFor(it) to it.speakerId!! }
         .mapValues { (_, list) -> list.mapNotNull { it.anchorPosition?.x }.average().toFloat() }
+    val allowGlobalFallback = sortedBoundaries.isEmpty()
 
     return events.map { evt ->
         val isOffScreen = evt.dialogueType == DialogueType.OFF_SCREEN_LEFT ||
@@ -8218,7 +8684,8 @@ internal fun applyCutawayOffScreenSideMemory(
         if (!isOffScreen) return@map evt
 
         val resolvedType = if (evt.dialogueType == DialogueType.OFF_SCREEN_BEHIND && evt.speakerId != null) {
-            val sideX = speakerById[evt.speakerId]?.preferredScreenSideX ?: spokenAvgSideBySpeakerId[evt.speakerId]
+            val sceneSideX = spokenAvgSideBySceneAndSpeaker[sceneKeyFor(evt) to evt.speakerId]
+            val sideX = sceneSideX ?: if (allowGlobalFallback) speakerById[evt.speakerId]?.preferredScreenSideX else null
             when {
                 sideX != null && sideX < 0.45f -> DialogueType.OFF_SCREEN_LEFT
                 sideX != null && sideX > 0.55f -> DialogueType.OFF_SCREEN_RIGHT

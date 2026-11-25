@@ -136,6 +136,7 @@ fun SpeechBalloonView(
     onMeasuredNormalizedSize: (Float, Float) -> Unit = { _, _ -> },
     onClick: () -> Unit,
     onDragCommit: (NormalizedPoint) -> Unit,
+    forceTaillessFixedZone: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val event = placed.event
@@ -217,8 +218,9 @@ fun SpeechBalloonView(
     val baseTopPx = (desiredCenterY - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
 
     // DialogueLens 2.0 Single-Authority Positioning: trust BalloonLayoutEngine's committed rect;
-    // only run emergency pixel escape if an actual severe face or sibling overlap occurs.
+    // only run emergency pixel escape if an actual severe face or sibling overlap occurs (and skip in Fixed Zones mode).
     val (bubbleLeftPx, bubbleTopPx) = if (
+        !forceTaillessFixedZone &&
         measuredSize != IntSize.Zero &&
         (faceExclusionRects.isNotEmpty() || occupiedBubbleRects.isNotEmpty()) &&
         event.placementMode != PlacementMode.MANUAL_OVERRIDE
@@ -243,10 +245,41 @@ fun SpeechBalloonView(
         baseLeftPx to baseTopPx
     }
 
-    val actualCenterX = bubbleLeftPx + actualW * 0.5f
-    val actualCenterY = bubbleTopPx + actualH * 0.5f
+    // Smooth critically-damped body motion: snaps cleanly on first measured frame, then glides
+    // with zero overshoot or tweaking on subsequent gentle-drift updates.
+    var hasInitializedBodyOffset by remember(event.id) { mutableStateOf(false) }
+    val isDraggingNow = dragOffsetXPx != 0f || dragOffsetYPx != 0f
+    val targetBodyOffset = Offset(bubbleLeftPx, bubbleTopPx)
+    val animatedBodyOffset by animateOffsetAsState(
+        targetValue = targetBodyOffset,
+        animationSpec = if (
+            measuredSize == IntSize.Zero ||
+            !hasInitializedBodyOffset ||
+            style.reducedMotion ||
+            isDraggingNow
+        ) {
+            snap()
+        } else {
+            spring(
+                dampingRatio = Spring.DampingRatioNoBouncy,
+                stiffness = if (forceTaillessFixedZone) Spring.StiffnessVeryLow else Spring.StiffnessLow,
+            )
+        },
+        label = "balloon_body_gentle_drift",
+    )
+    LaunchedEffect(event.id, measuredSize != IntSize.Zero) {
+        if (measuredSize != IntSize.Zero) {
+            hasInitializedBodyOffset = true
+        }
+    }
 
-    LaunchedEffect(event.id, measuredSize, bubbleLeftPx, bubbleTopPx, containerWidthPx, containerHeightPx) {
+    val renderedLeftPx = animatedBodyOffset.x
+    val renderedTopPx = animatedBodyOffset.y
+    val actualCenterX = renderedLeftPx + actualW * 0.5f
+    val actualCenterY = renderedTopPx + actualH * 0.5f
+
+    // Report pixel bounds for sibling avoidance without re-triggering normalized size feedback
+    LaunchedEffect(event.id, measuredSize, bubbleLeftPx, bubbleTopPx) {
         if (measuredSize != IntSize.Zero) {
             onPixelBoundsResolved(
                 Rect(
@@ -256,16 +289,22 @@ fun SpeechBalloonView(
                     bottom = bubbleTopPx + actualH,
                 )
             )
-            if (containerWidthPx > 0f && containerHeightPx > 0f) {
-                onMeasuredNormalizedSize(
-                    (actualW / containerWidthPx).coerceIn(0.06f, 0.88f),
-                    (actualH / containerHeightPx).coerceIn(0.04f, 0.48f),
-                )
-            }
         }
     }
 
-    val showPointerTail = style.showTail &&
+    // Report normalized dimensions ONLY when actual measured pixel size or container size changes
+    // (breaks the position <-> resize oscillation feedback loop).
+    LaunchedEffect(event.id, measuredSize, containerWidthPx, containerHeightPx) {
+        if (measuredSize != IntSize.Zero && containerWidthPx > 0f && containerHeightPx > 0f) {
+            onMeasuredNormalizedSize(
+                (actualW / containerWidthPx).coerceIn(0.06f, 0.88f),
+                (actualH / containerHeightPx).coerceIn(0.04f, 0.48f),
+            )
+        }
+    }
+
+    val showPointerTail = !forceTaillessFixedZone &&
+        style.showTail &&
         !isReadingComfort &&
         !isSpecialNonSpoken &&
         !placed.isOffScreenEdge &&
@@ -283,7 +322,7 @@ fun SpeechBalloonView(
             snap()
         } else {
             spring(
-                dampingRatio = 0.74f,
+                dampingRatio = 0.78f,
                 stiffness = Spring.StiffnessMediumLow,
             )
         },
@@ -315,7 +354,7 @@ fun SpeechBalloonView(
             snap()
         } else {
             spring(
-                dampingRatio = 0.78f,
+                dampingRatio = 0.82f,
                 stiffness = Spring.StiffnessMedium,
             )
         },
@@ -323,7 +362,7 @@ fun SpeechBalloonView(
     )
 
     val localTarget = if (showPointerTail) {
-        Offset(x = interpolatedTipWorld.x - bubbleLeftPx, y = interpolatedTipWorld.y - bubbleTopPx)
+        Offset(x = interpolatedTipWorld.x - renderedLeftPx, y = interpolatedTipWorld.y - renderedTopPx)
     } else {
         null
     }
@@ -331,8 +370,8 @@ fun SpeechBalloonView(
     val rootModifier = modifier
         .offset {
             IntOffset(
-                x = bubbleLeftPx.roundToInt(),
-                y = bubbleTopPx.roundToInt(),
+                x = renderedLeftPx.roundToInt(),
+                y = renderedTopPx.roundToInt(),
             )
         }
         .graphicsLayer { alpha = if (measuredSize == IntSize.Zero) 0f else enterAlpha.value }
