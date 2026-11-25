@@ -300,7 +300,11 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     private val activeSessionToken = AtomicLong(0L)
     private val coverageLedger = TranscriptCoverageLedger()
 
-    private fun nextSessionToken(): Long = activeSessionToken.incrementAndGet()
+    private fun nextSessionToken(): Long {
+        healBeaconJob?.cancel()
+        healBeaconJob = null
+        return activeSessionToken.incrementAndGet()
+    }
 
     private fun isCurrentSession(sessionToken: Long, projectId: String? = null): Boolean {
         if (activeSessionToken.get() != sessionToken) return false
@@ -395,7 +399,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     state.copy(
                         styleSettings = style,
                         project = updatedProject,
-                        placedBalloons = layoutEngine.computeLayout(updatedProject, state.currentTimeMs, style, currentLiveFaces),
+                        placedBalloons = computeContextAwareLayout(updatedProject, state.currentTimeMs, style, currentLiveFaces).first,
                     )
                 }
             }
@@ -423,7 +427,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     state.copy(
                         characterColorMemory = updatedMemory,
                         project = updatedProj,
-                        placedBalloons = layoutEngine.computeLayout(updatedProj, state.currentTimeMs, state.styleSettings, currentLiveFaces),
+                        placedBalloons = computeContextAwareLayout(updatedProj, state.currentTimeMs, state.styleSettings, currentLiveFaces).first,
                     )
                 }
             }
@@ -1027,7 +1031,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     hasPendingPlayIntro = false,
                     currentTimeMs = safePos,
                     streamPlayRequest = pauseSeq to false,
-                    placedBalloons = layoutEngine.computeLayout(updatedProj, safePos, state.styleSettings, currentLiveFaces),
+                    placedBalloons = computeContextAwareLayout(updatedProj, safePos, state.styleSettings, currentLiveFaces).first,
                 )
             } else {
                 val clearedBuffering = if (state.isScoutCatchUpBuffering && !isScoutActivelyBuffering) {
@@ -1047,7 +1051,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     isScoutCatchUpBuffering = clearedBuffering,
                     hasPendingPlayIntro = if (isPlaying) false else state.hasPendingPlayIntro,
                     currentTimeMs = safePos,
-                    placedBalloons = layoutEngine.computeLayout(updatedProj, safePos, state.styleSettings, currentLiveFaces),
+                    placedBalloons = computeContextAwareLayout(updatedProj, safePos, state.styleSettings, currentLiveFaces).first,
                 )
             }
         }
@@ -1174,7 +1178,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 project = updatedProj,
                 isPlaying = isPlaying,
                 currentTimeMs = safePos,
-                placedBalloons = layoutEngine.computeLayout(updatedProj, safePos, state.styleSettings, currentLiveFaces),
+                placedBalloons = computeContextAwareLayout(updatedProj, safePos, state.styleSettings, currentLiveFaces).first,
             )
         }
         maybeTriggerRollingWindowEnhancement(positionMs.coerceAtLeast(0L))
@@ -2095,7 +2099,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             state.copy(
                 styleSettings = settings,
                 project = proj,
-                placedBalloons = layoutEngine.computeLayout(proj, state.currentTimeMs, settings, currentLiveFaces),
+                placedBalloons = computeContextAwareLayout(proj, state.currentTimeMs, settings, currentLiveFaces).first,
             )
         }
         viewModelScope.launch { projectStore.saveStyleSettings(settings) }
@@ -2162,7 +2166,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             state.copy(
                 project = previous,
                 canUndo = undoStack.isNotEmpty(),
-                placedBalloons = layoutEngine.computeLayout(previous, state.currentTimeMs, state.styleSettings, currentLiveFaces),
+                placedBalloons = computeContextAwareLayout(previous, state.currentTimeMs, state.styleSettings, currentLiveFaces).first,
                 statusBanner = "Undid last timeline edit",
             )
         }
@@ -2849,7 +2853,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         scoutTimeMs = 0L,
                         scoutedUpToMs = 0L,
                         scoutStatusText = "Scout buffering opening 7s context in background...",
-                        placedBalloons = layoutEngine.computeLayout(newProject, 0L, it.styleSettings, currentLiveFaces),
+                        placedBalloons = computeContextAwareLayout(newProject, 0L, it.styleSettings, currentLiveFaces).first,
                         statusBanner = "Video loaded · Scout pre-buffering transcript & faces. Press Play for Smart Pre-Roll.",
                     )
                 }
@@ -5403,7 +5407,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     scoutFailedSliceCount = initialSummary.failedIntervalCount,
                     coverageSummary = initialSummary,
                     transcriptDiagnostics = initialDiag,
-                    placedBalloons = layoutEngine.computeLayout(ytProject, 0L, it.styleSettings, currentLiveFaces),
+                    placedBalloons = computeContextAwareLayout(ytProject, 0L, it.styleSettings, currentLiveFaces).first,
                     statusBanner = when {
                         cues.isNotEmpty() -> "Attached ${events.size} subtitles — DialogueLens balloons active"
                         restoredFromCache && fullyCached -> "Restored ${events.size} verified cached bubbles ($0 credits)"
@@ -6678,7 +6682,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     viewerWebNavCommand = null,
                     scoutWebNavCommand = null,
                     showScoutBrowserModal = false,
-                    placedBalloons = layoutEngine.computeLayout(webProject, 0L, it.styleSettings, currentLiveFaces),
+                    placedBalloons = computeContextAwareLayout(webProject, 0L, it.styleSettings, currentLiveFaces).first,
                     statusBanner = "Opened in Web Cinema ($hostLabel) · Scout gathering in background",
                 )
             }
@@ -7006,8 +7010,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         scope: HealScope = HealScope.ADAPTIVE,
         autoTriggered: Boolean = false,
     ) {
+        markHealBeaconAt(_uiState.value.currentTimeMs, scope, autoTriggered)
+    }
+
+    fun markHealBeaconAt(timestampMs: Long, scope: HealScope = HealScope.ADAPTIVE, autoTriggered: Boolean = false) {
         val state = _uiState.value
-        val ts = state.currentTimeMs.coerceAtLeast(0L)
+        val ts = timestampMs.coerceAtLeast(0L)
         val (updatedProj, beacon) = HealBeaconEngine.placeOrMergeBeacon(
             project = state.project,
             timestampMs = ts,
@@ -7071,7 +7079,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     val state = _uiState.value
                     val project = state.project
                     if (!isCurrentSession(sessionToken, project.id)) break
-                    val nextBeacon = project.healBeacons.firstOrNull { it.status == HealBeaconStatus.MARKED } ?: break
+                    val nextBeacon = com.example.domain.analysis.SentinelPolicy.nextBeacon(project.healBeacons) ?: break
                     processSingleHealBeacon(nextBeacon.id, sessionToken)
                 }
             }
@@ -7087,7 +7095,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         val healingBeacon = beacon.copy(
             status = HealBeaconStatus.HEALING,
             updatedAtEpochMs = System.currentTimeMillis(),
-            statusNote = "Re-checking dialogue and speaker context…",
+            statusNote = "Sentinel is re-checking this moment…",
         )
         updateProject(
             startProject.copy(
@@ -7165,8 +7173,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
                 if (!isCurrentSession(sessionToken, startProject.id)) return
                 val liveProj = _uiState.value.project
+                if (!com.example.domain.analysis.SentinelPolicy.isStillCurrent(liveProj.healBeacons, healingBeacon)) return
                 when (segOutcome) {
                     is SegmentExecutionOutcome.Completed -> {
+                        if (!com.example.domain.analysis.SentinelPolicy.hasVerifiedRepairCoverage(beacon, segOutcome)) {
+                            markSentinelAttention(healingBeacon, "Repair incomplete — existing dialogue kept. Retry this moment.")
+                            return
+                        }
                         val (reconciledCues, reconciledUpdates, _) = reconcileWindowOutcomeSpeakersAndCues(
                             existingSpeakers = liveProj.speakers,
                             cues = segOutcome.cues,
@@ -7259,6 +7272,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             } catch (_: Throwable) {
                 if (!isCurrentSession(sessionToken, startProject.id)) return
                 val liveProj = _uiState.value.project
+                if (!com.example.domain.analysis.SentinelPolicy.isStillCurrent(liveProj.healBeacons, healingBeacon)) return
                 val attentionBeacon = healingBeacon.copy(
                     status = HealBeaconStatus.NEEDS_ATTENTION,
                     updatedAtEpochMs = System.currentTimeMillis(),
@@ -7318,11 +7332,15 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     )
                     if (!isCurrentSession(sessionToken, startProject.id)) return
                     val currentProj = _uiState.value.project
+                    if (!com.example.domain.analysis.SentinelPolicy.isStillCurrent(currentProj.healBeacons, healingBeacon)) return
                     val detailed = aiResult.getOrNull()
+                    if (detailed?.outcome == TranscriptionOutcome.PARTIAL_SUCCESS) {
+                        markSentinelAttention(healingBeacon, "Repair incomplete — existing dialogue kept. Retry this moment.")
+                        return
+                    }
                     val isUsableOutcome = detailed != null && (
                         detailed.outcome == TranscriptionOutcome.DIALOGUE_DETECTED ||
-                            detailed.outcome == TranscriptionOutcome.VERIFIED_SILENCE ||
-                            detailed.outcome == TranscriptionOutcome.PARTIAL_SUCCESS
+                            detailed.outcome == TranscriptionOutcome.VERIFIED_SILENCE
                         )
                     if (isUsableOutcome && detailed != null) {
                         val candidateEvents = detailed.cues.map { cue ->
@@ -7377,10 +7395,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             }
         }
 
-        // Graceful fallback: local speaker re-attribution & anchor sanitization (preserves all dialogue)
-        val sanitized = AutoSelfHealDetector.consolidateDuplicateSpeakers(
-            liveProj.copy(dialogueEvents = AutoSelfHealDetector.sanitizeCorruptedAnchors(liveProj.dialogueEvents)),
-        )
+        if (!isCurrentSession(sessionToken, startProject.id)) return
+        val latestProject = _uiState.value.project
+        if (!com.example.domain.analysis.SentinelPolicy.isStillCurrent(latestProject.healBeacons, healingBeacon)) return
+        val sanitized = latestProject.copy(dialogueEvents = AutoSelfHealDetector.sanitizeCorruptedAnchors(latestProject.dialogueEvents))
         val windowEvents = sanitized.dialogueEvents.filter { evt ->
             val mid = (evt.startTimeMs + evt.endTimeMs) / 2L
             mid in beacon.windowStartMs..beacon.windowEndMs
@@ -7411,6 +7429,19 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             fallbackOutcome.updatedProject
         }
         updateProject(finalProject)
+    }
+
+    private fun markSentinelAttention(attempt: HealBeacon, note: String) {
+        val latest = _uiState.value.project
+        if (!com.example.domain.analysis.SentinelPolicy.isStillCurrent(latest.healBeacons, attempt)) return
+        updateProject(latest.copy(healBeacons = latest.healBeacons.map { item ->
+            if (item.id != attempt.id) item else item.copy(
+                status = HealBeaconStatus.NEEDS_ATTENTION,
+                attemptCount = item.attemptCount + 1,
+                updatedAtEpochMs = System.currentTimeMillis(),
+                statusNote = note,
+            )
+        }))
     }
 
     private fun maybeRunAutomaticSelfHealCheck(timeMs: Long, placedBalloons: List<PlacedBalloon>) {

@@ -61,6 +61,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
@@ -854,6 +855,7 @@ fun VideoPlayerStage(
                     val priorBubbleRects = nonSfxBalloons
                         .take(idx)
                         .mapNotNull { measuredBubbleBounds[it.event.id] }
+                    key(project.id, placed.event.id) {
                     SpeechBalloonView(
                         placed = placed,
                         translationMode = project.translationMode,
@@ -870,6 +872,7 @@ fun VideoPlayerStage(
                         onClick = { onTapBalloon(placed.event.id) },
                         onDragCommit = { newCenter -> onDragBalloonAnchor(placed.event.id, newCenter) },
                     )
+                    }
                 }
             }
 
@@ -879,6 +882,7 @@ fun VideoPlayerStage(
                 val sfxList = placedBalloons.filter { it.event.dialogueType == DialogueType.SOUND_DESCRIPTION }
                 sfxList.forEachIndexed { idx, sfxPlaced ->
                     val priorSfxObstacles = sfxList.take(idx).mapNotNull { measuredSfxBounds[it.event.id] }
+                    key(project.id, sfxPlaced.event.id) {
                     SpatialSfxNoteView(
                         placed = sfxPlaced,
                         translationMode = project.translationMode,
@@ -892,6 +896,7 @@ fun VideoPlayerStage(
                         },
                         onTap = { onTapBalloon(sfxPlaced.event.id) },
                     )
+                    }
                 }
             } else if (displayMode == CaptionDisplayMode.CLASSIC || displayMode == CaptionDisplayMode.BOTH) {
                 ClassicSubtitleBar(

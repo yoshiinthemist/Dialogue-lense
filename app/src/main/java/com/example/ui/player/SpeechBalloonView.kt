@@ -38,6 +38,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -214,6 +215,11 @@ fun SpeechBalloonView(
     val baseLeftPx = (desiredCenterX - actualW * 0.5f).coerceIn(safeMarginX, maxLeftPx)
     val baseTopPx = (desiredCenterY - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
 
+    // Remember the actual rendered position for the same cue and scene.
+    val lastSafePixelPosition = remember(event.id, placed.layoutSceneKey, measuredSize, containerWidthPx, containerHeightPx, style.stablePositioning, style.reducedMotion) {
+        arrayOfNulls<Pair<Float, Float>>(1)
+    }
+
     // Real-pixel face & sibling-bubble repulsion guarantee: scan open 2D space freely so wrapped lines never clip faces or neighbors
     val (bubbleLeftPx, bubbleTopPx) = if (
         measuredSize != IntSize.Zero &&
@@ -235,11 +241,15 @@ fun SpeechBalloonView(
             occupiedBubbleRects = occupiedBubbleRects,
             density = density,
             allowBelowFace = !style.lipReadingSafeZone || (event.faceTrackId == null && event.anchorPosition != null),
+            previousPosition = if (!isEditMode) lastSafePixelPosition[0] else null,
         )
     } else {
         baseLeftPx to baseTopPx
     }
 
+    SideEffect {
+        if (measuredSize != IntSize.Zero) lastSafePixelPosition[0] = bubbleLeftPx to bubbleTopPx
+    }
     val actualCenterX = bubbleLeftPx + actualW * 0.5f
     val actualCenterY = bubbleTopPx + actualH * 0.5f
 
@@ -1562,6 +1572,7 @@ private fun resolveFaceSafePixelPosition(
     occupiedBubbleRects: List<Rect> = emptyList(),
     density: Float,
     allowBelowFace: Boolean = true,
+    previousPosition: Pair<Float, Float>? = null,
 ): Pair<Float, Float> {
     val facePixels = faceExclusionRects.map { f ->
         Rect(
@@ -1591,6 +1602,14 @@ private fun resolveFaceSafePixelPosition(
             total += ix * iy
         }
         return total
+    }
+
+    if (previousPosition != null) {
+        val (previousLeft, previousTop) = previousPosition
+        if (previousLeft in safeMarginX..maxLeftPx && previousTop in safeMarginY..maxTopPx &&
+            sumOverlap(facePixels, previousLeft, previousTop) <= 1f &&
+            sumOverlap(siblingPixels, previousLeft, previousTop) <= 1f
+        ) return previousPosition
     }
 
     if (sumOverlap(facePixels, baseLeftPx, baseTopPx) <= 1f &&

@@ -193,8 +193,13 @@ object HealBeaconEngine {
         val window = computeWindow(timestampMs, scope, project)
 
         // Check for overlapping active beacon to prevent duplicate overlapping requests
+        val coveringRunning = project.healBeacons.firstOrNull { existing ->
+            existing.status == HealBeaconStatus.HEALING &&
+                existing.windowStartMs <= window.startMs && existing.windowEndMs >= window.endMs
+        }
+        if (coveringRunning != null) return project to coveringRunning
         val overlappingActive = project.healBeacons.firstOrNull { existing ->
-            (existing.status == HealBeaconStatus.MARKED || existing.status == HealBeaconStatus.HEALING) &&
+            existing.status == HealBeaconStatus.MARKED &&
                 windowsOverlap(existing.windowStartMs, existing.windowEndMs, window.startMs, window.endMs)
         }
         if (overlappingActive != null) {
@@ -203,11 +208,8 @@ object HealBeaconEngine {
                 windowEndMs = maxOf(overlappingActive.windowEndMs, window.endMs),
                 scope = if (scope.ordinal > overlappingActive.scope.ordinal) scope else overlappingActive.scope,
                 updatedAtEpochMs = nowEpochMs,
-                statusNote = if (overlappingActive.status == HealBeaconStatus.HEALING) {
-                    "Healing expanded around this moment"
-                } else {
-                    "Queued for localized repair"
-                },
+                autoTriggered = overlappingActive.autoTriggered && autoTriggered,
+                statusNote = "Queued for localized repair",
             )
             val updatedBeacons = project.healBeacons.map { if (it.id == merged.id) merged else it }
             return project.copy(healBeacons = updatedBeacons) to merged

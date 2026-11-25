@@ -46,6 +46,7 @@ data class PlacedBalloon(
     val heatmapDensity: Float = 0f,
     val identityConfidence: Float = 0f,
     val locationConfidence: Float = 0f,
+    val layoutSceneKey: String = "",
 )
 
 class BalloonLayoutEngine {
@@ -878,7 +879,7 @@ class BalloonLayoutEngine {
             )
         }
 
-        return results.sortedBy { it.event.startTimeMs }
+        return results.sortedWith(compareBy<PlacedBalloon> { it.event.startTimeMs }.thenBy { it.event.id }).map { it.copy(layoutSceneKey = effectiveSceneKey) }
     }
 
     private fun deriveSpeakerSilhouetteZone(face: NormalizedRect): NormalizedRect {
