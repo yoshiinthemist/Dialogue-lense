@@ -7,7 +7,7 @@ import com.example.data.model.HealBeaconStatus
 import com.example.data.model.HealProblemHint
 import com.example.data.model.HealScope
 import java.util.UUID
-import kotlin.math.abs
+import com.example.data.model.SubtitleSourceKind
 
 data class HealWindow(
     val startMs: Long,
@@ -21,21 +21,19 @@ data class LocalizedRepairOutcome(
     val applied: Boolean,
     val replacedCount: Int,
     val preservedLockedCount: Int,
+    val reason: String,
     val preservedIdentityCount: Int = 0,
     val modifiedEventIds: Set<String> = emptySet(),
-    val reason: String,
 )
 
 /**
- * Pure, deterministic core engine for DialogueLens 2.0 Heal Beacons ("Pause. Mark. Heal. Continue").
- * Guarantees:
+ * Pure, deterministic core engine for DialogueLens's Heal Beacon system ("Pause. Mark. Heal. Continue").
+ * Handles:
  * - Adaptive ~±15s window expansion snapped to dialogue, sentence, shot, or chapter boundaries
- * - Quick / Scene / Chapter explicit repair scopes
- * - Active `HEALING` windows are immutable while a worker runs (new overlapping marks queue uncovered slices separately)
- * - Transactionally safe partial sub-range replacement: never deletes cues outside verified sub-ranges
- * - In-place cue ID preservation when refining an existing cue without changing its identity
- * - User-locked cue protection and stale revision rejection
- * - Full Undo recovery transitioning cleanly to [HealBeaconStatus.UNDONE]
+ * - Quick / Scene / Chapter explicit repair scopes for Studio & Beacon Detail
+ * - Overlapping beacon merging & duplicate-request suppression
+ * - Safe, atomic, validated localized replacement preserving unaffected cues & user-locked edits
+ * - Full Undo recovery and restart restoration of interrupted HEALING beacons
  */
 object HealBeaconEngine {
 
@@ -44,13 +42,20 @@ object HealBeaconEngine {
     const val MAX_ADAPTIVE_HALF_WINDOW_MS = 28_000L
     const val MAX_CHAPTER_HEAL_SPAN_MS = 180_000L
 
+    /**
+     * Computes the exact time window to reanalyze for a Heal Beacon.
+     * - [HealScope.ADAPTIVE]: starts at ±15s and expands smoothly to capture complete overlapping
+     *   dialogue lines, sentence boundaries, nearby shot cuts, and chapter boundaries.
+     * - [HealScope.QUICK]: tight ±8s around the marked moment.
+     * - [HealScope.SCENE]: covers the full affected shot/scene (bounded safely).
+     * - [HealScope.CHAPTER]: covers the full active chapter (capped around the marked timestamp if very long).
+     */
     fun computeWindow(
         timestampMs: Long,
         scope: HealScope,
         project: DialogueLensProject,
     ): HealWindow {
-        val durationMs = maxOf(
-            project.videoSource.durationMs,
+        val durationMs = project.videoSource.durationMs.takeIf { it > 0L } ?: maxOf(
             project.dialogueEvents.maxOfOrNull { it.endTimeMs } ?: 0L,
             timestampMs + DEFAULT_HALF_WINDOW_MS,
         ).coerceAtLeast(15_000L)
@@ -63,24 +68,24 @@ object HealBeaconEngine {
                 return expandToDialogueBoundaries(baseStart, baseEnd, clampedTs, 14_000L, durationMs, project.dialogueEvents, scope)
             }
             HealScope.SCENE -> {
-                val activeShot = project.shots.firstOrNull { clampedTs in it.startMs..it.endMs }
+                val activeShot = project.shots.firstOrNull { clampedTs >= it.startMs && (clampedTs < it.endMs || clampedTs == durationMs && it.endMs == durationMs) }
                 val shotSpan = if (activeShot != null) activeShot.endMs - activeShot.startMs else 0L
                 val isUsefulShot = activeShot != null && shotSpan in 6_000L..90_000L
                 val rawStart = if (isUsefulShot) {
-                    (activeShot!!.startMs - 2_000L).coerceAtLeast(0L)
+                    (activeShot.startMs - 2_000L).coerceAtLeast(0L)
                 } else {
                     (clampedTs - 22_000L).coerceAtLeast(0L)
                 }
                 val rawEnd = if (isUsefulShot) {
-                    (activeShot!!.endMs + 2_000L).coerceAtMost(durationMs)
+                    (activeShot.endMs + 2_000L).coerceAtMost(durationMs)
                 } else {
                     (clampedTs + 22_000L).coerceAtMost(durationMs)
                 }
                 return expandToDialogueBoundaries(rawStart, rawEnd, clampedTs, 45_000L, durationMs, project.dialogueEvents, scope)
             }
             HealScope.CHAPTER -> {
-                val chapter = project.chapters.firstOrNull { clampedTs in it.startMs..it.endMs }
-                if (chapter != null) {
+                val chapter = project.chapters.firstOrNull { clampedTs >= it.startMs && (clampedTs < it.endMs || clampedTs == durationMs && it.endMs == durationMs) }
+                if (chapter != null && chapter.startMs < durationMs && chapter.endMs > chapter.startMs) {
                     val span = chapter.endMs - chapter.startMs
                     if (span <= MAX_CHAPTER_HEAL_SPAN_MS) {
                         return HealWindow(
@@ -89,9 +94,10 @@ object HealBeaconEngine {
                             scope = scope,
                         )
                     }
+                    // Very long chapter: focus on a 2-minute window centered on the marked moment inside the chapter
                     val start = maxOf(chapter.startMs, clampedTs - 60_000L)
                     val end = minOf(chapter.endMs, clampedTs + 60_000L).coerceAtMost(durationMs)
-                    return HealWindow(startMs = start, endMs = end.coerceAtLeast(start + 10_000L), scope = scope)
+                    return HealWindow(startMs = start, endMs = end, scope = scope)
                 }
                 val start = (clampedTs - 45_000L).coerceAtLeast(0L)
                 val end = (clampedTs + 45_000L).coerceAtMost(durationMs)
@@ -101,6 +107,7 @@ object HealBeaconEngine {
                 var start = (clampedTs - DEFAULT_HALF_WINDOW_MS).coerceAtLeast(0L)
                 var end = (clampedTs + DEFAULT_HALF_WINDOW_MS).coerceAtMost(durationMs)
 
+                // Include nearby chapter transition if within 6s of window edge so context stays coherent
                 val nearbyChapterBoundary = project.chapters.flatMap { listOf(it.startMs, it.endMs) }
                     .firstOrNull { boundary ->
                         (boundary in (start - 6_000L)..start) || (boundary in end..(end + 6_000L))
@@ -110,6 +117,7 @@ object HealBeaconEngine {
                     if (nearbyChapterBoundary > end) end = (nearbyChapterBoundary + 2_000L).coerceAtMost(durationMs)
                 }
 
+                // Expand to complete dialogue segments & sentence endings
                 return expandToDialogueBoundaries(
                     rawStart = start,
                     rawEnd = end,
@@ -139,14 +147,17 @@ object HealBeaconEngine {
 
         val sorted = events.sortedBy { it.startTimeMs }
         for (evt in sorted) {
+            // Pull start back to avoid bisecting a cue at the left edge
             if (evt.startTimeMs < start && evt.endTimeMs > start) {
                 start = evt.startTimeMs.coerceAtLeast(minAllowedStart)
             }
+            // Push end forward to avoid bisecting a cue at the right edge
             if (evt.startTimeMs < end && evt.endTimeMs > end) {
                 end = evt.endTimeMs.coerceAtMost(maxAllowedEnd)
             }
         }
 
+        // If the boundary cue does not end with terminal punctuation, extend one cue further if within budget
         val lastInside = sorted.lastOrNull { it.endTimeMs <= end && it.endTimeMs >= start }
         if (lastInside != null && !endsWithSentencePunctuation(lastInside.translatedText.ifBlank { lastInside.sourceText })) {
             val nextCue = sorted.firstOrNull { it.startTimeMs >= lastInside.endTimeMs && it.startTimeMs - lastInside.endTimeMs <= 2_500L }
@@ -157,7 +168,7 @@ object HealBeaconEngine {
 
         return HealWindow(
             startMs = start.coerceIn(0L, durationMs),
-            endMs = end.coerceIn(start + 1_000L, maxOf(durationMs, start + 1_000L)),
+            endMs = end.coerceIn(start.coerceAtMost(durationMs), durationMs),
             scope = scope,
         )
     }
@@ -171,104 +182,72 @@ object HealBeaconEngine {
 
     /**
      * Creates or merges a Heal Beacon for [timestampMs].
-     * - If an overlapping `MARKED` (queued, not yet running) beacon exists, merges cleanly into it.
-     * - If an overlapping `HEALING` (actively running) beacon exists, NEVER mutates the running
-     *   beacon's window! If the running window already covers [window], returns it; otherwise
-     *   queues a separate follow-up `MARKED` beacon for the uncovered slice.
+     * If an active (`MARKED` or `HEALING`) beacon already overlaps the computed window, merges
+     * them cleanly into a single unified window rather than launching duplicate conflicting cloud jobs.
      */
     fun placeOrMergeBeacon(
         project: DialogueLensProject,
         timestampMs: Long,
         scope: HealScope = HealScope.ADAPTIVE,
         autoTriggered: Boolean = false,
+        nowEpochMs: Long = System.currentTimeMillis(),
+        window: HealWindow = computeWindow(timestampMs, scope, project),
         problemHint: HealProblemHint = HealProblemHint.NONE,
         patrolChapterId: String? = null,
-        nowEpochMs: Long = System.currentTimeMillis(),
     ): Pair<DialogueLensProject, HealBeacon> {
-        val window = computeWindow(timestampMs, scope, project)
 
-        // 1. Check actively running HEALING beacons first — never mutate their window in flight
-        val runningOverlap = project.healBeacons.firstOrNull { existing ->
-            existing.status == HealBeaconStatus.HEALING &&
-                windowsOverlap(existing.windowStartMs, existing.windowEndMs, window.startMs, window.endMs)
+        require(window.endMs > window.startMs) { "Repair window must have positive duration" }
+        val running = project.healBeacons.filter { it.status == HealBeaconStatus.HEALING &&
+            it.windowStartMs < window.endMs && it.windowEndMs > window.startMs }.sortedBy { it.windowStartMs }
+        var updated = project
+        var result: HealBeacon? = null
+        var cursor = window.startMs
+        val uncovered = mutableListOf<HealWindow>()
+        for (active in running) {
+            if (active.windowStartMs > cursor) uncovered.add(window.copy(startMs = cursor, endMs = active.windowStartMs))
+            if (timestampMs in active.windowStartMs until active.windowEndMs) {
+                result = if (!autoTriggered && active.autoTriggered) {
+                    // Keep the active analysis request immutable while making the manual mark visible.
+                    val promoted = active.copy(autoTriggered = false, timestampMs = timestampMs, problemHint = problemHint)
+                    updated = updated.copy(healBeacons = updated.healBeacons.map { if (it.id == active.id) promoted else it })
+                    promoted
+                } else active
+            }
+            cursor = maxOf(cursor, active.windowEndMs)
         }
-        if (runningOverlap != null) {
-            val fullyCovered = window.startMs >= runningOverlap.windowStartMs &&
-                window.endMs <= runningOverlap.windowEndMs
-            if (fullyCovered) {
-                return project to runningOverlap
+        if (cursor < window.endMs) uncovered.add(window.copy(startMs = cursor))
+        for (piece in uncovered) {
+            val existing = updated.healBeacons.firstOrNull { pending ->
+                pending.status == HealBeaconStatus.MARKED &&
+                    windowsOverlap(pending.windowStartMs, pending.windowEndMs, piece.startMs, piece.endMs) &&
+                    running.none { active -> active.windowStartMs < maxOf(piece.endMs, pending.windowEndMs) &&
+                        active.windowEndMs > minOf(piece.startMs, pending.windowStartMs) }
             }
-            // Queue the uncovered tail/head as a separate MARKED beacon so the running worker remains immutable
-            val uncoveredStart = if (window.endMs > runningOverlap.windowEndMs) {
-                runningOverlap.windowEndMs
-            } else {
-                window.startMs
-            }
-            val uncoveredEnd = if (window.endMs > runningOverlap.windowEndMs) {
-                window.endMs
-            } else {
-                runningOverlap.windowStartMs
-            }
-            if (uncoveredEnd - uncoveredStart >= 2_000L) {
-                val followUp = HealBeacon(
-                    id = "beacon_${UUID.randomUUID().toString().take(8)}",
-                    timestampMs = timestampMs.coerceAtLeast(0L),
-                    windowStartMs = uncoveredStart,
-                    windowEndMs = uncoveredEnd,
-                    status = HealBeaconStatus.MARKED,
-                    scope = scope,
-                    createdAtEpochMs = nowEpochMs,
-                    updatedAtEpochMs = nowEpochMs,
-                    statusNote = "Queued right after current repair",
-                    attemptCount = 0,
-                    autoTriggered = autoTriggered,
-                    problemHint = problemHint,
-                    patrolChapterId = patrolChapterId,
-                )
-                val updated = (project.healBeacons + followUp).sortedBy { it.timestampMs }
-                return project.copy(healBeacons = updated) to followUp
-            }
-            return project to runningOverlap
-        }
-
-        // 2. Merge into overlapping queued MARKED beacon to prevent duplicate requests
-        val overlappingMarked = project.healBeacons.firstOrNull { existing ->
-            existing.status == HealBeaconStatus.MARKED &&
-                windowsOverlap(existing.windowStartMs, existing.windowEndMs, window.startMs, window.endMs)
-        }
-        if (overlappingMarked != null) {
-            val merged = overlappingMarked.copy(
-                windowStartMs = minOf(overlappingMarked.windowStartMs, window.startMs),
-                windowEndMs = maxOf(overlappingMarked.windowEndMs, window.endMs),
-                scope = if (scope.ordinal > overlappingMarked.scope.ordinal) scope else overlappingMarked.scope,
-                updatedAtEpochMs = nowEpochMs,
-                autoTriggered = overlappingMarked.autoTriggered && autoTriggered,
-                problemHint = if (problemHint != HealProblemHint.NONE) problemHint else overlappingMarked.problemHint,
-                statusNote = "Queued for localized repair",
+            val markedTime = timestampMs.coerceIn(piece.startMs, piece.endMs)
+            val mark = existing?.copy(
+                timestampMs = if (existing.autoTriggered && !autoTriggered) markedTime else existing.timestampMs,
+                windowStartMs = minOf(existing.windowStartMs, piece.startMs),
+                windowEndMs = maxOf(existing.windowEndMs, piece.endMs),
+                scope = if (scope.ordinal > existing.scope.ordinal) scope else existing.scope,
+                updatedAtEpochMs = nowEpochMs, autoTriggered = existing.autoTriggered && autoTriggered,
+                problemHint = problemHint.takeUnless { it == HealProblemHint.NONE } ?: existing.problemHint,
+                patrolChapterId = existing.patrolChapterId ?: patrolChapterId,
+            ) ?: HealBeacon(
+                id = "beacon_${UUID.randomUUID()}", timestampMs = markedTime, windowStartMs = piece.startMs,
+                windowEndMs = piece.endMs, scope = scope, createdAtEpochMs = nowEpochMs, updatedAtEpochMs = nowEpochMs,
+                statusNote = "Queued for localized repair", autoTriggered = autoTriggered,
+                problemHint = problemHint, patrolChapterId = patrolChapterId,
             )
-            val updatedBeacons = project.healBeacons.map { if (it.id == merged.id) merged else it }
-            return project.copy(healBeacons = updatedBeacons) to merged
+            updated = updated.copy(healBeacons = (updated.healBeacons.filterNot { it.id == mark.id } + mark).sortedBy { it.timestampMs })
+            if (result == null || timestampMs in piece.startMs until piece.endMs) result = mark
         }
-
-        val beacon = HealBeacon(
-            id = "beacon_${UUID.randomUUID().toString().take(8)}",
-            timestampMs = timestampMs.coerceAtLeast(0L),
-            windowStartMs = window.startMs,
-            windowEndMs = window.endMs,
-            status = HealBeaconStatus.MARKED,
-            scope = scope,
-            createdAtEpochMs = nowEpochMs,
-            updatedAtEpochMs = nowEpochMs,
-            statusNote = "Queued for localized repair",
-            attemptCount = 0,
-            autoTriggered = autoTriggered,
-            problemHint = problemHint,
-            patrolChapterId = patrolChapterId,
-        )
-        val updatedBeacons = (project.healBeacons + beacon).sortedBy { it.timestampMs }
-        return project.copy(healBeacons = updatedBeacons) to beacon
+        return updated to (result ?: running.first())
     }
 
+    /**
+     * Restores any beacons left in [HealBeaconStatus.HEALING] across an app crash/restart back to
+     * [HealBeaconStatus.MARKED] so unfinished repairs survive restarts safely.
+     */
     fun restoreInterruptedBeacons(
         project: DialogueLensProject,
         nowEpochMs: Long = System.currentTimeMillis(),
@@ -288,22 +267,34 @@ object HealBeaconEngine {
         return project.copy(healBeacons = restored)
     }
 
+    /** Requeue immutable attempts before their read access is transferred to an urgent Scout request. */
+    fun deferToPlayback(project: DialogueLensProject, nowMs: Long = System.currentTimeMillis()): DialogueLensProject {
+        if (project.healBeacons.none { it.status == HealBeaconStatus.HEALING }) return project
+        return project.copy(healBeacons = project.healBeacons.map { mark ->
+            if (mark.status != HealBeaconStatus.HEALING) mark else mark.copy(status = HealBeaconStatus.MARKED,
+                revision = mark.revision + 1, repairRevision = mark.repairRevision + 1,
+                updatedAtEpochMs = nowMs, statusNote = "Waiting for playback to be ready.")
+        })
+    }
+
     /**
-     * Transactionally validates and applies candidate replacement cues for [beaconId].
-     * - When [verifiedSubRanges] is provided, replaces non-locked cues ONLY inside those verified
-     *   sub-ranges so unverified portions of a wide repair window are NEVER wiped!
-     * - Preserves existing cue IDs when a candidate refines an existing cue in place.
-     * - Rejects stale commits if [expectedRepairRevision] does not match [HealBeacon.repairRevision].
-     * - Never deletes existing dialogue on unconfirmed empty results.
+     * Validates candidate replacement cues for [beacon] and applies them atomically ONLY inside
+     * `[beacon.windowStartMs, beacon.windowEndMs]`:
+     * - Unaffected dialogue outside the repair window is strictly untouched.
+     * - User-confirmed (`lockedByUser = true`) dialogue inside the window is strictly preserved.
+     * - Rejects empty/invalid candidate sets when existing cues are present unless silence was
+     *   explicitly confirmed, marking the beacon [HealBeaconStatus.NEEDS_ATTENTION] instead of
+     *   silently wiping good subtitles.
+     * - Stores [HealBeacon.preHealSnapshotEvents] so the user can Undo the repair cleanly.
      */
     fun applyValidatedLocalizedRepair(
         project: DialogueLensProject,
         beaconId: String,
         candidateEvents: List<DialogueEvent>,
         silenceExplicitlyConfirmed: Boolean = false,
+        nowEpochMs: Long = System.currentTimeMillis(),
         verifiedSubRanges: List<TimeWindowRange>? = null,
         expectedRepairRevision: Int? = null,
-        nowEpochMs: Long = System.currentTimeMillis(),
     ): LocalizedRepairOutcome {
         val beacon = project.healBeacons.firstOrNull { it.id == beaconId }
             ?: return LocalizedRepairOutcome(
@@ -322,209 +313,123 @@ object HealBeaconEngine {
                 reason = "Beacon not found",
             )
 
-        if (expectedRepairRevision != null && beacon.repairRevision != expectedRepairRevision) {
-            return LocalizedRepairOutcome(
-                updatedProject = project,
-                updatedBeacon = beacon,
-                applied = false,
-                replacedCount = 0,
-                preservedLockedCount = 0,
-                reason = "Stale repair revision rejected (expected $expectedRepairRevision, current ${beacon.repairRevision})",
-            )
+        if (beacon.status != HealBeaconStatus.HEALING || expectedRepairRevision != null && expectedRepairRevision != beacon.repairRevision) {
+            return LocalizedRepairOutcome(project, beacon, false, 0, 0, "Attempt superseded")
         }
-
-        val winStart = beacon.windowStartMs
-        val winEnd = beacon.windowEndMs
-        val effectiveReplacementRanges = verifiedSubRanges
-            ?.filter { it.endMs > it.startMs }
-            ?.map { TimeWindowRange(maxOf(winStart, it.startMs), minOf(winEnd, it.endMs)) }
-            ?.filter { it.endMs > it.startMs }
-            ?.takeIf { it.isNotEmpty() }
-            ?: listOf(TimeWindowRange(winStart, winEnd))
-
-        val isPartialWindowRepair = verifiedSubRanges != null &&
-            (effectiveReplacementRanges.minOf { it.startMs } > winStart + 500L ||
-                effectiveReplacementRanges.maxOf { it.endMs } < winEnd - 500L)
-
-        fun isInsideEffectiveRanges(midMs: Long): Boolean =
-            effectiveReplacementRanges.any { midMs in it.startMs..it.endMs }
-
-        val unaffectedEvents = mutableListOf<DialogueEvent>()
-        val lockedInsideWindow = mutableListOf<DialogueEvent>()
-        val replaceableInsideWindow = mutableListOf<DialogueEvent>()
-
-        for (evt in project.dialogueEvents) {
-            val mid = (evt.startTimeMs + evt.endTimeMs) / 2L
-            if (!isInsideEffectiveRanges(mid)) {
-                unaffectedEvents.add(evt)
-            } else if (evt.lockedByUser) {
-                lockedInsideWindow.add(evt)
+        val originals = windowEvents(project, beacon)
+        val protectedIds = project.corrections.mapTo(mutableSetOf()) { it.eventId }
+        val locked = originals.filter { it.lockedByUser || it.id in protectedIds }
+        val authoritative = project.subtitleSource in setOf(SubtitleSourceKind.UPLOADED_FILE, SubtitleSourceKind.EMBEDDED_TRACK)
+        fun observed(event: DialogueEvent): Boolean = verifiedSubRanges == null || verifiedSubRanges.any {
+            event.startTimeMs >= it.startMs && event.endTimeMs <= it.endMs
+        }
+        val writable = originals.filter {
+            it !in locked && observed(it) && it.startTimeMs >= beacon.windowStartMs && it.endTimeMs <= beacon.windowEndMs
+        }
+        val replacements = linkedMapOf<String, DialogueEvent>()
+        val additions = linkedMapOf<String, DialogueEvent>()
+        val existingIds = project.dialogueEvents.mapTo(mutableSetOf()) { it.id }
+        val validCandidates = candidateEvents.filter {
+            it.id.isNotBlank() && observed(it) && it.startTimeMs >= beacon.windowStartMs && it.endTimeMs <= beacon.windowEndMs &&
+                it.endTimeMs > it.startTimeMs && it.translatedText.ifBlank { it.sourceText }.isNotBlank()
+        }
+        var uncertain = validCandidates.size != candidateEvents.size || verifiedSubRanges != null && verifiedSubRanges.none { it.startMs <= beacon.windowStartMs && it.endMs >= beacon.windowEndMs }
+        for (candidate in validCandidates) {
+            val overlaps = originals.filter { candidate.startTimeMs < it.endTimeMs && candidate.endTimeMs > it.startTimeMs }
+            if (overlaps.any { it in locked }) continue
+            val exact = writable.firstOrNull { it.id == candidate.id }
+            val match = exact ?: overlaps.singleOrNull()?.takeIf {
+                it in writable && temporalOverlapFraction(it.startTimeMs, it.endTimeMs, candidate.startTimeMs, candidate.endTimeMs) >= 0.65f &&
+                    (it.speakerId == null || candidate.speakerId == null || it.speakerId == candidate.speakerId ||
+                        it.sourceText.trim().trimEnd('.', '!', '?').equals(candidate.sourceText.trim().trimEnd('.', '!', '?'), ignoreCase = true))
+            }
+            if (match != null && !replacements.containsKey(match.id)) {
+                // The cue identity follows the utterance through text, timing and spatial refinements.
+                val refined = if (authoritative) {
+                    match.copy(anchorPosition = candidate.anchorPosition, placementMode = candidate.placementMode,
+                        faceTrackId = candidate.faceTrackId, faceConfidence = candidate.faceConfidence)
+                } else candidate.copy(id = match.id)
+                replacements[match.id] = refined
+            } else if (!authoritative && overlaps.isEmpty() && candidate.id !in existingIds &&
+                candidate.id !in additions && additions.values.none { it.startTimeMs < candidate.endTimeMs &&
+                    it.endTimeMs > candidate.startTimeMs && it.sourceText.equals(candidate.sourceText, ignoreCase = true) }) {
+                additions[candidate.id] = candidate
             } else {
-                replaceableInsideWindow.add(evt)
+                uncertain = true
             }
         }
-
-        val rawValidCandidates = candidateEvents
-            .filter { cand ->
-                val text = cand.translatedText.ifBlank { cand.sourceText }.trim()
-                val mid = (cand.startTimeMs + cand.endTimeMs) / 2L
-                text.isNotBlank() &&
-                    cand.endTimeMs > cand.startTimeMs &&
-                    effectiveReplacementRanges.any { mid in (it.startMs - 500L)..(it.endMs + 500L) }
-            }
-            .map { cand ->
-                cand.copy(
-                    startTimeMs = cand.startTimeMs.coerceAtLeast(0L),
-                    endTimeMs = cand.endTimeMs.coerceAtLeast(cand.startTimeMs + 350L),
-                )
-            }
-            .filter { cand ->
-                lockedInsideWindow.none { locked ->
-                    temporalOverlapFraction(cand.startTimeMs, cand.endTimeMs, locked.startTimeMs, locked.endTimeMs) >= 0.45f
-                }
-            }
-            .sortedBy { it.startTimeMs }
-
-        if (rawValidCandidates.isEmpty() && !silenceExplicitlyConfirmed) {
-            val failedBeacon = beacon.copy(
-                status = HealBeaconStatus.NEEDS_ATTENTION,
-                updatedAtEpochMs = nowEpochMs,
-                attemptCount = beacon.attemptCount + 1,
-                statusNote = if (replaceableInsideWindow.isNotEmpty()) {
-                    "Could not verify a clearer repair — kept your existing dialogue."
-                } else {
-                    "No clearer dialogue could be verified for this moment."
-                },
-            )
-            val updatedProject = project.copy(
-                healBeacons = project.healBeacons.map { if (it.id == beaconId) failedBeacon else it },
-            )
-            return LocalizedRepairOutcome(
-                updatedProject = updatedProject,
-                updatedBeacon = failedBeacon,
-                applied = false,
-                replacedCount = 0,
-                preservedLockedCount = lockedInsideWindow.size,
-                reason = failedBeacon.statusNote,
-            )
+        val changed = writable.filter { replacements[it.id]?.let { after -> after != it } == true }
+        val appliedEvents = changed.map { replacements.getValue(it.id) } + additions.values
+        val confirmedQuiet = silenceExplicitlyConfirmed && originals.isEmpty() && candidateEvents.isEmpty()
+        val success = appliedEvents.isNotEmpty() || confirmedQuiet
+        val note = when {
+            confirmedQuiet -> "Verified silence in this moment."
+            appliedEvents.isNotEmpty() && uncertain -> "Updated ${appliedEvents.size} lines. Other observations still need review."
+            appliedEvents.isNotEmpty() -> "Updated ${appliedEvents.size} lines. Other dialogue was preserved."
+            silenceExplicitlyConfirmed && originals.isNotEmpty() -> "The silence result conflicts with existing dialogue. Your lines were kept."
+            else -> "No change could be verified. Your existing dialogue was kept."
         }
-
-        // In-place identity preservation: when a candidate refines an existing cue in place
-        // (same/very similar text AND overlapping timestamps), preserve its cue ID so Compose
-        // stability and layout anchors stay seamless.
-        val claimedOriginalIds = mutableSetOf<String>()
-        var preservedIdentityCount = 0
-        val validCandidates = rawValidCandidates.map { cand ->
-            val candText = cand.translatedText.ifBlank { cand.sourceText }
-            val matchingOriginal = replaceableInsideWindow.firstOrNull { orig ->
-                orig.id !in claimedOriginalIds &&
-                    temporalOverlapFraction(cand.startTimeMs, cand.endTimeMs, orig.startTimeMs, orig.endTimeMs) >= 0.35f &&
-                    normalizedTokenSimilarity(candText, orig.translatedText.ifBlank { orig.sourceText }) >= 0.65f
-            }
-            if (matchingOriginal != null) {
-                claimedOriginalIds.add(matchingOriginal.id)
-                preservedIdentityCount++
-                cand.copy(id = matchingOriginal.id)
-            } else {
-                cand
-            }
-        }
-
-        val snapshotToStore = if (beacon.preHealSnapshotEvents.isNotEmpty()) {
-            beacon.preHealSnapshotEvents
-        } else {
-            replaceableInsideWindow
-        }
-
-        val mergedEvents = (unaffectedEvents + lockedInsideWindow + validCandidates)
-            .sortedWith(compareBy<DialogueEvent> { it.startTimeMs }.thenBy { it.endTimeMs })
-
-        val beforeSample = replaceableInsideWindow
-            .take(2)
-            .joinToString(" / ") { it.translatedText.ifBlank { it.sourceText }.trim() }
-            .take(140)
-        val afterSample = validCandidates
-            .take(2)
-            .joinToString(" / ") { it.translatedText.ifBlank { it.sourceText }.trim() }
-            .take(140)
-        val summary = when {
-            validCandidates.isEmpty() && silenceExplicitlyConfirmed ->
-                "Verified silence in this moment."
-            isPartialWindowRepair ->
-                "Partially verified ${validCandidates.size} line(s); untouched sections preserved."
-            lockedInsideWindow.isNotEmpty() ->
-                "Updated ${validCandidates.size} line(s) · preserved ${lockedInsideWindow.size} manual edit(s)."
-            else ->
-                "Updated ${validCandidates.size} dialogue line(s) in this moment."
-        }
-
-        val healedBeacon = beacon.copy(
-            status = if (isPartialWindowRepair) HealBeaconStatus.NEEDS_ATTENTION else HealBeaconStatus.HEALED,
-            updatedAtEpochMs = nowEpochMs,
+        val updated = beacon.copy(
+            status = if (success && !uncertain) HealBeaconStatus.HEALED else HealBeaconStatus.NEEDS_ATTENTION,
             attemptCount = beacon.attemptCount + 1,
-            repairRevision = beacon.repairRevision + 1,
-            preHealSnapshotEvents = snapshotToStore,
-            replacedEventIds = validCandidates.map { it.id },
-            statusNote = summary,
-            changeSummary = summary,
-            beforeSampleText = beforeSample,
-            afterSampleText = afterSample,
+            updatedAtEpochMs = nowEpochMs,
+            statusNote = note, changeSummary = note,
+            beforeSampleText = changed.firstOrNull()?.let { it.translatedText.ifBlank { it.sourceText } }.orEmpty(),
+            afterSampleText = appliedEvents.firstOrNull()?.let { it.translatedText.ifBlank { it.sourceText } }.orEmpty(),
+            preHealSnapshotEvents = if (appliedEvents.isEmpty()) beacon.preHealSnapshotEvents else changed,
+            postHealSnapshotEvents = appliedEvents.ifEmpty { beacon.postHealSnapshotEvents },
+            replacedEventIds = if (appliedEvents.isEmpty()) beacon.replacedEventIds else appliedEvents.map { it.id },
         )
-
-        val updatedProject = project.copy(
-            dialogueEvents = mergedEvents,
-            healBeacons = project.healBeacons.map { if (it.id == beaconId) healedBeacon else it },
-        )
-        val modifiedIds = (replaceableInsideWindow.map { it.id } + validCandidates.map { it.id }).toSet()
-
-        return LocalizedRepairOutcome(
-            updatedProject = updatedProject,
-            updatedBeacon = healedBeacon,
-            applied = true,
-            replacedCount = validCandidates.size,
-            preservedLockedCount = lockedInsideWindow.size,
-            preservedIdentityCount = preservedIdentityCount,
-            modifiedEventIds = modifiedIds,
-            reason = summary,
-        )
+        val dialogue = if (appliedEvents.isEmpty()) project.dialogueEvents else
+            (project.dialogueEvents.map { replacements[it.id] ?: it } + additions.values)
+                .sortedWith(compareBy<DialogueEvent> { it.startTimeMs }.thenBy { it.endTimeMs })
+        return LocalizedRepairOutcome(project.copy(
+            dialogueEvents = dialogue,
+            healBeacons = project.healBeacons.map { if (it.id == beaconId) updated else it },
+        ), updated, success, appliedEvents.size, locked.size, note, changed.size, appliedEvents.mapTo(mutableSetOf()) { it.id })
     }
 
-    /**
-     * Reverts a healed beacon back to its pre-heal snapshot while preserving unaffected cues
-     * and any user-locked edits made after the heal. Transitions status to [HealBeaconStatus.UNDONE].
-     */
+    fun windowEvents(project: DialogueLensProject, beacon: HealBeacon): List<DialogueEvent> =
+        project.dialogueEvents.filter { it.startTimeMs < beacon.windowEndMs && it.endTimeMs > beacon.windowStartMs }
+
     fun undoBeaconRepair(
         project: DialogueLensProject,
         beaconId: String,
         nowEpochMs: Long = System.currentTimeMillis(),
     ): DialogueLensProject {
         val beacon = project.healBeacons.firstOrNull { it.id == beaconId } ?: return project
-        if (beacon.status != HealBeaconStatus.HEALED && beacon.status != HealBeaconStatus.NEEDS_ATTENTION) return project
-        if (beacon.preHealSnapshotEvents.isEmpty() && beacon.replacedEventIds.isEmpty()) return project
-
-        val replacedIds = beacon.replacedEventIds.toSet()
-        val withoutReplaced = project.dialogueEvents.filterNot { evt ->
-            evt.id in replacedIds && !evt.lockedByUser
+        if (beacon.status == HealBeaconStatus.HEALING || beacon.status == HealBeaconStatus.UNDONE ||
+            (beacon.replacedEventIds.isEmpty() && beacon.preHealSnapshotEvents.isEmpty() && beacon.preRepairCoverage.isEmpty())) return project
+        val expected = beacon.postHealSnapshotEvents.associateBy { it.id }
+        val original = beacon.preHealSnapshotEvents.associateBy { it.id }
+        val legacy = expected.isEmpty()
+        val correctedIds = project.corrections.mapTo(mutableSetOf()) { it.eventId }
+        var skipped = false
+        val result = project.dialogueEvents.mapNotNull { current ->
+            if (current.id !in beacon.replacedEventIds) return@mapNotNull current
+            if (legacy || current.lockedByUser || current.id in correctedIds || expected[current.id] != current) {
+                skipped = true
+                current
+            } else original[current.id]
+        }.toMutableList()
+        if (legacy) {
+            // Older projects used fresh IDs on every repair. Do not duplicate a later user edit.
+            for (old in original.values) {
+                if (result.none { it.id == old.id || it.startTimeMs < old.endTimeMs && it.endTimeMs > old.startTimeMs }) result.add(old)
+            }
         }
-        val existingIds = withoutReplaced.map { it.id }.toSet()
-        val restoredOriginals = beacon.preHealSnapshotEvents.filter { it.id !in existingIds }
-
-        val mergedEvents = (withoutReplaced + restoredOriginals)
-            .sortedWith(compareBy<DialogueEvent> { it.startTimeMs }.thenBy { it.endTimeMs })
-
-        val revertedBeacon = beacon.copy(
-            status = HealBeaconStatus.UNDONE,
-            updatedAtEpochMs = nowEpochMs,
-            repairRevision = beacon.repairRevision + 1,
-            replacedEventIds = emptyList(),
-            statusNote = "Repair undone — original dialogue restored.",
-            changeSummary = "Restored ${restoredOriginals.size} original line(s).",
-        )
-
-        return project.copy(
-            dialogueEvents = mergedEvents,
-            healBeacons = project.healBeacons.map { if (it.id == beaconId) revertedBeacon else it },
-        )
+        if (legacy && skipped) {
+            val note = "Restored available original lines. Retained current lines whose edit history could not be verified."
+            val reviewed = beacon.copy(status = HealBeaconStatus.NEEDS_ATTENTION, statusNote = note)
+            return project.copy(dialogueEvents = result.sortedBy { it.startTimeMs },
+                healBeacons = project.healBeacons.map { if (it.id == beaconId) reviewed else it })
+        }
+        val undone = beacon.copy(status = HealBeaconStatus.UNDONE, replacedEventIds = emptyList(),
+            preHealSnapshotEvents = emptyList(), postHealSnapshotEvents = emptyList(), preRepairCoverage = emptyList(), coverageRepairToken = null,
+            updatedAtEpochMs = nowEpochMs, revision = beacon.revision + 1,
+            statusNote = if (skipped) "Repair undone where safe. Later edits were preserved." else "Repair undone. Original dialogue restored.")
+        return project.copy(dialogueEvents = result.sortedWith(compareBy<DialogueEvent> { it.startTimeMs }.thenBy { it.endTimeMs }),
+            healBeacons = project.healBeacons.map { if (it.id == beaconId) undone else it })
     }
 
     fun dismissBeacon(project: DialogueLensProject, beaconId: String): DialogueLensProject =
@@ -535,18 +440,7 @@ object HealBeaconEngine {
 
     private fun temporalOverlapFraction(aStart: Long, aEnd: Long, bStart: Long, bEnd: Long): Float {
         val overlap = (minOf(aEnd, bEnd) - maxOf(aStart, bStart)).coerceAtLeast(0L)
-        val minDur = minOf(aEnd - aStart, bEnd - bStart).coerceAtLeast(1L)
-        return overlap.toFloat() / minDur.toFloat()
-    }
-
-    private fun normalizedTokenSimilarity(a: String, b: String): Float {
-        val tokensA = a.lowercase().replace(Regex("[^\\p{L}\\p{N}\\s]"), " ")
-            .split(Regex("\\s+")).filter { it.isNotBlank() }.toSet()
-        val tokensB = b.lowercase().replace(Regex("[^\\p{L}\\p{N}\\s]"), " ")
-            .split(Regex("\\s+")).filter { it.isNotBlank() }.toSet()
-        if (tokensA.isEmpty() || tokensB.isEmpty()) return 0f
-        val intersection = tokensA.intersect(tokensB).size
-        val union = tokensA.union(tokensB).size
-        return if (union == 0) 0f else intersection.toFloat() / union.toFloat()
+        val unionMs = (maxOf(aEnd, bEnd) - minOf(aStart, bStart)).coerceAtLeast(1L)
+        return overlap.toFloat() / unionMs.toFloat()
     }
 }

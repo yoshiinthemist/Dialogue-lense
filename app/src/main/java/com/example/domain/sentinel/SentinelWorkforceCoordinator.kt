@@ -2,6 +2,7 @@ package com.example.domain.sentinel
 
 import com.example.data.model.ChapterSource
 import com.example.data.model.CoverageStatus
+import com.example.data.model.HealBeaconStatus
 import com.example.data.model.DialogueLensProject
 import com.example.data.model.QuotaSaverMode
 import com.example.data.model.VideoChapter
@@ -33,7 +34,7 @@ enum class ChapterInspectionStatus(val label: String) {
     NOT_INSPECTED("Not inspected"),
     INSPECTION_QUEUED("Inspection queued"),
     INSPECTING("Inspecting"),
-    INSPECTED_WITHOUT_DEFECTS("Verified"),
+    INSPECTED_WITHOUT_DEFECTS("Local checks passed"),
     REPAIR_REQUIRED("Repair required"),
     REPAIR_IN_PROGRESS("Repairing"),
     REPAIR_VERIFIED("Repair verified"),
@@ -170,6 +171,39 @@ class SentinelWorkforceCoordinator {
         }
     }
 
+    /** Reflect durable work and history in the live queue. The project remains authoritative across restarts. */
+    fun syncWithProject(project: DialogueLensProject) = synchronized(lock) {
+        if (projectId != project.id) resetForProject(project)
+        planDefaultChapterPatrolLocked(project)
+        val marked = project.healBeacons.filter { it.status == HealBeaconStatus.MARKED }
+        val currentIds = marked.mapTo(mutableSetOf()) { it.id }
+        queue.removeAll { item -> item.beaconId != null && item.beaconId !in currentIds }
+        for (mark in marked) {
+            val item = SentinelWorkItem(id = mark.id, beaconId = mark.id,
+                tier = if (mark.autoTriggered) SentinelPriorityTier.PREVENTIVE_MAINTENANCE else SentinelPriorityTier.USER_DIRECTED_REPAIR,
+                kind = SentinelTaskKind.USER_HEAL_BEACON, startMs = mark.windowStartMs, endMs = mark.windowEndMs,
+                createdAtEpochMs = mark.createdAtEpochMs)
+            if (queue.none { it == item }) {
+                queue.removeAll { it.beaconId == mark.id }
+                enqueueLocked(item)
+            }
+        }
+        val inspected = project.chapterInspections.associateBy { it.chapterId }
+        for ((id, record) in chapterRecords.toMap()) {
+            val check = inspected[id]?.takeIf { it.boundaryMs == record.boundaryMs } ?: continue
+            val mark = project.healBeacons.firstOrNull { it.id == check.beaconId }
+            val status = when {
+                check.finding.isBlank() -> ChapterInspectionStatus.INSPECTED_WITHOUT_DEFECTS
+                mark?.status == HealBeaconStatus.HEALED -> ChapterInspectionStatus.REPAIR_VERIFIED
+                mark?.status == HealBeaconStatus.HEALING -> ChapterInspectionStatus.REPAIR_IN_PROGRESS
+                else -> ChapterInspectionStatus.REPAIR_REQUIRED
+            }
+            chapterRecords[id] = record.copy(status = status, summary = mark?.statusNote?.ifBlank { check.finding }
+                ?: check.finding.ifBlank { "Transcript and pointer checks passed." }, updatedAtEpochMs = check.checkedAtEpochMs)
+            queue.removeAll { it.chapterId == id && it.kind == SentinelTaskKind.CHAPTER_BOUNDARY_PATROL }
+        }
+    }
+
     fun updateRuntimeConditions(
         quotaMode: QuotaSaverMode = this.quotaMode,
         isPlaybackBuffering: Boolean = this.isPlaybackBuffering,
@@ -214,11 +248,8 @@ class SentinelWorkforceCoordinator {
     }
 
     private fun planDefaultChapterPatrolLocked(project: DialogueLensProject) {
-        val durationMs = maxOf(
-            project.videoSource.durationMs,
-            project.chapters.maxOfOrNull { it.endMs } ?: 0L,
-            project.dialogueEvents.maxOfOrNull { it.endTimeMs } ?: 0L,
-        )
+        val durationMs = project.videoSource.durationMs.takeIf { it > 0L }
+            ?: maxOf(project.chapters.maxOfOrNull { it.endMs } ?: 0L, project.dialogueEvents.maxOfOrNull { it.endTimeMs } ?: 0L)
         if (durationMs <= 0L) return
 
         val namedBoundaries = project.chapters
@@ -418,10 +449,11 @@ class SentinelWorkforceCoordinator {
     fun claimNextWork(
         workerId: String,
         nowEpochMs: Long = System.currentTimeMillis(),
+        eligible: (SentinelWorkItem) -> Boolean = { true },
     ): Pair<SentinelWorkItem, IntervalReservation>? = synchronized(lock) {
         val activeCount = workers.values.count { it.isActive }
         val isWorkerAlreadyActive = workers[workerId]?.isActive == true
-        if (!isWorkerAlreadyActive && activeCount >= maxAllowedWorkersLocked()) {
+        if (isWorkerAlreadyActive || activeCount >= maxAllowedWorkersLocked()) {
             return@synchronized null
         }
 
@@ -429,6 +461,7 @@ class SentinelWorkforceCoordinator {
         val iterator = queue.iterator()
         while (iterator.hasNext()) {
             val item = iterator.next()
+            if (!eligible(item)) continue
             if (suspendPatrol && item.tier.rank >= SentinelPriorityTier.PREVENTIVE_MAINTENANCE.rank) {
                 continue
             }
@@ -462,6 +495,14 @@ class SentinelWorkforceCoordinator {
             return@synchronized item to reservation
         }
         null
+    }
+
+    fun yieldWorkersToPlayback() {
+        synchronized(lock) {
+            // Only Sentinel-owned reservations are eligible for preemption.
+            reservations.entries.removeAll { it.value.ownerId in workers }
+            workers.keys.toList().forEach { id -> workers[id] = SentinelWorkerState(id, isActive = false) }
+        }
     }
 
     fun markWorkerIdle(workerId: String, reservationId: String? = null, repairCompleted: Boolean = false) {
@@ -529,7 +570,7 @@ class SentinelWorkforceCoordinator {
         // 2. Missing post-boundary dialogue when post-boundary coverage is unverified/failed
         val postStatus = ledger.coverageStatusAt(boundary + 2_000L)
         val postLead = ledger.continuousVerifiedLeadFrom(boundary)
-        if (postEvents.isEmpty() && postStatus != CoverageStatus.VERIFIED_SILENCE && postLead < 5_000L) {
+        if (postEvents.isEmpty() && postStatus in setOf(CoverageStatus.FAILED, CoverageStatus.PARTIAL_RECOVERY) && postLead < 5_000L) {
             anomalies.add(ChapterBoundaryAnomalyKind.MISSING_POST_BOUNDARY_DIALOGUE)
         }
 
@@ -548,7 +589,7 @@ class SentinelWorkforceCoordinator {
 
         val summary = if (anomalies.isEmpty()) {
             totalLocalCleanChapterChecks++
-            "Verified clean locally — no cloud repair needed"
+            "Transcript and pointer checks passed."
         } else {
             anomalies.joinToString(" · ") { it.label }
         }

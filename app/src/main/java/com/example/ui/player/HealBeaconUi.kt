@@ -1,5 +1,7 @@
 package com.example.ui.player
 
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -75,6 +77,7 @@ import com.example.ui.theme.ConfidenceMediumColor
 import com.example.ui.theme.InkMuted
 import com.example.ui.theme.InkPrimary
 import com.example.ui.theme.InkSecondary
+import com.example.ui.theme.LensAmethyst
 import com.example.ui.theme.LensSky
 import com.example.ui.theme.SoftJade
 import com.example.ui.theme.WarmAmber
@@ -234,6 +237,45 @@ fun formatBeaconTimestamp(ms: Long): String {
     }
 }
 
+@Composable
+fun RepairComparison(beacon: HealBeacon) {
+    val changes = beacon.postHealSnapshotEvents
+    if (changes.isEmpty()) return
+    var index by remember(beacon.id, changes) { mutableStateOf(-1) }
+    TextButton(onClick = { index = if (index >= 0) -1 else 0 }) {
+        Text(if (index >= 0) "Close comparison" else "Review changes (${changes.size})")
+    }
+    val after = changes.getOrNull(index) ?: return
+    val before = beacon.preHealSnapshotEvents.firstOrNull { it.id == after.id }
+    val newText = after.translatedText.ifBlank { after.sourceText }
+    val oldText = before?.translatedText?.ifBlank { before.sourceText }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("Line ${index + 1} of ${changes.size} · ${formatBeaconTimestamp(after.startTimeMs)}",
+            style = MaterialTheme.typography.labelMedium)
+        when {
+            before == null -> Text("Added dialogue")
+            oldText != newText -> {
+                Text("Before", style = MaterialTheme.typography.labelSmall)
+                Text(oldText.orEmpty())
+                Text("After", style = MaterialTheme.typography.labelSmall)
+            }
+            else -> {
+                val details = buildList {
+                    if (before.startTimeMs != after.startTimeMs || before.endTimeMs != after.endTimeMs) add("Timing adjusted")
+                    if (before.speakerId != after.speakerId) add("Speaker reassigned")
+                    if (before.anchorPosition != after.anchorPosition || before.placementMode != after.placementMode) add("Position adjusted")
+                }
+                if (details.isNotEmpty()) Text(details.joinToString(" · "), style = MaterialTheme.typography.labelMedium)
+            }
+        }
+        Text(newText)
+        if (changes.size > 1) Row {
+            TextButton(enabled = index > 0, onClick = { index-- }) { Text("Previous line") }
+            TextButton(enabled = index < changes.lastIndex, onClick = { index++ }) { Text("Next line") }
+        }
+    }
+}
+
 /**
  * Contextual Bottom Sheet for inspecting, jumping to, retrying with an expanded scope or problem hint,
  * previewing before/after repair changes, undoing, or dismissing a single Heal Beacon.
@@ -253,8 +295,8 @@ fun HealBeaconDetailSheet(
     var selectedScope by remember(beacon.id, beacon.scope) { mutableStateOf(beacon.scope) }
     var selectedHint by remember(beacon.id, beacon.problemHint) { mutableStateOf(beacon.problemHint) }
     val statusColor = healBeaconColor(beacon.status)
-    val canUndo = beacon.status == HealBeaconStatus.HEALED &&
-        (beacon.preHealSnapshotEvents.isNotEmpty() || beacon.replacedEventIds.isNotEmpty())
+    val canUndo = beacon.status !in setOf(HealBeaconStatus.HEALING, HealBeaconStatus.UNDONE) &&
+        (beacon.preHealSnapshotEvents.isNotEmpty() || beacon.replacedEventIds.isNotEmpty() || beacon.preRepairCoverage.isNotEmpty())
 
     ModalBottomSheet(
         onDismissRequest = onDismissSheet,
@@ -265,6 +307,7 @@ fun HealBeaconDetailSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 8.dp)
                 .padding(bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -332,6 +375,8 @@ fun HealBeaconDetailSheet(
                 }
             }
 
+            RepairComparison(beacon)
+
             if (beacon.statusNote.isNotBlank() || beacon.changeSummary.isNotBlank()) {
                 Surface(
                     shape = RoundedCornerShape(12.dp),
@@ -357,7 +402,7 @@ fun HealBeaconDetailSheet(
                                 color = SoftJade,
                             )
                         }
-                        if (beacon.beforeSampleText.isNotBlank() || beacon.afterSampleText.isNotBlank()) {
+                        if (beacon.postHealSnapshotEvents.isEmpty() && (beacon.beforeSampleText.isNotBlank() || beacon.afterSampleText.isNotBlank())) {
                             HorizontalDivider(color = CinemaBorder)
                             if (beacon.beforeSampleText.isNotBlank()) {
                                 Text(

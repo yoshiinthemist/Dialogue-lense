@@ -1,0 +1,114 @@
+name: Android verification
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      signed_bundle:
+        description: Build a signed Play bundle from main after verification
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-android-build
+      - name: Unit tests, Android lint and APKs
+        run: bash gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleDebugAndroidTest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DialogueLens-debug-${{ github.sha }}
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/androidTest/debug/*.apk
+          if-no-files-found: error
+      - name: Save verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-reports
+          path: |
+            app/build/reports/tests/
+            app/build/reports/lint-results-*.html
+          if-no-files-found: ignore
+  device:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-android-build
+      - name: Build both APKs before starting the emulator
+        run: |
+          bash gradlew --no-daemon --max-workers=2 -Pkotlin.compiler.execution.strategy=in-process :app:assembleDebug :app:assembleDebugAndroidTest
+      - name: Enable Android emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run Android instrumentation on API 35
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          ram-size: 3072M
+          disable-animations: true
+          emulator-options: >-
+            -no-window -no-snapshot -noaudio -no-boot-anim -gpu swiftshader
+            -feature -Vulkan -feature -HardwareDecoder -camera-back none -camera-front none
+          script: bash .github/scripts/run-device-tests.sh
+      - name: Save connected test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-reports
+          path: app/build/reports/androidTests/
+          if-no-files-found: ignore
+  signed-bundle:
+    if: github.event_name == 'workflow_dispatch' && inputs.signed_bundle && github.ref == 'refs/heads/main'
+    needs: [build, device]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-android-build
+      - name: Build and verify the signed release bundle
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          FIREBASE_CONFIG: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON }}
+        run: |
+          : "${KEYSTORE_BASE64:?Missing upload keystore}" "${STORE_PASSWORD:?Missing store password}"
+          : "${KEY_PASSWORD:?Missing key password}" "${FIREBASE_CONFIG:?Missing Firebase configuration}"
+          umask 077
+          export KEYSTORE_PATH="$RUNNER_TEMP/dialoguelens-upload.jks"
+          trap 'rm -f "$KEYSTORE_PATH" app/google-services.json' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          printf '%s' "$FIREBASE_CONFIG" > app/google-services.json
+          bash gradlew --no-configuration-cache :app:lintRelease :app:bundleRelease
+          bundle=app/build/outputs/bundle/release/app-release.aab
+          jarsigner -verify "$bundle"
+          keytool -list -v -keystore "$KEYSTORE_PATH" -storepass:env STORE_PASSWORD -alias upload |
+            awk '/SHA256:/ && !seen++ {print $2}' > "$RUNNER_TEMP/expected-sha256"
+          keytool -printcert -jarfile "$bundle" |
+            awk '/SHA256:/ && !seen++ {print $2}' > "$RUNNER_TEMP/bundle-sha256"
+          test -s "$RUNNER_TEMP/bundle-sha256"
+          diff "$RUNNER_TEMP/expected-sha256" "$RUNNER_TEMP/bundle-sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DialogueLens-signed-bundle-${{ github.sha }}
+          path: app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error

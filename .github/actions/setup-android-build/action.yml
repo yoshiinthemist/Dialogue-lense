@@ -1,0 +1,19 @@
+name: Set up DialogueLens Android build
+description: Prepare the SDK, Gradle cache and local debug signer.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '21'
+    - uses: gradle/actions/setup-gradle@v4
+    - name: Install the pinned Android SDK
+      shell: bash
+      run: |
+        "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36.1" "build-tools;36.0.0"
+    - name: Create runner-local debug signer
+      shell: bash
+      run: |
+        keytool -genkeypair -keystore debug.keystore -storepass android -keypass android \
+          -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 365 -dname "CN=Android Debug,O=Android,C=US"

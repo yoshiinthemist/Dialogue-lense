@@ -14,7 +14,7 @@ val CinemaBorder = Color(0xFF323D49)
 
 val InkPrimary = Color(0xFFF3F1EC)     // Warm off-white
 val InkSecondary = Color(0xFF9AA5B1)   // Muted cool gray
-val InkMuted = Color(0xFF6B7785)
+val InkMuted = Color(0xFF929FA9)
 
 // Signature 2.0 semantic accents
 val SoftJade = Color(0xFFBCE5CE)       // Primary calm action & verified coverage
@@ -25,6 +25,7 @@ val WarmAmber = Color(0xFFD5A36A)      // Attention & graceful limitation accent
 val WarmAmberContainer = Color(0xFF3A2B1A)
 
 // Legacy aliases harmonized with the 2.0 cinematic palette
+val LensAmethyst = AmethystHeal
 val LensSky = SoftJade
 val LensSkyContainer = SoftJadeContainer
 val LensAmber = WarmAmber

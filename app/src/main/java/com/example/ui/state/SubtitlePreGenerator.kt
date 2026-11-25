@@ -38,10 +38,8 @@ import com.example.domain.analysis.TranscriptionOutcome
 import com.example.domain.analysis.VideoAnalyzer
 import com.example.domain.attribution.SpeakerAttributionEngine
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeoutOrNull
 
 sealed interface SubtitlePrepState {
     data object Idle : SubtitlePrepState
@@ -207,13 +205,13 @@ class SubtitlePreGenerator(
         val restoredIntervals = if (cached != null) {
             TranscriptCoverageLedger.restoreOrMigrate(
                 cached = cached,
-                resolvedDurationMs = maxOf(cached.durationMs, cached.scoutedUpToMs, 60_000L),
+                resolvedDurationMs = cached.durationMs,
             )
         } else {
             emptyList()
         }
         if (cached != null && LookaheadWindowPlanner.hasRealSubtitles(cached.dialogueEvents)) {
-            val cachedDur = maxOf(cached.durationMs, cached.scoutedUpToMs, 60_000L)
+            val cachedDur = maxOf(cached.durationMs, cached.dialogueEvents.maxOfOrNull { it.endTimeMs } ?: 0L)
             val cacheLedger = TranscriptCoverageLedger(initialDurationMs = cachedDur, initialIntervals = restoredIntervals)
             val cachedProj = DialogueLensProject(
                 id = "yt_prep_${videoId}_${System.currentTimeMillis()}",
@@ -242,6 +240,7 @@ class SubtitlePreGenerator(
                 styleSettings = styleSettings,
                 glossary = glossary,
                 castDiscoverySummary = cached.castDiscoverySummary,
+                coverageIntervals = restoredIntervals,
             )
             val isAuthoritativeTrack = cached.subtitleSource == SubtitleSourceKind.EMBEDDED_TRACK ||
                 cached.subtitleSource == SubtitleSourceKind.UPLOADED_FILE
@@ -260,123 +259,130 @@ class SubtitlePreGenerator(
             }
         }
 
-        val skipUpfrontFreeCc = LookaheadWindowPlanner.shouldSkipUpfrontFreeCaptionSearch(
-            quotaSaverMode = quotaSaverMode,
-            quotaCircuitBreakerTripped = quotaCircuitBreakerTripped,
-        )
-
-        if (!skipUpfrontFreeCc) {
-            onProgress(
-                SubtitlePrepState.Working(
-                    title = cached?.title?.ifBlank { defaultTitle } ?: defaultTitle,
-                    sourceLabel = "Free YouTube CC",
-                    progress = 0.14f,
-                    completedWindows = 0,
-                    totalWindows = 1,
-                    cueCount = 0,
-                    speakerCount = 2,
-                    statusText = if (quotaCircuitBreakerTripped) {
-                        "Credits depleted — searching free YouTube closed captions ($0)..."
-                    } else {
-                        "Searching free YouTube closed captions ($0)..."
-                    },
-                )
-            )
-            val fetched = YouTubeCaptionFetcher.fetchMetadataAndCaptions(
-                videoId = videoId,
-                preferredSourceLanguage = sourceLanguage,
-                preferredTargetLanguage = targetLanguage,
-            )
-            if (fetched.cues.isNotEmpty()) {
-                val resolvedTitle = fetched.title?.takeIf { it.isNotBlank() } ?: (cached?.title?.ifBlank { defaultTitle } ?: defaultTitle)
-                val resolvedChannel = fetched.channelName?.takeIf { it.isNotBlank() } ?: cached?.channelName.orEmpty()
-                val resolvedDescription = fetched.description?.takeIf { it.isNotBlank() } ?: cached?.description.orEmpty()
-                val resolvedDurationMs = maxOf(
-                    fetched.durationMs ?: 0L,
-                    cached?.durationMs ?: 0L,
-                    60_000L,
-                )
-                val resolvedSrcLang = if (sourceLanguage.equals("Auto-Detect", ignoreCase = true)) {
-                    isoToFriendlyLanguage(fetched.languageCode, sourceLanguage)
+        onProgress(
+            SubtitlePrepState.Working(
+                title = cached?.title?.ifBlank { defaultTitle } ?: defaultTitle,
+                sourceLabel = "Free YouTube CC",
+                progress = 0.14f,
+                completedWindows = 0,
+                totalWindows = 1,
+                cueCount = 0,
+                speakerCount = 2,
+                statusText = if (quotaCircuitBreakerTripped) {
+                    "Credits depleted — searching free YouTube closed captions ($0)..."
                 } else {
-                    sourceLanguage
-                }
-                val ccProj = buildProjectFromCues(
-                    id = "yt_prep_${videoId}_${System.currentTimeMillis()}",
-                    title = resolvedTitle,
-                    videoUrl = youtubeUrl.trim(),
-                    videoKind = VideoSourceKind.YOUTUBE_COMPLIANT,
-                    youtubeVideoId = videoId,
-                    cues = fetched.cues,
-                    sourceLanguage = resolvedSrcLang,
-                    targetLanguage = targetLanguage,
-                    translationMode = translationMode,
-                    subtitleSource = SubtitleSourceKind.EMBEDDED_TRACK,
-                    styleSettings = styleSettings,
-                    glossary = glossary,
-                    characterColorMemory = characterColorMemory,
-                    durationHintMs = resolvedDurationMs,
-                    channelName = resolvedChannel,
-                    description = resolvedDescription,
-                )
-                val finalCcProj = maybeTranslateProjectOfflineOrCloud(
-                    project = ccProj,
-                    quotaSaverMode = quotaSaverMode,
-                    quotaCircuitBreakerTripped = quotaCircuitBreakerTripped,
-                    onQuotaTripped = onQuotaTripped,
-                    onStatus = { msg ->
-                        onProgress(
-                            SubtitlePrepState.Working(
-                                title = ccProj.title,
-                                sourceLabel = "Free YouTube CC",
-                                progress = 0.78f,
-                                completedWindows = 1,
-                                totalWindows = 1,
-                                cueCount = ccProj.dialogueEvents.size,
-                                speakerCount = ccProj.speakers.size,
-                                statusText = msg,
-                                partialProject = ccProj,
-                            )
-                        )
-                    },
-                )
-                saveCacheEntry(finalCcProj, finalCcProj.videoSource.durationMs)
-                onProgress(
-                    SubtitlePrepState.Ready(
-                        generatedProject = finalCcProj,
-                        sourceLabel = "Free YouTube CC ($0)",
-                        cueCount = finalCcProj.dialogueEvents.size,
-                        speakerCount = finalCcProj.speakers.size,
-                        note = "Captured free native YouTube captions and cached for instant playback.",
-                    )
-                )
-                return
-            }
-
-            val reason = if (quotaCircuitBreakerTripped) {
-                "Credits depleted and no free YouTube CC track was exposed — open stream to capture player captions or attach an .srt."
+                    "Searching free YouTube closed captions ($0)..."
+                },
+            )
+        )
+        val fetched = YouTubeCaptionFetcher.fetchMetadataAndCaptions(
+            videoId = videoId,
+            preferredSourceLanguage = sourceLanguage,
+            preferredTargetLanguage = targetLanguage,
+        )
+        if (fetched.restricted) {
+            onProgress(SubtitlePrepState.Error("This video restricts dialogue access. Use the player’s captions or attach a subtitle file."))
+            return
+        }
+        if (fetched.cues.isNotEmpty()) {
+            val resolvedTitle = fetched.title?.takeIf { it.isNotBlank() } ?: (cached?.title?.ifBlank { defaultTitle } ?: defaultTitle)
+            val resolvedChannel = fetched.channelName?.takeIf { it.isNotBlank() } ?: cached?.channelName.orEmpty()
+            val resolvedDescription = fetched.description?.takeIf { it.isNotBlank() } ?: cached?.description.orEmpty()
+            val resolvedDurationMs = maxOf(
+                fetched.durationMs ?: 0L,
+                cached?.durationMs ?: 0L,
+                fetched.cues.maxOf { it.endTimeMs },
+            )
+            val resolvedSrcLang = if (sourceLanguage.equals("Auto-Detect", ignoreCase = true)) {
+                isoToFriendlyLanguage(fetched.languageCode, sourceLanguage)
             } else {
-                "No free YouTube CC track was found while Free CC Only is active. Switch to Best Model to pre-generate with Gemini 3.8 Flash."
+                sourceLanguage
+            }
+            val ccProj = buildProjectFromCues(
+                id = "yt_prep_${videoId}_${System.currentTimeMillis()}",
+                title = resolvedTitle,
+                videoUrl = youtubeUrl.trim(),
+                videoKind = VideoSourceKind.YOUTUBE_COMPLIANT,
+                youtubeVideoId = videoId,
+                cues = fetched.cues,
+                sourceLanguage = resolvedSrcLang,
+                targetLanguage = targetLanguage,
+                translationMode = translationMode,
+                subtitleSource = SubtitleSourceKind.EMBEDDED_TRACK,
+                styleSettings = styleSettings,
+                glossary = glossary,
+                characterColorMemory = characterColorMemory,
+                durationHintMs = resolvedDurationMs,
+                channelName = resolvedChannel,
+                description = resolvedDescription,
+            )
+            val translated = maybeTranslateProjectOfflineOrCloud(
+                project = ccProj,
+                quotaSaverMode = quotaSaverMode,
+                quotaCircuitBreakerTripped = quotaCircuitBreakerTripped,
+                onQuotaTripped = onQuotaTripped,
+                onStatus = { msg ->
+                    onProgress(
+                        SubtitlePrepState.Working(
+                            title = ccProj.title,
+                            sourceLabel = "Free YouTube CC",
+                            progress = 0.78f,
+                            completedWindows = 1,
+                            totalWindows = 1,
+                            cueCount = ccProj.dialogueEvents.size,
+                            speakerCount = ccProj.speakers.size,
+                            statusText = msg,
+                            partialProject = ccProj,
+                        )
+                    )
+                },
+            )
+            val finalCcProj = translated.copy(
+                speakers = (cached?.speakers.orEmpty() + translated.speakers).distinctBy { it.id },
+                dialogueEvents = LookaheadWindowPlanner.mergeNativeTrack(
+                    cached?.dialogueEvents.orEmpty(), translated.dialogueEvents, restoredIntervals,
+                ),
+                chapters = fetched.chapters,
+            )
+            saveCacheEntry(finalCcProj, finalCcProj.videoSource.durationMs)
+            onProgress(
+                SubtitlePrepState.Ready(
+                    generatedProject = finalCcProj,
+                    sourceLabel = "Free YouTube CC ($0)",
+                    cueCount = finalCcProj.dialogueEvents.size,
+                    speakerCount = finalCcProj.speakers.size,
+                    note = "Captured free native YouTube captions and cached for instant playback.",
+                )
+            )
+            return
+        }
+
+        if (quotaCircuitBreakerTripped || quotaSaverMode == QuotaSaverMode.ZERO_CLOUD) {
+            val reason = if (quotaCircuitBreakerTripped) {
+                "Credits depleted and no native captions were available. Use the player’s captions or attach a subtitle file."
+            } else {
+                "No native YouTube captions were available. Use the player’s captions or attach a subtitle file."
             }
             onProgress(SubtitlePrepState.Error(reason))
             return
         }
 
-        // Best-Model-First / Lite-First path: start AI immediately without blocking 8-10s on Free CC endpoints.
-        coroutineScope {
-            val fastMetaDeferred = async {
-                runCatching { YouTubeCaptionFetcher.fetchFastMetadataOnly(videoId) }.getOrNull()
-            }
 
+        // Native captions were unavailable. Use the selected analysis tier for unresolved intervals.
+        coroutineScope {
             var activeTier = LookaheadWindowPlanner.initialExecutionTier(
                 quotaSaverMode = quotaSaverMode,
                 quotaCircuitBreakerTripped = false,
             )
-            val initialDurationMs = maxOf(cached?.durationMs ?: 0L, 180_000L)
-            var durationSec = (initialDurationMs / 1000L).toInt().coerceAtLeast(60)
+            val initialDurationMs = fetched.durationMs?.takeIf { it > 0L } ?: cached?.durationMs?.takeIf { it > 0L }
+            if (initialDurationMs == null) {
+                onProgress(SubtitlePrepState.Error("Video duration is unavailable. Open the video in Watch or attach a subtitle file."))
+                return@coroutineScope
+            }
+            val durationSec = ((initialDurationMs + 999L) / 1000L).toInt().coerceAtLeast(1)
             var workingProj = DialogueLensProject(
                 id = "yt_prep_${videoId}_${System.currentTimeMillis()}",
-                title = cached?.title?.ifBlank { defaultTitle } ?: defaultTitle,
+                title = fetched.title?.takeIf { it.isNotBlank() } ?: cached?.title?.ifBlank { defaultTitle } ?: defaultTitle,
                 createdAtEpochMs = System.currentTimeMillis(),
                 sourceLanguage = sourceLanguage,
                 targetLanguage = targetLanguage,
@@ -391,33 +397,18 @@ class SubtitlePreGenerator(
                     width = 1920,
                     height = 1080,
                     youtubeVideoId = videoId,
-                    channelName = cached?.channelName.orEmpty(),
-                    description = cached?.description.orEmpty(),
+                    channelName = fetched.channelName ?: cached?.channelName.orEmpty(),
+                    description = fetched.description ?: cached?.description.orEmpty(),
                 ),
                 shots = listOf(Shot("shot_1", 0L, initialDurationMs, cutType = "EMBEDDED_YOUTUBE")),
                 speakers = cached?.speakers?.ifEmpty { defaultSpeakers() } ?: defaultSpeakers(),
+                chapters = fetched.chapters,
                 faceTracks = emptyList(),
                 dialogueEvents = cached?.dialogueEvents.orEmpty(),
                 styleSettings = styleSettings,
                 glossary = glossary,
                 castDiscoverySummary = cached?.castDiscoverySummary.orEmpty(),
             )
-
-            // Peek up to 350ms for instant title/duration without stalling opening AI call
-            val quickMeta = withTimeoutOrNull(350L) { fastMetaDeferred.await() }
-            if (quickMeta != null) {
-                val quickDur = maxOf(workingProj.videoSource.durationMs, quickMeta.durationMs ?: 0L)
-                durationSec = (quickDur / 1000L).toInt().coerceAtLeast(60)
-                workingProj = workingProj.copy(
-                    title = quickMeta.title?.takeIf { it.isNotBlank() } ?: workingProj.title,
-                    videoSource = workingProj.videoSource.copy(
-                        durationMs = quickDur,
-                        channelName = quickMeta.channelName?.takeIf { it.isNotBlank() } ?: workingProj.videoSource.channelName,
-                        description = quickMeta.description?.takeIf { it.isNotBlank() } ?: workingProj.videoSource.description,
-                    ),
-                    shots = listOf(Shot("shot_1", 0L, quickDur, cutType = "EMBEDDED_YOUTUBE")),
-                )
-            }
 
             val hintMap = mutableMapOf<String, AiTranslatedLine>()
             var currentColorMemory = characterColorMemory
@@ -429,28 +420,6 @@ class SubtitlePreGenerator(
             awaitWarmAppCheckToken(forceRefresh = false, timeoutMs = 4_000L)
 
             while (true) {
-                if (fastMetaDeferred.isCompleted) {
-                    val resolvedMeta = runCatching { fastMetaDeferred.getCompleted() }.getOrNull()
-                    if (resolvedMeta != null) {
-                        val metaDur = maxOf(workingProj.videoSource.durationMs, resolvedMeta.durationMs ?: 0L)
-                        if (metaDur != workingProj.videoSource.durationMs ||
-                            (!resolvedMeta.title.isNullOrBlank() && workingProj.title == defaultTitle)
-                        ) {
-                            durationSec = (metaDur / 1000L).toInt().coerceAtLeast(60)
-                            ledger.updateDuration(metaDur)
-                            workingProj = workingProj.copy(
-                                title = resolvedMeta.title?.takeIf { it.isNotBlank() } ?: workingProj.title,
-                                videoSource = workingProj.videoSource.copy(
-                                    durationMs = metaDur,
-                                    channelName = resolvedMeta.channelName?.takeIf { it.isNotBlank() } ?: workingProj.videoSource.channelName,
-                                    description = resolvedMeta.description?.takeIf { it.isNotBlank() } ?: workingProj.videoSource.description,
-                                ),
-                                shots = listOf(Shot("shot_1", 0L, metaDur, cutType = "EMBEDDED_YOUTUBE")),
-                            )
-                        }
-                    }
-                }
-
                 val nextInterval = ledger.nextPriorityInterval(
                     playheadMs = 0L,
                     maxRetryAttempts = 3,
@@ -575,11 +544,11 @@ class SubtitlePreGenerator(
                             styleSettings = styleSettings,
                             glossary = glossary,
                             characterColorMemory = currentColorMemory,
-                            durationHintMs = maxOf(workingProj.videoSource.durationMs, fallbackCc.durationMs ?: 0L, 60_000L),
+                            durationHintMs = fallbackCc.durationMs?.takeIf { it > 0L } ?: workingProj.videoSource.durationMs,
                             channelName = fallbackCc.channelName?.takeIf { it.isNotBlank() } ?: workingProj.videoSource.channelName,
                             description = fallbackCc.description?.takeIf { it.isNotBlank() } ?: workingProj.videoSource.description,
                         )
-                        val translatedCc = maybeTranslateProjectOfflineOrCloud(
+                        val nativeTranslation = maybeTranslateProjectOfflineOrCloud(
                             project = ccProj,
                             quotaSaverMode = QuotaSaverMode.ZERO_CLOUD,
                             quotaCircuitBreakerTripped = true,
@@ -599,6 +568,13 @@ class SubtitlePreGenerator(
                                     )
                                 )
                             },
+                        )
+                        val translatedCc = nativeTranslation.copy(
+                            speakers = (workingProj.speakers + nativeTranslation.speakers).distinctBy { it.id },
+                            dialogueEvents = LookaheadWindowPlanner.mergeNativeTrack(
+                                workingProj.dialogueEvents, nativeTranslation.dialogueEvents, ledger.intervalsSnapshot(),
+                            ),
+                            chapters = fallbackCc.chapters.ifEmpty { workingProj.chapters },
                         )
                         val ccLedger = TranscriptCoverageLedger().apply {
                             markAuthoritativeTrack(
@@ -637,7 +613,7 @@ class SubtitlePreGenerator(
                         val partialSum = ledger.summary()
                         onProgress(
                             SubtitlePrepState.Ready(
-                                generatedProject = workingProj,
+                                generatedProject = workingProj.copy(coverageIntervals = ledger.intervalsSnapshot()),
                                 sourceLabel = "${activeTier.displayLabel} (Partial)",
                                 cueCount = workingProj.dialogueEvents.size,
                                 speakerCount = workingProj.speakers.size,
@@ -663,10 +639,13 @@ class SubtitlePreGenerator(
                 if (completed.invalidTimestampCount > 0) ledger.recordInvalidOrAmbiguousTimestamp(completed.invalidTimestampCount)
                 if (completed.quotaFallbackTransitions > 0) ledger.recordQuotaFallbackTransition()
 
-                if (completed.speakerUpdates.isNotEmpty() || completed.summary.isNotBlank()) {
+                val (reconciledCues, reconciledSpeakers, _) = reconcileWindowOutcomeSpeakersAndCues(
+                    workingProj.speakers, completed.cues, completed.speakerUpdates,
+                )
+                if (reconciledSpeakers.isNotEmpty() || completed.summary.isNotBlank()) {
                     val (castMerged, updatedMem) = mergeCastSlotAssignments(
                         project = workingProj,
-                        assignments = completed.speakerUpdates,
+                        assignments = reconciledSpeakers,
                         rememberedColors = currentColorMemory,
                         reconcileColors = attributionEngine::reconcileCharacterColors,
                         summary = completed.summary,
@@ -676,9 +655,10 @@ class SubtitlePreGenerator(
                     workingProj = castMerged
                 }
 
-                if (completed.cues.isNotEmpty()) {
+                var windowEvidence = emptyList<DialogueEvent>()
+                if (reconciledCues.isNotEmpty()) {
                     val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
-                    val windowEvents = completed.cues.map { cue ->
+                    val windowEvents = reconciledCues.map { cue ->
                         val eventId = SubtitleParser.newEventId()
                         val isNonSpeaker = cue.dialogueType == DialogueType.SOUND_DESCRIPTION ||
                             cue.dialogueType == DialogueType.NARRATION
@@ -687,6 +667,9 @@ class SubtitlePreGenerator(
                             NormalizedPoint(cue.anchorX, cue.anchorY)
                         } else null
                         val slotUpper = cue.suggestedSpeakerSlot.trim().uppercase()
+                        val recognizedSpeaker = if (!isNonSpeaker && slotUpper in validSlots) {
+                            workingProj.speakers.firstOrNull { it.id.equals("spk_${slotUpper.lowercase()}", ignoreCase = true) }
+                        } else null
                         hintMap[eventId] = AiTranslatedLine(
                             id = eventId,
                             naturalTranslation = cue.naturalTranslation,
@@ -706,8 +689,8 @@ class SubtitlePreGenerator(
                             translatedText = cue.naturalTranslation,
                             literalText = cue.literalTranslation,
                             romanization = cue.romanization,
-                            speakerId = null,
-                            speakerConfidence = if (slotUpper in validSlots) 0.84f else 0.42f,
+                            speakerId = recognizedSpeaker?.id,
+                            speakerConfidence = if (recognizedSpeaker != null) 0.84f else 0.42f,
                             faceTrackId = null,
                             faceConfidence = if (spatialAnchor != null) 0.78f else 0f,
                             shotId = "shot_1",
@@ -736,6 +719,7 @@ class SubtitlePreGenerator(
                         windowStartMs = sliceStartMs,
                         windowEndMs = sliceEndMs,
                     )
+                    windowEvidence = mergeReport.windowEvidence
                     ledger.recordDuplicateDecisions(mergeReport.decisions)
                     val (attributedSpeakers, attributedEvents) = attributionEngine.assignSpeakers(
                         events = mergeReport.events,
@@ -761,7 +745,7 @@ class SubtitlePreGenerator(
                 completed.verifiedDialogueRanges.forEach { (vs, ve) ->
                     val sMs = vs * 1000L
                     val eMs = minOf(workingProj.videoSource.durationMs, ve * 1000L)
-                    val count = workingProj.dialogueEvents.count { it.startTimeMs in sMs until eMs }
+                    val count = windowEvidence.count { it.startTimeMs in sMs until eMs }
                     if (count > 0) {
                         ledger.recordOutcome(
                             startMs = sMs,
@@ -870,7 +854,7 @@ class SubtitlePreGenerator(
                 if (hasRealDialogue) {
                     onProgress(
                         SubtitlePrepState.Ready(
-                            generatedProject = workingProj,
+                            generatedProject = workingProj.copy(coverageIntervals = ledger.intervalsSnapshot()),
                             sourceLabel = if (isFullyVerified) "${activeTier.displayLabel} · Cached" else "${activeTier.displayLabel} · Partial",
                             cueCount = workingProj.dialogueEvents.size,
                             speakerCount = workingProj.speakers.size,
@@ -915,7 +899,7 @@ class SubtitlePreGenerator(
             )
         )
         val metadata = videoAnalyzer.extractMetadata(videoUri)
-        val durationMs = metadata.durationMs.coerceAtLeast(10_000L)
+        val durationMs = metadata.durationMs.coerceAtLeast(0L)
         val embeddedCues = audioAnalyzer.extractEmbeddedSubtitles(videoUri)
 
         if (embeddedCues.isNotEmpty()) {
@@ -975,7 +959,7 @@ class SubtitlePreGenerator(
                     if (quotaCircuitBreakerTripped) {
                         "Credits depleted and this file has no embedded subtitle track."
                     } else {
-                        "No embedded subtitle track in this file while Zero-Cloud is active. Switch to Quota-Saver to transcribe audio."
+                        "This file has no embedded subtitle track. Attach an SRT or VTT file."
                     }
                 )
             )
@@ -1009,6 +993,7 @@ class SubtitlePreGenerator(
         var currentSpeakers = defaultSpeakers()
         val shotList = listOf(Shot("shot_1", 0L, durationMs))
 
+        val ledger = TranscriptCoverageLedger(initialDurationMs = durationMs)
         for ((idx, chunk) in chunks.withIndex()) {
             val partialProjSnapshot = if (collectedEvents.isNotEmpty()) {
                 DialogueLensProject(
@@ -1034,6 +1019,7 @@ class SubtitlePreGenerator(
                     speakers = currentSpeakers,
                     faceTracks = emptyList(),
                     dialogueEvents = SubtitleParser.applyReadingPacingGuardrails(collectedEvents),
+                    coverageIntervals = ledger.intervalsSnapshot(),
                     styleSettings = styleSettings,
                     glossary = glossary,
                 )
@@ -1115,6 +1101,15 @@ class SubtitlePreGenerator(
             }
 
             val audioResult = chunkRes.getOrThrow()
+            val status = when {
+                audioResult.outcome == TranscriptionOutcome.VERIFIED_SILENCE && audioResult.noSpeechConfirmed ->
+                    CoverageStatus.VERIFIED_SILENCE
+                audioResult.outcome == TranscriptionOutcome.DIALOGUE_DETECTED && audioResult.cues.isNotEmpty() ->
+                    CoverageStatus.VERIFIED_DIALOGUE
+                audioResult.cues.isNotEmpty() -> CoverageStatus.PARTIAL_RECOVERY
+                else -> CoverageStatus.FAILED
+            }
+            ledger.recordOutcome(chunk.startMs, chunk.endMs, status, SubtitleSourceKind.AI_DRAFT, audioResult.cues.size)
             audioResult.cues.forEach { c ->
                 val id = SubtitleParser.newEventId()
                 collectedEvents.add(
@@ -1151,8 +1146,10 @@ class SubtitlePreGenerator(
             }
         }
 
-        if (collectedEvents.isEmpty()) {
-            onProgress(SubtitlePrepState.Error("Transcription produced 0 spoken lines for this video."))
+        val coverage = ledger.summary()
+        val hasVerifiedSilence = ledger.intervalsSnapshot().any { it.status == CoverageStatus.VERIFIED_SILENCE }
+        if (collectedEvents.isEmpty() && !hasVerifiedSilence) {
+            onProgress(SubtitlePrepState.Error("Audio processing could not verify speech or silence in this video."))
             return
         }
 
@@ -1191,6 +1188,7 @@ class SubtitlePreGenerator(
             speakers = currentSpeakers,
             faceTracks = emptyList(),
             dialogueEvents = attributed,
+            coverageIntervals = ledger.intervalsSnapshot(),
             styleSettings = styleSettings,
             glossary = glossary,
         )
@@ -1200,7 +1198,12 @@ class SubtitlePreGenerator(
                 sourceLabel = "${activeTier.displayLabel} Audio",
                 cueCount = attributed.size,
                 speakerCount = currentSpeakers.size,
-                note = "Generated subtitles & voice speaker splits ready for download.",
+                isPartial = !coverage.isFullyVerified,
+                note = when {
+                    !coverage.isFullyVerified -> "Verified ${(coverage.verifiedFraction * 100).toInt()}% of this video. Unchecked sections remain."
+                    attributed.isEmpty() -> "The audio was checked. No speech was detected."
+                    else -> "Subtitles and speaker assignments are ready."
+                },
             )
         )
     }
@@ -1312,7 +1315,7 @@ class SubtitlePreGenerator(
         }
 
         if (cachedUpdates.isEmpty()) return project
-        val patched = SubtitleParser.applyReadingPacingGuardrails(
+        val patched = SubtitleParser.inSourceTimeOrder(
             project.dialogueEvents.map { evt ->
                 val tr = cachedUpdates[evt.id] ?: return@map evt
                 evt.copy(translatedText = tr)
@@ -1381,7 +1384,6 @@ class SubtitlePreGenerator(
         val durationMs = maxOf(
             durationHintMs ?: 0L,
             cues.maxOfOrNull { it.endTimeMs } ?: 0L,
-            60_000L,
         )
         val cutType = when (videoKind) {
             VideoSourceKind.YOUTUBE_COMPLIANT -> "EMBEDDED_YOUTUBE"
@@ -1389,7 +1391,7 @@ class SubtitlePreGenerator(
             else -> "CUT"
         }
         val shots = listOf(Shot("shot_1", 0L, durationMs, cutType = cutType))
-        val rawEvents = SubtitleParser.applyReadingPacingGuardrails(
+        val rawEvents = SubtitleParser.inSourceTimeOrder(
             cues.map { cue ->
                 DialogueEvent(
                     id = SubtitleParser.newEventId(),

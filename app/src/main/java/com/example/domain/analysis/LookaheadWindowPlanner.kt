@@ -1,10 +1,41 @@
 package com.example.domain.analysis
 
+import com.example.data.model.CoverageInterval
 import com.example.data.model.DialogueEvent
 import com.example.data.model.DialogueLensProject
 import com.example.data.model.QuotaSaverMode
 import com.example.data.model.SubtitleSourceKind
 import kotlin.math.abs
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+/** Coalesce timeline drags before moving expensive Scout requests; the visible player seeks immediately. */
+internal class ScoutSeekRequests(private val scope: CoroutineScope, private val onSettled: (Long) -> Unit) {
+    private var pending: Job? = null
+
+    fun submit(targetMs: Long) {
+        pending?.cancel()
+        pending = scope.launch {
+            delay(200L)
+            onSettled(targetMs)
+        }
+    }
+
+    suspend fun awaitLatest() {
+        while (true) {
+            val current = pending ?: return
+            current.join()
+            if (pending === current) return
+        }
+    }
+
+    fun clear() {
+        pending?.cancel()
+        pending = null
+    }
+}
 
 enum class ScoutExecutionTier(
     val modelId: String?,
@@ -46,6 +77,10 @@ sealed interface ScoutSyncCommand {
  */
 object LookaheadWindowPlanner {
 
+    private val nonWord = Regex("[^\\p{L}\\p{N}]+")
+    private val orderedWord = Regex("[\\p{L}\\p{N}']+")
+    private val orderedSeparator = Regex("[^\\p{L}\\p{N}']+")
+
     const val LOOKAHEAD_LEAD_MS = 7_000L
     const val INTRO_MIN_BUFFER_MS = 3_000L
     const val INTRO_DURATION_MS = 18_000L
@@ -69,31 +104,40 @@ object LookaheadWindowPlanner {
             ScoutExecutionTier.BEST_AI
     }
 
-    /**
-     * When cloud AI credits are available, jump straight to the AI Scout without
-     * spending 8-10 seconds searching YouTube CC endpoints first. Only run the
-     * free CC search upfront when Zero-Cloud is selected or credits have run dry.
-     */
-    fun shouldSkipUpfrontFreeCaptionSearch(
-        quotaSaverMode: QuotaSaverMode,
-        quotaCircuitBreakerTripped: Boolean,
-    ): Boolean = quotaSaverMode != QuotaSaverMode.ZERO_CLOUD && !quotaCircuitBreakerTripped
+    fun needsNativeTrack(source: SubtitleSourceKind, events: List<DialogueEvent>, fullyVerified: Boolean): Boolean =
+        !fullyVerified && !hasLoadedSubtitlesLocked(source, events)
+
+    fun effectiveQuotaMode(requested: QuotaSaverMode, cloudConfigured: Boolean): QuotaSaverMode =
+        if (cloudConfigured) requested else QuotaSaverMode.ZERO_CLOUD
+
+    /** Retain reviewed words and edits as-is when an authoritative native track arrives late. */
+    fun mergeNativeTrack(
+        existing: List<DialogueEvent>,
+        native: List<DialogueEvent>,
+        intervals: List<CoverageInterval>,
+        correctedIds: Set<String> = emptySet(),
+    ): List<DialogueEvent> {
+        fun intersects(a: Long, b: Long, c: Long, d: Long) = a < d && c < b
+        val verified = intervals.filter { it.verified }.sortedBy { it.startMs }
+        var index = 0
+        val retained = existing.sortedBy { it.startTimeMs }.filter { cue ->
+            while (index < verified.size && verified[index].endMs <= cue.startTimeMs) index++
+            val span = verified.getOrNull(index)
+            cue.lockedByUser || cue.id in correctedIds ||
+                (span != null && intersects(cue.startTimeMs, cue.endTimeMs, span.startMs, span.endMs))
+        }
+        index = 0
+        val fill = native.sortedBy { it.startTimeMs }.filter { cue ->
+            while (index < retained.size && retained[index].endTimeMs <= cue.startTimeMs) index++
+            val previous = retained.getOrNull(index)
+            previous == null || !intersects(cue.startTimeMs, cue.endTimeMs, previous.startTimeMs, previous.endTimeMs)
+        }
+        return (retained + fill).sortedWith(compareBy<DialogueEvent> { it.startTimeMs }.thenBy { it.id })
+    }
 
     fun nextFallbackTierOnQuotaError(failedTier: ScoutExecutionTier): ScoutExecutionTier = when (failedTier) {
         ScoutExecutionTier.BEST_AI -> ScoutExecutionTier.LITE_AI
         ScoutExecutionTier.LITE_AI, ScoutExecutionTier.FREE_LOCAL -> ScoutExecutionTier.FREE_LOCAL
-    }
-
-    fun shouldAllowPassiveWebTimedTextOverride(
-        quotaSaverMode: QuotaSaverMode,
-        quotaCircuitBreakerTripped: Boolean,
-        subtitleSource: SubtitleSourceKind,
-        events: List<DialogueEvent>,
-    ): Boolean {
-        if (hasLoadedSubtitlesLocked(subtitleSource, events)) return false
-        if (quotaSaverMode == QuotaSaverMode.ZERO_CLOUD || quotaCircuitBreakerTripped) return true
-        if (quotaSaverMode == QuotaSaverMode.PRO_ACCURACY) return false
-        return !hasRealSubtitles(events)
     }
 
     fun hasRealSubtitles(events: List<DialogueEvent>): Boolean {
@@ -123,7 +167,8 @@ object LookaheadWindowPlanner {
         rollingWindowSec: Int = ROLLING_SCOUT_WINDOW_SEC,
         maxWindows: Int = 180,
     ): List<Pair<Int, Int>> {
-        val safeDur = durationSec.coerceAtLeast(30)
+        if (durationSec <= 0) return emptyList()
+        val safeDur = durationSec
         return buildList {
             add(0 to minOf(safeDur, openingWindowSec))
             var start = openingWindowSec
@@ -183,6 +228,16 @@ object LookaheadWindowPlanner {
         durationMs <= 0L || durationMs == Long.MAX_VALUE || durationMs <= 150_000L -> INTRO_DURATION_MS
         durationMs <= 480_000L -> 28_000L
         else -> 42_000L
+    }
+
+    /** Keep opaque browser recordings bounded while the recorder can seek back to uncaptured gaps. */
+    fun canAnalyzeRecording(startMs: Long, endMs: Long, active: Collection<TimeWindowRange>): Boolean =
+        endMs > startMs && active.size < 2 && active.none { it.startMs < endMs && it.endMs > startMs }
+
+    /** Keep a request already preparing the first missing instant. Otherwise reuse one distant worker. */
+    fun supersededScoutWindow(firstMissingMs: Long, active: Collection<TimeWindowRange>): TimeWindowRange? {
+        if (active.any { firstMissingMs in it.startMs until it.endMs }) return null
+        return active.maxByOrNull { maxOf(it.startMs - firstMissingMs, firstMissingMs - it.endMs) }
     }
 
     fun recommendedWorkerCount(durationMs: Long): Int = when {
@@ -408,6 +463,8 @@ object LookaheadWindowPlanner {
         val acceptedCount: Int,
         val rejectedCount: Int,
         val decisions: List<DuplicateDecisionRecord>,
+        /** Incoming cues retained or independently re-observed inside the requested window. */
+        val windowEvidence: List<DialogueEvent>,
     )
 
     fun mergeWindowDialogueEvents(
@@ -440,6 +497,7 @@ object LookaheadWindowPlanner {
         }
 
         val merged = keptExisting.toMutableList()
+        val evidence = mutableListOf<DialogueEvent>()
         val decisions = mutableListOf<DuplicateDecisionRecord>()
         var acceptedCount = 0
         var rejectedCount = 0
@@ -481,6 +539,7 @@ object LookaheadWindowPlanner {
                         abs(locked.startTimeMs - candidate.startTimeMs) <= 350L)
             }
             if (matchedLocked != null) {
+                if (candidate.startTimeMs in windowStartMs until windowEndMs) evidence.add(candidate)
                 rejectedCount++
                 decisions.add(
                     DuplicateDecisionRecord(
@@ -499,6 +558,8 @@ object LookaheadWindowPlanner {
                 areDuplicateUtterances(prev, candidate)
             }
             if (duplicateMatch != null) {
+                if (duplicateMatch.startTimeMs in windowStartMs until windowEndMs &&
+                    candidate.startTimeMs in windowStartMs until windowEndMs) evidence.add(candidate)
                 rejectedCount++
                 decisions.add(
                     DuplicateDecisionRecord(
@@ -602,6 +663,7 @@ object LookaheadWindowPlanner {
             }
 
             merged.add(stitchedCandidate)
+            if (stitchedCandidate.startTimeMs in windowStartMs until windowEndMs) evidence.add(stitchedCandidate)
             acceptedCount++
             if (decisions.size < 24) {
                 decisions.add(
@@ -620,6 +682,7 @@ object LookaheadWindowPlanner {
             acceptedCount = acceptedCount,
             rejectedCount = rejectedCount,
             decisions = decisions,
+            windowEvidence = evidence,
         )
     }
 
@@ -712,15 +775,22 @@ object LookaheadWindowPlanner {
 
     private fun tokenizeOrderedWords(raw: String): List<String> =
         raw.trim().lowercase()
-            .split(Regex("[^\\p{L}\\p{N}']+"))
+            .split(orderedSeparator)
             .filter { it.isNotBlank() }
 
     private fun dropLeadingWordsPreservingOriginal(raw: String, wordsToDrop: Int): String {
         if (wordsToDrop <= 0) return raw.trim()
-        val matcher = Regex("[\\p{L}\\p{N}']+").findAll(raw).toList()
+        val matcher = orderedWord.findAll(raw).toList()
         if (wordsToDrop >= matcher.size) return ""
         val cutIndex = matcher[wordsToDrop].range.first
         return raw.substring(cutIndex).trimStart(' ', ',', ';', ':', '-', '—', '.').trim()
+    }
+
+    private data class EchoCandidate(val cue: DialogueEvent, val normalized: String, val words: Set<String>)
+
+    private fun echoCandidate(cue: DialogueEvent): EchoCandidate? {
+        val normalized = normalizeCueComparisonText(cue.sourceText)
+        return if (normalized.length < 14) null else EchoCandidate(cue, normalized, tokenizeComparisonWords(cue.sourceText))
     }
 
     /**
@@ -736,23 +806,19 @@ object LookaheadWindowPlanner {
         windowStartMs: Long,
     ): List<DialogueEvent> {
         if (incoming.isEmpty() || existing.isEmpty() || windowStartMs < 35_000L) return incoming
-        val priorAnchors = existing
-            .filter {
-                it.startTimeMs < (windowStartMs - 25_000L).coerceAtLeast(0L) &&
-                    normalizeCueComparisonText(it.sourceText).length >= 14
-            }
-            .sortedBy { it.startTimeMs }
+        val priorAnchors = existing.asSequence()
+            .filter { it.startTimeMs < windowStartMs - 25_000L }
+            .mapNotNull(::echoCandidate)
+            .sortedBy { it.cue.startTimeMs }
+            .toList()
         if (priorAnchors.isEmpty()) return incoming
 
         val exactOrFuzzyMatches = mutableListOf<Pair<Int, DialogueEvent>>() // (incomingIdx, matchedPrior)
         val sameSpeakerMatches = mutableSetOf<Int>()
 
         incoming.forEachIndexed { idx, evt ->
-            val norm = normalizeCueComparisonText(evt.sourceText)
-            if (norm.length < 14) return@forEachIndexed
-            val matchedPrior = priorAnchors.firstOrNull { prior ->
-                isEchoCandidateTextMatch(prior.sourceText, evt.sourceText)
-            }
+            val candidate = echoCandidate(evt) ?: return@forEachIndexed
+            val matchedPrior = priorAnchors.firstOrNull { isEchoCandidateTextMatch(it, candidate) }?.cue
             if (matchedPrior != null) {
                 exactOrFuzzyMatches.add(idx to matchedPrior)
                 if (areSpeakersCompatible(matchedPrior.speakerId, evt.speakerId)) {
@@ -788,18 +854,17 @@ object LookaheadWindowPlanner {
         }
     }
 
-    private fun isEchoCandidateTextMatch(priorText: String, incomingText: String): Boolean {
-        val priorNorm = normalizeCueComparisonText(priorText)
-        val incNorm = normalizeCueComparisonText(incomingText)
-        if (priorNorm.length < 14 || incNorm.length < 14) return false
+    private fun isEchoCandidateTextMatch(prior: EchoCandidate, incoming: EchoCandidate): Boolean {
+        val priorNorm = prior.normalized
+        val incNorm = incoming.normalized
         if (priorNorm == incNorm) return true
         val shorter = minOf(priorNorm.length, incNorm.length)
         if (shorter >= 18 && (priorNorm.contains(incNorm) || incNorm.contains(priorNorm))) return true
-        val priorWords = tokenizeComparisonWords(priorText)
-        val incWords = tokenizeComparisonWords(incomingText)
+        val priorWords = prior.words
+        val incWords = incoming.words
         if (priorWords.size >= 4 && incWords.size >= 4) {
-            val intersection = priorWords.intersect(incWords).size
-            val union = priorWords.union(incWords).size.coerceAtLeast(1)
+            val intersection = incWords.count { it in priorWords }
+            val union = priorWords.size + incWords.size - intersection
             val minSet = minOf(priorWords.size, incWords.size).coerceAtLeast(1)
             if (intersection.toFloat() / union.toFloat() >= 0.58f ||
                 (intersection >= 4 && intersection.toFloat() / minSet.toFloat() >= 0.72f)
@@ -918,11 +983,11 @@ object LookaheadWindowPlanner {
 
     private fun tokenizeComparisonWords(raw: String): Set<String> =
         raw.trim().lowercase()
-            .split(Regex("[^\\p{L}\\p{N}]+"))
+            .split(nonWord)
             .filter { it.length >= 2 }
             .toSet()
 
     private fun normalizeCueComparisonText(raw: String): String =
-        raw.trim().lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), "")
+        raw.trim().lowercase().replace(nonWord, "")
 }
 

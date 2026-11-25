@@ -1,6 +1,8 @@
 package com.example.domain.playback
 
-import com.example.data.model.CoverageStatus
+import com.example.domain.analysis.MediaTransport
+import com.example.domain.analysis.PlaybackPhase
+import com.example.domain.analysis.ReadinessDecision
 import com.example.domain.analysis.TranscriptCoverageLedger
 import kotlin.math.abs
 import kotlin.math.roundToLong
@@ -81,6 +83,8 @@ data class PlaybackTimingDiagnostics(
     val bufferingStartedAtEpochMs: Long = 0L,
     val lastBufferingDurationMs: Long = 0L,
     val autoResumeCount: Int = 0,
+    val scoutWindowServiceMs: Long = 0L,
+    val scoutWindowMediaMs: Long = 0L,
     val watchNowBypassActive: Boolean = false,
     val waitTimedOut: Boolean = false,
     val statusDetail: String = "",
@@ -105,8 +109,7 @@ data class PlaybackReadinessSnapshot(
      * Controls Watch-mode "Heal this moment" visibility (Section 10 & Section 24).
      */
     val isIntentionallyPausedByUser: Boolean
-        get() = state == PlaybackReadinessState.PAUSED_BY_USER ||
-            (state == PlaybackReadinessState.READY_PAUSED && userIntent == UserPlaybackIntent.PAUSE)
+        get() = state == PlaybackReadinessState.PAUSED_BY_USER
 
     /**
      * True when playback is holding for verified dialogue coverage and should promise automatic
@@ -116,509 +119,375 @@ data class PlaybackReadinessSnapshot(
         get() = isBufferingHoldActive && userIntent == UserPlaybackIntent.PLAY && !waitTimedOut
 }
 
-/**
- * Single authoritative controller for playback readiness, speed-scaled adaptive buffering,
- * seek generation acknowledgment, exact one-shot auto-resumption, and bounded failure recovery
- * (DialogueLens 2.0 Part III — Sections 10, 11, 12, 13, 14).
- *
- * Works identically across YouTube, Web Stream, Local Video, and Demo Scenario sources.
- */
+/** Main-thread coordinator shared by all media adapters and Studio diagnostics. */
 class PlaybackReadinessController(
     private val waitTimeoutMs: Long = DEFAULT_WAIT_TIMEOUT_MS,
 ) {
-    private var state: PlaybackReadinessState = PlaybackReadinessState.IDLE
-    private var userIntent: UserPlaybackIntent = UserPlaybackIntent.PAUSE
-    private var playbackSpeed: Float = 1.0f
-    private var currentPositionMs: Long = 0L
-    private var targetPositionMs: Long = 0L
-    private var knownDurationMs: Long = 0L
-    private var seekGeneration: Long = 0L
-    private var acknowledgedSeekGeneration: Long = 0L
-    private var bufferingEpisodeId: Long = 0L
-    private var bufferingStartedAtEpochMs: Long = 0L
-    private var lastBufferingDurationMs: Long = 0L
-    private var autoResumeSeq: Long = 0L
-    private var autoResumeCount: Int = 0
-    private var pendingAutoResume: AutoResumeDirective? = null
-    private var activeWatchNowBypass: WatchNowBypassScope? = null
-    private var waitTimedOut: Boolean = false
-    private var failureReason: String = ""
-    private var lastContiguousLeadMs: Long = 0L
-    private var requiresCoverageGate: Boolean = true
+    var wantsPlay = false
+        private set
+    var pendingTargetMs: Long? = null
+        private set
+    var generation = 0
+        private set
+    private var explicitPause = false
+    private var commandedPlaying = false
+    private var waitingForCoverage = true
+    private var hasStarted = false
+    private var ended = false
+    private var bypassEndMs: Long? = null
+    private var waitingSinceMs: Long? = null
+    private var lastPosition = 0L
+    private var duration: Long? = null
+    private var speed = 1f
+    private var needsDialogue = true
+    private var lead = 0L
+    private var transport = MediaTransport.PAUSED
+    private var lastNow = 0L
+    private var waitTimedOut = false
+    private var failureReason = ""
+    private var state = PlaybackReadinessState.IDLE
+    private var acknowledgedGeneration = 0
+    private var episodeStarted: Long? = null
+    private var episodeStartedAtEpochMs = 0L
+    private var scoutServiceMs = 0L
+    private var scoutMediaMs = 0L
+    private var episodeCount = 0
+    private var previousWaitDuration = 0L
+    private var resumeSeq = 0L
+    private var resumesDispatched = 0
+    private var directive: AutoResumeDirective? = null
 
     fun resetForMedia(
         initialPositionMs: Long,
         durationMs: Long,
         requiresCoverageGate: Boolean,
         initialIntent: UserPlaybackIntent = UserPlaybackIntent.PAUSE,
-        playbackSpeed: Float = 1.0f,
+        playbackSpeed: Float = 1f,
     ): PlaybackReadinessSnapshot {
-        this.requiresCoverageGate = requiresCoverageGate
-        this.userIntent = initialIntent
-        this.playbackSpeed = playbackSpeed.coerceIn(0.25f, 3.0f)
-        this.currentPositionMs = initialPositionMs.coerceAtLeast(0L)
-        this.targetPositionMs = initialPositionMs.coerceAtLeast(0L)
-        this.knownDurationMs = durationMs.coerceAtLeast(0L)
-        this.seekGeneration = 0L
-        this.acknowledgedSeekGeneration = 0L
-        this.bufferingEpisodeId = 0L
-        this.bufferingStartedAtEpochMs = 0L
-        this.lastBufferingDurationMs = 0L
-        this.pendingAutoResume = null
-        this.activeWatchNowBypass = null
-        this.waitTimedOut = false
-        this.failureReason = ""
-        this.lastContiguousLeadMs = 0L
-        this.state = if (requiresCoverageGate) {
-            PlaybackReadinessState.LOADING_MEDIA
-        } else {
-            PlaybackReadinessState.READY_PAUSED
-        }
+        wantsPlay = initialIntent == UserPlaybackIntent.PLAY
+        pendingTargetMs = null
+        generation = 0
+        acknowledgedGeneration = 0
+        explicitPause = false
+        commandedPlaying = false
+        waitingForCoverage = true
+        hasStarted = false
+        ended = false
+        bypassEndMs = null
+        waitingSinceMs = null
+        lastPosition = initialPositionMs.coerceAtLeast(0L)
+        duration = durationMs.takeIf { it > 0 }
+        speed = playbackSpeed.coerceIn(0.25f, 4f)
+        needsDialogue = requiresCoverageGate
+        lead = 0
+        transport = MediaTransport.PAUSED
+        lastNow = 0
+        episodeStarted = null
+        episodeStartedAtEpochMs = 0L
+        scoutServiceMs = 0L
+        scoutMediaMs = 0L
+        episodeCount = 0
+        previousWaitDuration = 0
+        directive = null
+        resumesDispatched = 0
+        failureReason = ""
+        waitTimedOut = false
+        state = if (needsDialogue) PlaybackReadinessState.LOADING_MEDIA else PlaybackReadinessState.READY_PAUSED
         return snapshot()
     }
 
+    fun setIntent(play: Boolean) {
+        if (play && !wantsPlay) waitingForCoverage = true
+        wantsPlay = play
+        explicitPause = !play
+        ended = false
+        waitingSinceMs = null
+        if (!play) {
+            directive = null
+            episodeStarted = null
+            bypassEndMs = null
+        }
+    }
+
+    fun seek(targetMs: Long, sequence: Int) {
+        pendingTargetMs = targetMs
+        generation = sequence
+        waitingForCoverage = true
+        bypassEndMs = null
+        waitingSinceMs = null
+        episodeStarted = null
+        directive = null
+        ended = false
+    }
+
+    fun acknowledge(sequence: Int, positionMs: Long, settled: Boolean): Boolean {
+        if (sequence != generation) return false
+        val target = pendingTargetMs ?: return true
+        if (!settled || abs(target - positionMs) > SEEK_ACK_TOLERANCE_MS) return false
+        acknowledgedGeneration = sequence
+        pendingTargetMs = null
+        return true
+    }
+
+    fun suspendPlayback() {
+        if (wantsPlay) {
+            setIntent(false)
+            explicitPause = false
+        }
+    }
+
+    fun end() {
+        setIntent(false)
+        ended = true
+        commandedPlaying = false
+    }
+
+    fun retry() {
+        waitingSinceMs = null
+        waitTimedOut = false
+        failureReason = ""
+    }
+
+    fun continueWithAvailable(positionMs: Long, speed: Float, nextVerifiedMs: Long?) {
+        if (!wantsPlay || pendingTargetMs != null) return
+        val limit = positionMs + mediaMs(BASE_HEALTHY_LEAD_MS, speed)
+        bypassEndMs = minOf(limit, nextVerifiedMs?.takeIf { it > positionMs } ?: limit)
+        waitingSinceMs = null
+        episodeStarted = null
+        directive = null
+    }
+
+    fun evaluate(
+        positionMs: Long,
+        durationMs: Long?,
+        speed: Float,
+        verifiedLeadMs: Long,
+        needsDialogue: Boolean,
+        processingFailed: Boolean,
+        transport: MediaTransport,
+        nowMs: Long,
+        nowEpochMs: Long = nowMs,
+    ): ReadinessDecision {
+        // Only advancement of contiguous evidence at the held target extends the stall timeout.
+        if (waitingForCoverage && positionMs == lastPosition && verifiedLeadMs > lead) waitingSinceMs = nowMs
+        lastPosition = positionMs
+        duration = durationMs?.takeIf { it > 0L }
+        this.speed = speed.coerceIn(0.25f, 4f)
+        this.needsDialogue = needsDialogue
+        this.transport = transport
+        lastNow = nowMs
+        lead = verifiedLeadMs
+        val target = pendingTargetMs ?: positionMs
+        val minimum = requiredInitialOrSeekLeadMs(target)
+        val critical = midPlaybackBufferTriggerMs(target)
+        if (verifiedLeadMs >= minimum || !needsDialogue) waitingForCoverage = false
+        else if (verifiedLeadMs < critical) waitingForCoverage = true
+        if (!waitingForCoverage || target >= (bypassEndMs ?: Long.MAX_VALUE)) bypassEndMs = null
+        val bypassed = bypassEndMs != null
+        val dialogueHold = needsDialogue && waitingForCoverage && !bypassed
+        val seekHold = pendingTargetMs != null
+        val transportReady = transport == MediaTransport.PAUSED || transport == MediaTransport.PLAYING
+        val wait = seekHold || (wantsPlay && (dialogueHold || transport != MediaTransport.PLAYING))
+        if (wait && waitingSinceMs == null) waitingSinceMs = nowMs
+        if (!wait) waitingSinceMs = null
+        waitTimedOut = waitingSinceMs?.let { nowMs - it >= waitTimeoutMs } ?: false
+        val phase = when {
+            ended -> PlaybackPhase.ENDED
+            seekHold && waitTimedOut -> PlaybackPhase.PROCESSING_UNAVAILABLE
+            seekHold -> PlaybackPhase.WAITING_FOR_SEEK
+            !wantsPlay -> if (explicitPause) PlaybackPhase.USER_PAUSED else PlaybackPhase.READY
+            dialogueHold && (processingFailed || waitTimedOut) -> PlaybackPhase.PROCESSING_UNAVAILABLE
+            dialogueHold -> if (hasStarted) PlaybackPhase.BUFFERING_DIALOGUE else PlaybackPhase.PREPARING
+            waitTimedOut && transport != MediaTransport.PLAYING -> PlaybackPhase.PROCESSING_UNAVAILABLE
+            transport != MediaTransport.PLAYING -> PlaybackPhase.BUFFERING_MEDIA
+            bypassed -> PlaybackPhase.LIMITED
+            else -> PlaybackPhase.PLAYING
+        }
+        if (dialogueHold && (wantsPlay || seekHold)) {
+            directive = null
+            if (episodeStarted == null) {
+                episodeStarted = nowMs
+                episodeStartedAtEpochMs = nowEpochMs
+                episodeCount++
+            }
+        } else if (episodeStarted != null) {
+            previousWaitDuration = (nowMs - episodeStarted!!).coerceAtLeast(0L)
+            episodeStarted = null
+            if (wantsPlay && !bypassed) directive = AutoResumeDirective(++resumeSeq, target,
+                "Dialogue ready at the requested position", generation.toLong())
+        }
+
+        state = when {
+            phase == PlaybackPhase.PROCESSING_UNAVAILABLE -> PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR
+            directive != null -> PlaybackReadinessState.READY_TO_AUTO_RESUME
+            seekHold -> if (dialogueHold) PlaybackReadinessState.BUFFERING_FOR_SEEK else PlaybackReadinessState.SEEKING
+            phase == PlaybackPhase.USER_PAUSED -> PlaybackReadinessState.PAUSED_BY_USER
+            !wantsPlay -> PlaybackReadinessState.READY_PAUSED
+            bypassed -> PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE
+            phase == PlaybackPhase.PREPARING -> PlaybackReadinessState.BUFFERING_INITIAL_WINDOW
+            phase == PlaybackPhase.BUFFERING_DIALOGUE -> PlaybackReadinessState.BUFFERING_MID_PLAYBACK
+            phase == PlaybackPhase.BUFFERING_MEDIA -> PlaybackReadinessState.LOADING_MEDIA
+            else -> PlaybackReadinessState.PLAYING
+        }
+        failureReason = when {
+            state != PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR -> ""
+            processingFailed -> "Dialogue or media preparation failed for this section."
+            seekHold -> "The player hasn't confirmed the requested position."
+            else -> "Preparation is taking longer than expected."
+        }
+        val desired = wantsPlay && !seekHold && !dialogueHold && (transportReady || commandedPlaying)
+        val command = if (commandedPlaying != desired) desired else null
+        commandedPlaying = desired
+        if (transport == MediaTransport.PLAYING && desired) hasStarted = true
+        return ReadinessDecision(phase, minimum, command)
+    }
+
+    fun nativePlay() {
+        setIntent(true)
+        commandedPlaying = true
+    }
+
+    fun nativePause() {
+        setIntent(false)
+        commandedPlaying = false
+    }
+
     fun setPlaybackSpeed(speed: Float): PlaybackReadinessSnapshot {
-        playbackSpeed = speed.coerceIn(0.25f, 3.0f)
+        this.speed = speed.coerceIn(0.25f, 4f)
         return snapshot()
     }
 
     fun updateDuration(durationMs: Long) {
-        if (durationMs > 0L) {
-            knownDurationMs = durationMs
-        }
+        if (durationMs > 0L) duration = durationMs
     }
 
-    /**
-     * Records an explicit user Play request at [positionMs].
-     * Preserves [positionMs] verbatim (never rewinds a resumed position back to 0).
-     */
-    fun onUserPlayRequested(
-        positionMs: Long,
-        ledger: TranscriptCoverageLedger,
-        nowEpochMs: Long = System.currentTimeMillis(),
-    ): PlaybackReadinessSnapshot {
-        userIntent = UserPlaybackIntent.PLAY
-        val pos = positionMs.coerceAtLeast(0L)
-        currentPositionMs = pos
-        targetPositionMs = pos
-        waitTimedOut = false
-        failureReason = ""
-
-        if (!requiresCoverageGate) {
-            state = PlaybackReadinessState.PLAYING
-            return snapshot()
-        }
-
-        val lead = ledger.continuousVerifiedLeadFrom(pos)
-        lastContiguousLeadMs = lead
-        val reqInitial = requiredInitialOrSeekLeadMs(pos)
-        if (lead >= reqInitial || isAtOrPastVerifiedTail(pos, lead)) {
-            activeWatchNowBypass = null
-            state = PlaybackReadinessState.PLAYING
-            return snapshot()
-        }
-
-        if (activeWatchNowBypass != null && activeWatchNowBypass!!.seekGeneration == seekGeneration) {
-            state = PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE
-            return snapshot()
-        }
-
-        startBufferingEpisode(
-            newState = if (bufferingEpisodeId == 0L) {
-                PlaybackReadinessState.BUFFERING_INITIAL_WINDOW
-            } else {
-                PlaybackReadinessState.BUFFERING_MID_PLAYBACK
-            },
-            targetMs = pos,
-            nowEpochMs = nowEpochMs,
-        )
-        return snapshot()
-    }
-
-    /**
-     * Records an explicit user Pause request. Immediately cancels any pending auto-resume so
-     * DialogueLens NEVER overrides an intentional user pause.
-     */
-    fun onUserPauseRequested(positionMs: Long = currentPositionMs): PlaybackReadinessSnapshot {
-        userIntent = UserPlaybackIntent.PAUSE
-        currentPositionMs = positionMs.coerceAtLeast(0L)
-        targetPositionMs = currentPositionMs
-        pendingAutoResume = null
-        waitTimedOut = false
-        state = PlaybackReadinessState.PAUSED_BY_USER
-        return snapshot()
-    }
-
-    /**
-     * Records a user seek to [requestedTargetMs]. Increments [seekGeneration], clears any prior
-     * Watch Now bypass, and enters [PlaybackReadinessState.SEEKING] or [PlaybackReadinessState.BUFFERING_FOR_SEEK].
-     */
-    fun onUserSeekRequested(
-        requestedTargetMs: Long,
-        ledger: TranscriptCoverageLedger,
-        nowEpochMs: Long = System.currentTimeMillis(),
-    ): PlaybackReadinessSnapshot {
-        val clamped = if (knownDurationMs > 0L) {
-            requestedTargetMs.coerceIn(0L, knownDurationMs)
-        } else {
-            requestedTargetMs.coerceAtLeast(0L)
-        }
-        seekGeneration++
-        currentPositionMs = clamped
-        targetPositionMs = clamped
-        pendingAutoResume = null
-        activeWatchNowBypass = null
-        waitTimedOut = false
-        failureReason = ""
-
-        if (!requiresCoverageGate) {
-            state = PlaybackReadinessState.SEEKING
-            return snapshot()
-        }
-
-        val lead = ledger.continuousVerifiedLeadFrom(clamped)
-        lastContiguousLeadMs = lead
-        val reqSeekLead = requiredInitialOrSeekLeadMs(clamped)
-        if (lead >= reqSeekLead || isAtOrPastVerifiedTail(clamped, lead)) {
-            state = PlaybackReadinessState.SEEKING
-        } else {
-            startBufferingEpisode(
-                newState = PlaybackReadinessState.BUFFERING_FOR_SEEK,
-                targetMs = clamped,
-                nowEpochMs = nowEpochMs,
-            )
-        }
-        return snapshot()
-    }
-
-    /**
-     * Acknowledges that the underlying media player has actually landed near [reportedPositionMs]
-     * for the active seek generation. Rejects stale pre-seek ticks until acknowledgment occurs.
-     */
-    fun onPlayerPositionSample(
-        reportedPositionMs: Long,
-        playerIsPlaying: Boolean,
-        ledger: TranscriptCoverageLedger,
-        nowEpochMs: Long = System.currentTimeMillis(),
-    ): PlaybackReadinessSnapshot {
-        val safePos = reportedPositionMs.coerceAtLeast(0L)
-        val isSeekPendingAck = seekGeneration > acknowledgedSeekGeneration
-        if (isSeekPendingAck) {
-            if (abs(safePos - targetPositionMs) <= SEEK_ACK_TOLERANCE_MS) {
-                acknowledgedSeekGeneration = seekGeneration
-                currentPositionMs = safePos
-            } else {
-                // Ignore stale pre-seek position sample while player is still moving to targetPositionMs
-                return evaluateCoverage(ledger, nowEpochMs)
-            }
-        } else {
-            currentPositionMs = safePos
-            if (state == PlaybackReadinessState.PLAYING ||
-                state == PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE
-            ) {
-                targetPositionMs = safePos
-            }
-        }
-
-        if (!requiresCoverageGate) {
-            state = when {
-                userIntent == UserPlaybackIntent.PAUSE -> PlaybackReadinessState.PAUSED_BY_USER
-                playerIsPlaying -> PlaybackReadinessState.PLAYING
-                else -> PlaybackReadinessState.READY_PAUSED
-            }
-            return snapshot()
-        }
-
-        val lead = ledger.continuousVerifiedLeadFrom(currentPositionMs)
-        lastContiguousLeadMs = lead
-
-        // If user chose Watch Now and playback has now re-entered verified coverage, clear the temporary bypass
-        val bypass = activeWatchNowBypass
-        if (bypass != null && lead >= requiredInitialOrSeekLeadMs(currentPositionMs)) {
-            activeWatchNowBypass = null
-            if (state == PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE && userIntent == UserPlaybackIntent.PLAY) {
-                state = PlaybackReadinessState.PLAYING
-            }
-        }
-
-        // Check mid-playback buffer depletion while actively playing
-        if (state == PlaybackReadinessState.PLAYING && userIntent == UserPlaybackIntent.PLAY) {
-            val triggerThreshold = midPlaybackBufferTriggerMs(currentPositionMs)
-            if (lead < triggerThreshold && !isAtOrPastVerifiedTail(currentPositionMs, lead)) {
-                startBufferingEpisode(
-                    newState = PlaybackReadinessState.BUFFERING_MID_PLAYBACK,
-                    targetMs = currentPositionMs,
-                    nowEpochMs = nowEpochMs,
-                )
-                return snapshot()
-            }
-        }
-
-        if (state == PlaybackReadinessState.SEEKING) {
-            val reqLead = requiredInitialOrSeekLeadMs(targetPositionMs)
-            state = when {
-                lead < reqLead && !isAtOrPastVerifiedTail(targetPositionMs, lead) -> {
-                    startBufferingEpisode(
-                        newState = PlaybackReadinessState.BUFFERING_FOR_SEEK,
-                        targetMs = targetPositionMs,
-                        nowEpochMs = nowEpochMs,
-                    )
-                    state
-                }
-                userIntent == UserPlaybackIntent.PLAY -> {
-                    emitAutoResumeDirective("Seek target verified and ready")
-                    PlaybackReadinessState.READY_TO_AUTO_RESUME
-                }
-                else -> PlaybackReadinessState.PAUSED_BY_USER
-            }
-        }
-
+    fun onUserPlayRequested(positionMs: Long, ledger: TranscriptCoverageLedger,
+                            nowEpochMs: Long = System.currentTimeMillis()): PlaybackReadinessSnapshot {
+        setIntent(true)
+        lastPosition = positionMs.coerceAtLeast(0L)
         return evaluateCoverage(ledger, nowEpochMs)
     }
 
-    /**
-     * Re-evaluates readiness whenever the coverage ledger advances or a periodic tick occurs.
-     * Emits an exact one-shot [AutoResumeDirective] the moment verified lead satisfies the
-     * speed-scaled threshold AND [userIntent] is [UserPlaybackIntent.PLAY].
-     */
-    fun evaluateCoverage(
-        ledger: TranscriptCoverageLedger,
-        nowEpochMs: Long = System.currentTimeMillis(),
-    ): PlaybackReadinessSnapshot {
-        if (!requiresCoverageGate) return snapshot()
-
-        val evalPos = if (isBufferingState(state) || state == PlaybackReadinessState.SEEKING) {
-            targetPositionMs
-        } else {
-            currentPositionMs
-        }
-        val lead = ledger.continuousVerifiedLeadFrom(evalPos)
-        lastContiguousLeadMs = lead
-
-        if (isBufferingState(state)) {
-            val required = requiredLeadForState(state, evalPos)
-            if (lead >= required || isAtOrPastVerifiedTail(evalPos, lead)) {
-                lastBufferingDurationMs = if (bufferingStartedAtEpochMs > 0L) {
-                    (nowEpochMs - bufferingStartedAtEpochMs).coerceAtLeast(0L)
-                } else {
-                    0L
-                }
-                waitTimedOut = false
-                failureReason = ""
-                if (userIntent == UserPlaybackIntent.PLAY) {
-                    emitAutoResumeDirective("Verified lead ready (${lead / 1000L}s)")
-                    state = PlaybackReadinessState.READY_TO_AUTO_RESUME
-                } else {
-                    state = PlaybackReadinessState.READY_PAUSED
-                }
-                return snapshot()
-            }
-
-            // Detect failed interval at target or bounded wait timeout
-            val elapsedWait = if (bufferingStartedAtEpochMs > 0L) {
-                (nowEpochMs - bufferingStartedAtEpochMs).coerceAtLeast(0L)
-            } else {
-                0L
-            }
-            val failedAtTarget = ledger.coverageStatusAt(evalPos) == CoverageStatus.FAILED
-            if (failedAtTarget || elapsedWait >= waitTimeoutMs) {
-                waitTimedOut = true
-                failureReason = if (failedAtTarget) {
-                    "Dialogue preparation failed for this section."
-                } else {
-                    "Dialogue preparation is taking longer than expected."
-                }
-                state = PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR
-            }
-        }
-
+    fun onUserPauseRequested(positionMs: Long = lastPosition): PlaybackReadinessSnapshot {
+        setIntent(false)
+        lastPosition = positionMs.coerceAtLeast(0L)
+        refresh(lastNow)
         return snapshot()
     }
 
-    /**
-     * Consumes the pending one-shot [AutoResumeDirective] once the UI/ViewModel dispatches
-     * the actual play/seek command, transitioning cleanly into [PlaybackReadinessState.PLAYING].
-     */
+    fun onUserSeekRequested(requestedTargetMs: Long, ledger: TranscriptCoverageLedger,
+                            nowEpochMs: Long = System.currentTimeMillis()): PlaybackReadinessSnapshot {
+        val target = requestedTargetMs.coerceIn(0L, duration ?: Long.MAX_VALUE)
+        seek(target, generation + 1)
+        return evaluateCoverage(ledger, nowEpochMs)
+    }
+
+    fun onPlayerPositionSample(reportedPositionMs: Long, playerIsPlaying: Boolean, ledger: TranscriptCoverageLedger,
+                               nowEpochMs: Long = System.currentTimeMillis()): PlaybackReadinessSnapshot {
+        val pos = reportedPositionMs.coerceAtLeast(0L)
+        if (acknowledge(generation, pos, settled = true)) {
+            lastPosition = pos
+            transport = if (playerIsPlaying) MediaTransport.PLAYING else MediaTransport.PAUSED
+        }
+        return evaluateCoverage(ledger, nowEpochMs)
+    }
+
+    fun evaluateCoverage(ledger: TranscriptCoverageLedger,
+                         nowEpochMs: Long = System.currentTimeMillis()): PlaybackReadinessSnapshot {
+        val target = pendingTargetMs ?: lastPosition
+        evaluate(lastPosition, duration, speed, ledger.continuousVerifiedLeadFrom(target), needsDialogue,
+            ledger.hasFailedIntervalAt(target), transport, nowEpochMs)
+        return snapshot()
+    }
+
+    private fun refresh(now: Long, failed: Boolean = false) {
+        evaluate(lastPosition, duration, speed, lead, needsDialogue, failed, transport, now)
+    }
+
+    /** Dispatched commands are separate from provider confirmation that media time is advancing. */
+    fun confirmResumeDispatched() {
+        val pending = directive ?: return
+        if (!wantsPlay || pendingTargetMs != null || pending.seekGeneration != generation.toLong() ||
+            !commandedPlaying || (transport != MediaTransport.PAUSED && transport != MediaTransport.PLAYING)) return
+        directive = null
+        resumesDispatched++
+        state = PlaybackReadinessState.PLAYING
+    }
+
     fun consumeAutoResumeDirective(directiveId: Long): PlaybackReadinessSnapshot {
-        val current = pendingAutoResume
-        if (current != null && current.id == directiveId) {
-            pendingAutoResume = null
-            if (userIntent == UserPlaybackIntent.PLAY) {
-                state = PlaybackReadinessState.PLAYING
-            }
-        }
+        if (directive?.id == directiveId) confirmResumeDispatched()
         return snapshot()
     }
 
-    /**
-     * Explicit user choice ("Watch Now") during a buffering hold. Scoped ONLY to the current
-     * buffering episode; never suppresses future seeks or later unverified stretches.
-     */
     fun onUserWatchNowBypass(): PlaybackReadinessSnapshot {
-        activeWatchNowBypass = WatchNowBypassScope(
-            episodeId = bufferingEpisodeId,
-            createdAtPositionMs = targetPositionMs,
-            seekGeneration = seekGeneration,
-        )
-        waitTimedOut = false
-        failureReason = ""
-        pendingAutoResume = null
-        userIntent = UserPlaybackIntent.PLAY
-        state = PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE
+        if (!wantsPlay) setIntent(true)
+        continueWithAvailable(lastPosition, speed, null)
+        refresh(lastNow)
         return snapshot()
     }
 
-    /**
-     * Explicit user retry after a bounded buffering timeout or failure.
-     */
     fun onUserRetryBuffering(nowEpochMs: Long = System.currentTimeMillis()): PlaybackReadinessSnapshot {
-        waitTimedOut = false
-        failureReason = ""
-        activeWatchNowBypass = null
-        startBufferingEpisode(
-            newState = if (targetPositionMs <= 1_000L) {
-                PlaybackReadinessState.BUFFERING_INITIAL_WINDOW
-            } else {
-                PlaybackReadinessState.BUFFERING_FOR_SEEK
-            },
-            targetMs = targetPositionMs,
-            nowEpochMs = nowEpochMs,
-        )
+        retry()
+        refresh(nowEpochMs)
         return snapshot()
     }
 
     fun onMediaOrAnalysisError(reason: String): PlaybackReadinessSnapshot {
-        failureReason = reason.ifBlank { "Unable to prepare dialogue for this section." }
-        pendingAutoResume = null
+        directive = null
         state = PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR
+        failureReason = reason.ifBlank { "Unable to prepare this section." }
         return snapshot()
     }
 
-    // -------------------------------------------------------------------------
-    // Speed-scaled adaptive thresholds (Section 11)
-    // -------------------------------------------------------------------------
-
-    fun requiredInitialOrSeekLeadMs(positionMs: Long): Long =
-        capToRemaining(scaleBySpeed(BASE_START_AND_RESUME_LEAD_MS), positionMs)
-
-    fun midPlaybackBufferTriggerMs(positionMs: Long): Long =
-        capToRemaining(scaleBySpeed(BASE_MID_PLAYBACK_TRIGGER_MS), positionMs)
-
-    fun healthyLeadTargetMs(positionMs: Long): Long =
-        capToRemaining(scaleBySpeed(BASE_HEALTHY_LEAD_MS), positionMs)
-
-    fun comfortableLeadTargetMs(positionMs: Long): Long =
-        capToRemaining(scaleBySpeed(BASE_COMFORTABLE_LEAD_MS), positionMs)
-
-    private fun requiredLeadForState(s: PlaybackReadinessState, positionMs: Long): Long = when (s) {
-        PlaybackReadinessState.BUFFERING_INITIAL_WINDOW,
-        PlaybackReadinessState.BUFFERING_FOR_SEEK,
-        PlaybackReadinessState.BUFFERING_MID_PLAYBACK -> requiredInitialOrSeekLeadMs(positionMs)
-        else -> midPlaybackBufferTriggerMs(positionMs)
+    /** Update only after a real window has been verified. Smooth variable network/decoder time per session. */
+    fun recordScoutWindow(mediaMs: Long, elapsedMs: Long) {
+        if (mediaMs <= 0L || elapsedMs <= 0L) return
+        scoutServiceMs = if (scoutServiceMs == 0L) elapsedMs else (scoutServiceMs * 3 + elapsedMs) / 4
+        scoutMediaMs = if (scoutMediaMs == 0L) mediaMs else (scoutMediaMs * 3 + mediaMs) / 4
     }
 
-    private fun scaleBySpeed(baseMs: Long): Long =
-        (baseMs.toDouble() * playbackSpeed.coerceIn(0.5f, 3.0f)).roundToLong()
-
-    private fun capToRemaining(desiredMs: Long, positionMs: Long): Long {
-        if (knownDurationMs <= 0L) {
-            // Unknown duration: require at least a bounded opening slice so buffering never hangs
-            return desiredMs.coerceAtMost(UNKNOWN_DURATION_MAX_REQUIRED_LEAD_MS)
-        }
-        val remaining = (knownDurationMs - positionMs).coerceAtLeast(0L)
-        if (remaining <= END_OF_MEDIA_TOLERANCE_MS) return 0L
-        return minOf(desiredMs, (remaining - 500L).coerceAtLeast(MIN_SHORT_VIDEO_LEAD_MS.coerceAtMost(remaining)))
+    fun requiredInitialOrSeekLeadMs(positionMs: Long): Long {
+        // A worker that consumes an entire window's viewing time needs a cushion for the next
+        // completion. The two-second depletion threshold still governs uninterrupted playback.
+        val realMs = if (scoutServiceMs * speed < scoutMediaMs || scoutMediaMs <= 0L) BASE_START_AND_RESUME_LEAD_MS
+            else (scoutServiceMs + BASE_MID_PLAYBACK_TRIGGER_MS).coerceIn(BASE_START_AND_RESUME_LEAD_MS, BASE_COMFORTABLE_LEAD_MS)
+        return threshold(realMs, positionMs)
     }
+    fun midPlaybackBufferTriggerMs(positionMs: Long): Long = threshold(BASE_MID_PLAYBACK_TRIGGER_MS, positionMs)
+    fun healthyLeadTargetMs(positionMs: Long): Long = maxOf(requiredInitialOrSeekLeadMs(positionMs), threshold(BASE_HEALTHY_LEAD_MS, positionMs))
+    fun comfortableLeadTargetMs(positionMs: Long): Long = threshold(BASE_COMFORTABLE_LEAD_MS, positionMs)
 
-    private fun isAtOrPastVerifiedTail(positionMs: Long, leadMs: Long): Boolean {
-        if (knownDurationMs <= 0L) return false
-        val remaining = (knownDurationMs - positionMs).coerceAtLeast(0L)
-        return remaining <= END_OF_MEDIA_TOLERANCE_MS || leadMs >= (remaining - END_OF_MEDIA_TOLERANCE_MS).coerceAtLeast(0L)
-    }
+    private fun threshold(base: Long, position: Long): Long =
+        minOf(mediaMs(base, speed), duration?.let { (it - position).coerceAtLeast(0L) } ?: Long.MAX_VALUE)
 
-    private fun startBufferingEpisode(
-        newState: PlaybackReadinessState,
-        targetMs: Long,
-        nowEpochMs: Long,
-    ) {
-        bufferingEpisodeId++
-        bufferingStartedAtEpochMs = nowEpochMs
-        targetPositionMs = targetMs.coerceAtLeast(0L)
-        pendingAutoResume = null
-        waitTimedOut = false
-        failureReason = ""
-        state = newState
-    }
-
-    private fun emitAutoResumeDirective(reason: String) {
-        autoResumeSeq++
-        autoResumeCount++
-        pendingAutoResume = AutoResumeDirective(
-            id = autoResumeSeq,
-            targetPositionMs = targetPositionMs,
-            reason = reason,
-            seekGeneration = seekGeneration,
-        )
-    }
-
-    private fun isBufferingState(s: PlaybackReadinessState): Boolean =
-        s == PlaybackReadinessState.BUFFERING_INITIAL_WINDOW ||
-            s == PlaybackReadinessState.BUFFERING_FOR_SEEK ||
-            s == PlaybackReadinessState.BUFFERING_MID_PLAYBACK
+    private fun mediaMs(wallTimeMs: Long, speed: Float): Long =
+        (wallTimeMs * speed.coerceIn(0.25f, 4f)).roundToLong()
 
     fun snapshot(): PlaybackReadinessSnapshot {
-        val evalPos = if (isBufferingState(state) || state == PlaybackReadinessState.SEEKING) {
-            targetPositionMs
-        } else {
-            currentPositionMs
-        }
-        val reqLead = requiredLeadForState(state, evalPos)
-        val actions = if (state == PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR) {
-            listOf(
-                BufferingFailureAction.RETRY,
-                BufferingFailureAction.WATCH_WITHOUT_SUBTITLES,
-                BufferingFailureAction.ATTACH_SUBTITLES,
-            )
-        } else {
-            emptyList()
-        }
-        val diag = PlaybackTimingDiagnostics(
-            readinessState = state,
-            userIntent = userIntent,
-            playbackSpeed = playbackSpeed,
-            currentPositionMs = currentPositionMs,
-            targetPositionMs = targetPositionMs,
-            knownDurationMs = knownDurationMs,
-            contiguousVerifiedLeadMs = lastContiguousLeadMs,
-            requiredInitialLeadMs = requiredInitialOrSeekLeadMs(evalPos),
-            requiredSeekLeadMs = requiredInitialOrSeekLeadMs(evalPos),
-            requiredResumeLeadMs = requiredInitialOrSeekLeadMs(evalPos),
-            midPlaybackBufferThresholdMs = midPlaybackBufferTriggerMs(evalPos),
-            healthyLeadTargetMs = healthyLeadTargetMs(evalPos),
-            seekGeneration = seekGeneration,
-            acknowledgedSeekGeneration = acknowledgedSeekGeneration,
-            isSeekInFlight = seekGeneration > acknowledgedSeekGeneration,
-            bufferingEpisodeCount = bufferingEpisodeId.toInt(),
-            bufferingStartedAtEpochMs = bufferingStartedAtEpochMs,
-            lastBufferingDurationMs = lastBufferingDurationMs,
-            autoResumeCount = autoResumeCount,
-            watchNowBypassActive = activeWatchNowBypass != null,
-            waitTimedOut = waitTimedOut,
-            statusDetail = failureReason,
+        val target = pendingTargetMs ?: lastPosition
+        val intent = if (wantsPlay) UserPlaybackIntent.PLAY else UserPlaybackIntent.PAUSE
+        val minimum = requiredInitialOrSeekLeadMs(target)
+        val diagnostics = PlaybackTimingDiagnostics(
+            readinessState = state, userIntent = intent, playbackSpeed = speed, currentPositionMs = lastPosition,
+            targetPositionMs = target, knownDurationMs = duration ?: 0L, contiguousVerifiedLeadMs = lead,
+            requiredInitialLeadMs = minimum, requiredSeekLeadMs = minimum, requiredResumeLeadMs = minimum,
+            midPlaybackBufferThresholdMs = midPlaybackBufferTriggerMs(target), healthyLeadTargetMs = healthyLeadTargetMs(target),
+            seekGeneration = generation.toLong(), acknowledgedSeekGeneration = acknowledgedGeneration.toLong(),
+            isSeekInFlight = pendingTargetMs != null, bufferingEpisodeCount = episodeCount,
+            bufferingStartedAtEpochMs = if (episodeStarted != null) episodeStartedAtEpochMs else 0L,
+            lastBufferingDurationMs = previousWaitDuration,
+            autoResumeCount = resumesDispatched, scoutWindowServiceMs = scoutServiceMs, scoutWindowMediaMs = scoutMediaMs,
+            watchNowBypassActive = bypassEndMs != null,
+            waitTimedOut = waitTimedOut, statusDetail = failureReason,
         )
         return PlaybackReadinessSnapshot(
-            state = state,
-            userIntent = userIntent,
-            targetPositionMs = targetPositionMs,
-            contiguousVerifiedLeadMs = lastContiguousLeadMs,
-            requiredLeadMs = reqLead,
-            isBufferingHoldActive = isBufferingState(state),
-            isWatchNowBypassActive = activeWatchNowBypass != null,
-            waitTimedOut = waitTimedOut,
-            failureReason = failureReason,
-            availableRecoveryActions = actions,
-            pendingAutoResume = pendingAutoResume,
-            diagnostics = diag,
+            state = state, userIntent = intent, targetPositionMs = target, contiguousVerifiedLeadMs = lead,
+            requiredLeadMs = minimum, isBufferingHoldActive = episodeStarted != null && failureReason.isEmpty(),
+            isWatchNowBypassActive = bypassEndMs != null, waitTimedOut = waitTimedOut, failureReason = failureReason,
+            availableRecoveryActions = if (state == PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR) {
+                BufferingFailureAction.entries
+            } else emptyList(),
+            pendingAutoResume = directive, diagnostics = diagnostics,
         )
     }
 
@@ -627,10 +496,7 @@ class PlaybackReadinessController(
         const val BASE_START_AND_RESUME_LEAD_MS = 7_000L
         const val BASE_HEALTHY_LEAD_MS = 15_000L
         const val BASE_COMFORTABLE_LEAD_MS = 30_000L
-        const val UNKNOWN_DURATION_MAX_REQUIRED_LEAD_MS = 7_000L
-        const val MIN_SHORT_VIDEO_LEAD_MS = 1_500L
-        const val END_OF_MEDIA_TOLERANCE_MS = 1_200L
-        const val SEEK_ACK_TOLERANCE_MS = 1_800L
-        const val DEFAULT_WAIT_TIMEOUT_MS = 24_000L
+        const val SEEK_ACK_TOLERANCE_MS = 650L
+        const val DEFAULT_WAIT_TIMEOUT_MS = 18_000L
     }
 }

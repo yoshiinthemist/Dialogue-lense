@@ -56,7 +56,8 @@ object SubtitleParser {
                 minutes = match.groupValues[6].toLongOrNull() ?: 0L,
                 seconds = match.groupValues[7].toLongOrNull() ?: 0L,
                 millis = match.groupValues[8].toLongOrNull() ?: 0L,
-            ).coerceAtLeast(startMs + 400L)
+            )
+            if (endMs <= startMs) continue
 
             val rawBody = lines.drop(timeLineIndex + 1).joinToString(" ")
             val cleaned = cleanTags(rawBody)
@@ -106,8 +107,8 @@ object SubtitleParser {
                 val textIdx = formatFields.indexOf("text").takeIf { it >= 0 } ?: (parts.lastIndex)
 
                 val startMs = parseAssTimestamp(parts.getOrNull(startIdx).orEmpty()) ?: continue
-                val endMs = (parseAssTimestamp(parts.getOrNull(endIdx).orEmpty()) ?: (startMs + 1500L))
-                    .coerceAtLeast(startMs + 400L)
+                val endMs = parseAssTimestamp(parts.getOrNull(endIdx).orEmpty()) ?: continue
+                if (endMs <= startMs) continue
                 val style = parts.getOrNull(styleIdx).orEmpty()
                 val rawText = parts.getOrNull(textIdx).orEmpty()
                     .replace("\\N", " ")
@@ -206,6 +207,10 @@ object SubtitleParser {
         return cues
     }
 
+    /** Imported captions and translated edits keep the source timestamps, including intentional overlaps. */
+    fun inSourceTimeOrder(events: List<DialogueEvent>): List<DialogueEvent> =
+        events.sortedBy { it.startTimeMs }
+
     /**
      * Reading-comfort pacing guardrails (Operation Golden Video Section 9):
      * - Targets ~15–20 characters/second where trailing silence permits, without artificially
@@ -220,6 +225,7 @@ object SubtitleParser {
 
         // Pass 1: Extend short/fast cues gently into available trailing silence toward ~18-20 CPS
         val paced = sorted.mapIndexed { idx, evt ->
+            if (evt.lockedByUser) return@mapIndexed evt
             val text = evt.translatedText.ifBlank { evt.sourceText }.trim()
             val nextSameOrAnyStart = sorted.getOrNull(idx + 1)?.startTimeMs ?: Long.MAX_VALUE
             val isSimultaneousWithNext = nextSameOrAnyStart < evt.endTimeMs &&
@@ -227,7 +233,7 @@ object SubtitleParser {
             val maxAllowedEnd = if (isSimultaneousWithNext) {
                 evt.endTimeMs
             } else {
-                (nextSameOrAnyStart - 60L).coerceAtLeast(evt.startTimeMs + 450L)
+                (nextSameOrAnyStart - 60L).coerceAtLeast(evt.startTimeMs)
             }
             // Target ~18.5 CPS (~54ms/char) bounded between 1050ms and 6500ms, never exceeding original + 1800ms
             // so dialogue never drifts into unrelated silence far after speech ends.
@@ -262,7 +268,9 @@ object SubtitleParser {
                                     evt.sourceText.trim().substring(0, srcIdx).trim() to
                                         evt.sourceText.trim().substring(srcIdx).trim()
                                 } else {
-                                    evt.sourceText to ""
+                                    // Keep an indivisible source phrase together with its translation.
+                                    add(evt)
+                                    continue
                                 }
                             }
                             add(

@@ -93,6 +93,18 @@ class HierarchicalContextEngine {
     @Volatile
     private var sceneMemory = SceneMemory()
 
+    private var indexedSpeakers: List<Speaker>? = null
+    private var indexedEvents: List<DialogueEvent>? = null
+    private var consecutiveEmpty = 0
+    private var consecutiveVisible = 0
+    private var lastVisibleMs = -1L
+
+    private fun resetObservations() {
+        consecutiveEmpty = 0
+        consecutiveVisible = 0
+        lastVisibleMs = -1L
+    }
+
     fun currentSnapshot(): ContextualSnapshot = ContextualSnapshot(
         videoMemory = videoMemory,
         chapterMemory = chapterMemory,
@@ -100,6 +112,9 @@ class HierarchicalContextEngine {
     )
 
     fun resetForProject(project: DialogueLensProject) {
+        resetObservations()
+        indexedSpeakers = project.speakers
+        indexedEvents = project.dialogueEvents
         val speakerMap = project.speakers.associateBy { it.id }
         val nameLookup = project.speakers.associate { normalizeSpeakerKey(it.displayName) to it.id }
         val lockedIds = project.dialogueEvents.filter { it.lockedByUser }.map { it.id }.toSet()
@@ -127,6 +142,9 @@ class HierarchicalContextEngine {
             resetForProject(project)
             return
         }
+        if (project.speakers === indexedSpeakers && project.dialogueEvents === indexedEvents) return
+        indexedSpeakers = project.speakers
+        indexedEvents = project.dialogueEvents
         val mergedSpeakers = videoMemory.confirmedSpeakersById.toMutableMap()
         project.speakers.forEach { sp -> mergedSpeakers[sp.id] = sp }
         val mergedNames = mergedSpeakers.values.associate { normalizeSpeakerKey(it.displayName) to it.id }
@@ -158,13 +176,13 @@ class HierarchicalContextEngine {
         val jumpedSeek = prevScene.lastUpdatedPlaybackMs > 0L &&
             abs(playbackMs - prevScene.lastUpdatedPlaybackMs) > SEEK_INVALIDATION_THRESHOLD_MS
 
-        val activeShotId = project.shots.firstOrNull { playbackMs in it.startMs..it.endMs }?.id
+        val activeShotId = project.shots.lastOrNull { playbackMs in it.startMs..it.endMs }?.id
             ?: prevScene.activeShotId
         val shotChanged = activeShotId.isNotEmpty() &&
             prevScene.activeShotId.isNotEmpty() &&
             activeShotId != prevScene.activeShotId
 
-        val activeChapter = project.chapters.firstOrNull { playbackMs in it.startMs..it.endMs }
+        val activeChapter = project.chapters.lastOrNull { playbackMs in it.startMs..it.endMs }
         val chapterChanged = activeChapter?.id != chapterMemory.activeChapter?.id
 
         if (chapterChanged) {
@@ -185,6 +203,7 @@ class HierarchicalContextEngine {
         }
 
         if (jumpedSeek || shotChanged || chapterChanged) {
+            resetObservations()
             sceneMemory = prevScene.copy(
                 sceneEpoch = prevScene.sceneEpoch + 1,
                 activeShotId = activeShotId,
@@ -196,9 +215,12 @@ class HierarchicalContextEngine {
                 isReactionOrCutaway = false,
             )
         } else {
+            val fresh = lastVisibleMs >= 0L && abs(playbackMs - lastVisibleMs) <= 800L
             sceneMemory = prevScene.copy(
                 activeShotId = activeShotId,
                 lastUpdatedPlaybackMs = playbackMs,
+                visibleFaces = if (fresh) prevScene.visibleFaces else emptyList(),
+                coordinatesValidated = fresh && prevScene.coordinatesValidated,
             )
         }
 
@@ -215,21 +237,33 @@ class HierarchicalContextEngine {
         playbackMs: Long,
     ): ContextualSnapshot {
         val prev = sceneMemory
-        val nextEpoch = if (snapshot.visualCutDetected) prev.sceneEpoch + 1 else prev.sceneEpoch
-        val isCutFrame = snapshot.visualCutDetected
-        val hasFaces = snapshot.faces.isNotEmpty()
-        val coordinatesNowValid = hasFaces && (!isCutFrame || snapshot.cutDistance < 0.35f)
-        val confirmedEmptyFrame = snapshot.hasLiveVisionSignal && !hasFaces &&
-            (isCutFrame || snapshot.emptyFrameConsecutiveCount >= LiveStageFaceTracker.CONFIRMED_EMPTY_FRAME_STREAK)
+        val cut = snapshot.visualCutDetected
+        if (playbackMs < prev.lastVisualCutMs) return currentSnapshot()
+        if (cut) resetObservations()
+        if (!snapshot.hasLiveVisionSignal && !cut) return currentSnapshot()
+        val seen = snapshot.faces.isNotEmpty()
+        consecutiveEmpty = if (seen) 0 else consecutiveEmpty + 1
+        consecutiveVisible = if (seen) consecutiveVisible + 1 else 0
+        if (seen) lastVisibleMs = playbackMs
+
+        val confirmedEmpty = !seen && snapshot.hasLiveVisionSignal &&
+            (cut || maxOf(consecutiveEmpty, snapshot.emptyFrameConsecutiveCount) >= LiveStageFrameSnapshot.CONFIRMED_EMPTY_FRAME_STREAK)
+        val restore = seen && (!prev.liveFrameObservedEmpty || consecutiveVisible >= 2) &&
+            (!cut || snapshot.cutDistance < 0.35f)
+        val hold = !seen && !cut && !confirmedEmpty && prev.coordinatesValidated &&
+            lastVisibleMs >= 0L && playbackMs - lastVisibleMs in 0L..800L
 
         sceneMemory = prev.copy(
-            sceneEpoch = nextEpoch,
-            lastUpdatedPlaybackMs = playbackMs,
-            lastVisualCutMs = if (isCutFrame) playbackMs else prev.lastVisualCutMs,
-            hasLiveVisionSignal = snapshot.hasLiveVisionSignal,
-            visibleFaces = snapshot.faces,
-            liveFrameObservedEmpty = confirmedEmptyFrame,
-            coordinatesValidated = coordinatesNowValid,
+            sceneEpoch = if (cut) prev.sceneEpoch + 1 else prev.sceneEpoch,
+            lastVisualCutMs = if (cut) playbackMs else prev.lastVisualCutMs,
+            hasLiveVisionSignal = snapshot.hasLiveVisionSignal || prev.hasLiveVisionSignal,
+            visibleFaces = when {
+                restore -> snapshot.faces
+                hold -> prev.visibleFaces
+                else -> emptyList()
+            },
+            liveFrameObservedEmpty = confirmedEmpty || (prev.liveFrameObservedEmpty && !restore),
+            coordinatesValidated = restore || hold,
             isReactionOrCutaway = false,
         )
         return currentSnapshot()
@@ -240,6 +274,7 @@ class HierarchicalContextEngine {
      * without touching Layer A speaker identities.
      */
     fun invalidateSceneCoordinates(playbackMs: Long) {
+        resetObservations()
         sceneMemory = sceneMemory.copy(
             sceneEpoch = sceneMemory.sceneEpoch + 1,
             lastUpdatedPlaybackMs = playbackMs,
@@ -334,13 +369,14 @@ class HierarchicalContextEngine {
 
         /**
          * Fallback editorial chapter inference when explicit YouTube chapters are unavailable.
-         * Uses sustained silence gaps (>= 9s) or major shot/topic transitions to create clean,
-         * non-intrusive editorial segments so Layer B Chapter Memory and Chapter Heal always work.
+         * Infer a possible transition only at a sustained, observed gap in dialogue.
+         * A partially analyzed transcript must supply coverage evidence for the gap.
          */
         fun inferEditorialChapters(
             events: List<DialogueEvent>,
             durationMs: Long,
             existingChapters: List<VideoChapter> = emptyList(),
+            gapWasObserved: (Long, Long) -> Boolean = { _, _ -> true },
         ): List<VideoChapter> {
             if (existingChapters.isNotEmpty()) return existingChapters
             val effectiveDuration = maxOf(durationMs, events.maxOfOrNull { it.endTimeMs } ?: 0L)
@@ -351,28 +387,14 @@ class HierarchicalContextEngine {
             val minSegmentMs = 40_000L
             val silenceGapThresholdMs = 9_000L
 
+            var previousEnd = sorted.first().endTimeMs
             for (i in 1 until sorted.size) {
-                val prevEnd = sorted[i - 1].endTimeMs
+                val prevEnd = previousEnd
+                previousEnd = maxOf(previousEnd, sorted[i].endTimeMs)
                 val currStart = sorted[i].startTimeMs
                 val gap = currStart - prevEnd
-                if (gap >= silenceGapThresholdMs && (currStart - splitPoints.last()) >= minSegmentMs) {
+                if (gap >= silenceGapThresholdMs && (currStart - splitPoints.last()) >= minSegmentMs && gapWasObserved(prevEnd, currStart)) {
                     splitPoints.add(currStart)
-                }
-            }
-
-            // If continuous talk video > 4 min with no long silence, create gentle 3-minute editorial sections
-            if (splitPoints.size == 1 && effectiveDuration >= 240_000L) {
-                val step = 180_000L
-                var t = step
-                while (t < effectiveDuration - 45_000L && splitPoints.size < 12) {
-                    // Snap to nearest dialogue start within ±15s
-                    val snap = sorted.minByOrNull { abs(it.startTimeMs - t) }
-                        ?.takeIf { abs(it.startTimeMs - t) <= 15_000L }
-                        ?.startTimeMs ?: t
-                    if (snap > splitPoints.last() + minSegmentMs) {
-                        splitPoints.add(snap)
-                    }
-                    t += step
                 }
             }
 
@@ -384,7 +406,7 @@ class HierarchicalContextEngine {
                     id = "inferred_chapter_${idx + 1}",
                     title = "Part ${idx + 1}",
                     startMs = startMs,
-                    endMs = endMs.coerceAtLeast(startMs + 1_000L),
+                    endMs = endMs,
                     source = ChapterSource.INFERRED_EDITORIAL,
                 )
             }

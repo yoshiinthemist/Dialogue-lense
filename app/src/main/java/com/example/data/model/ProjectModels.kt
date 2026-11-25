@@ -49,6 +49,7 @@ enum class SubtitleSourceKind {
     UPLOADED_FILE,
     EMBEDDED_TRACK,
     AI_DRAFT,
+    EMBEDDED_PARTIAL,
 }
 
 enum class TranslationMode(val label: String) {
@@ -78,8 +79,8 @@ enum class ProcessingQualityMode(val label: String, val sampleIntervalMs: Long) 
 }
 
 enum class QuotaSaverMode(val label: String, val subtitle: String) {
-    PRO_ACCURACY("Best Model", "Gemini 3.8 Flash first; Lite & Free CC if credits dry"),
-    QUOTA_SAVER("Lite First", "Flash-Lite + cache first; Free CC if credits dry"),
+    PRO_ACCURACY("Best Model", "Native captions first, then full-model analysis for missing dialogue"),
+    QUOTA_SAVER("Lite First", "Native captions first, then lower-cost analysis for missing dialogue"),
     ZERO_CLOUD("Free CC Only", "100% free CC, SRT & offline ML Kit"),
 }
 
@@ -396,6 +397,19 @@ data class HealBeacon(
     val patrolChapterId: String? = null,
     val beforeSampleText: String = "",
     val afterSampleText: String = "",
+    val postHealSnapshotEvents: List<DialogueEvent> = emptyList(),
+    val revision: Long = 0,
+    val preRepairCoverage: List<CoverageInterval> = emptyList(),
+    val coverageRepairToken: String? = null,
+)
+
+@JsonClass(generateAdapter = true)
+data class ChapterInspection(
+    val chapterId: String,
+    val boundaryMs: Long,
+    val checkedAtEpochMs: Long,
+    val finding: String = "",
+    val beaconId: String? = null,
 )
 
 @JsonClass(generateAdapter = true)
@@ -448,6 +462,8 @@ data class DialogueLensProject(
     val lastPlaybackPositionMs: Long = 0L,
     val lastWatchedAtEpochMs: Long = 0L,
     val coveragePercent: Int = 0,
+    val coverageIntervals: List<CoverageInterval> = emptyList(),
+    val chapterInspections: List<ChapterInspection> = emptyList(),
 )
 
 /**
@@ -516,6 +532,7 @@ data class CoverageInterval(
     val lastFailureReason: String = "",
     val dialogueCount: Int = 0,
     val silenceConfirmed: Boolean = status == CoverageStatus.VERIFIED_SILENCE,
+    val repairToken: String? = null,
     val updatedAtEpochMs: Long = 0L,
 )
 

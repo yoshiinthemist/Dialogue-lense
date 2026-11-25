@@ -178,6 +178,7 @@ class VideoExporter(private val context: Context) {
             val placedList = layoutEngine.computeLayout(project, timeMs, project.styleSettings)
             if (placedList.isEmpty()) return bitmap
 
+            val isReadingComfort = project.styleSettings.visualStyle == BubbleVisualStyle.READING_COMFORT
             val isManga = project.styleSettings.visualStyle == BubbleVisualStyle.MANGA_INK &&
                 !project.styleSettings.highContrastMode
             val isCinema = project.styleSettings.visualStyle == BubbleVisualStyle.CINEMA_SUBTLE &&
@@ -224,6 +225,7 @@ class VideoExporter(private val context: Context) {
                 textPaint.textSize = fontPx
                 textPaint.color = when {
                     project.styleSettings.highContrastMode -> Color.WHITE
+                    isReadingComfort -> Color.rgb(243, 241, 236)
                     isManga -> Color.parseColor("#0B0F17")
                     isCinema -> Color.parseColor("#F8FAFC")
                     else -> Color.parseColor("#0F172A")
@@ -252,6 +254,7 @@ class VideoExporter(private val context: Context) {
                 val alphaInt = (project.styleSettings.balloonOpacity * 255f).toInt().coerceIn(155, 250)
                 fillPaint.color = when {
                     project.styleSettings.highContrastMode -> Color.argb(248, 8, 8, 10)
+                    isReadingComfort -> Color.argb(alphaInt.coerceAtLeast(235), 21, 28, 36)
                     isManga -> Color.argb(alphaInt.coerceAtLeast(220), 251, 248, 241)
                     isCinema -> Color.argb(alphaInt, 10, 15, 26)
                     else -> Color.argb(alphaInt, 248, 250, 252)
@@ -262,7 +265,7 @@ class VideoExporter(private val context: Context) {
                 }
 
                 // Append pointed mouth tail when target exists & showTail is enabled
-                if (project.styleSettings.showTail && placed.tailTarget != null && !placed.isAmbiguousFallback) {
+                if (project.styleSettings.showTail && !isReadingComfort && placed.tailTarget != null && !placed.isAmbiguousFallback) {
                     val tx = placed.tailTarget.x * width
                     val ty = placed.tailTarget.y * height
                     val dx = tx - cx

@@ -3,8 +3,8 @@ package com.example.domain.analysis
 import com.example.data.model.DialogueEvent
 import com.example.data.model.DialogueLensProject
 import com.example.data.model.HealBeaconStatus
-import com.example.data.model.QuotaSaverMode
 import com.example.data.model.Speaker
+import com.example.data.model.QuotaSaverMode
 import com.example.domain.layout.PlacedBalloon
 import kotlin.math.abs
 
@@ -26,10 +26,9 @@ data class SelfHealFinding(
 
 /**
  * Bounded, resource-respecting automatic self-healing detector.
- * - Detects structural anomalies (invalid coordinates, temporal overhang, duplicate speakers,
+ * - Detects structural anomalies (invalid coordinates, temporal overhang,
  *   conflicting overlaps, repeated low-confidence positions, or playhead coverage gaps).
- * - Applies safe zero-cloud fixes locally (such as merging duplicate speakers with identical
- *   normalized names or clamping corrupted coordinates).
+ * - Detects repeatable local position and timing defects without changing speaker identities.
  * - Enforces strict guardrails before proposing a background cloud Heal Beacon:
  *   never fires in [QuotaSaverMode.ZERO_CLOUD], respects per-region 60s cooldowns, caps total
  *   automatic cloud repairs per video at [MAX_AUTO_CLOUD_HEALS_PER_VIDEO], and deduplicates
@@ -58,21 +57,6 @@ class AutoSelfHealDetector {
     ): List<SelfHealFinding> {
         resetForProject(project.id)
         val findings = mutableListOf<SelfHealFinding>()
-
-        // 1. Detect duplicate speaker identities (exact normalized name collision) -> safe zero-cloud local fix
-        val groupedByNormName = project.speakers.groupBy {
-            HierarchicalContextEngine.normalizeSpeakerKey(it.displayName)
-        }.filterKeys { it.isNotBlank() }
-        if (groupedByNormName.values.any { it.size > 1 }) {
-            findings.add(
-                SelfHealFinding(
-                    kind = SelfHealSignalKind.DUPLICATE_SPEAKER_IDENTITIES,
-                    timestampMs = playbackMs,
-                    description = "Duplicate speaker entries detected",
-                    canFixLocallyWithoutCloud = true,
-                )
-            )
-        }
 
         // 2. Detect invalid coordinates or temporal overhang on rendered balloons
         for (balloon in placedBalloons) {
@@ -197,11 +181,6 @@ class AutoSelfHealDetector {
         const val REGION_BUCKET_MS = 30_000L
         const val TEMPORAL_OVERHANG_TOLERANCE_MS = 450L
 
-        /**
-         * Safely consolidates duplicate speaker entries ONLY when at least one duplicate is
-         * unconfirmed (`!isConfirmedCharacter`) and they do not represent two distinct confirmed
-         * people (e.g., two confirmed guests sharing the same first name or opposing studio positions).
-         */
         fun consolidateDuplicateSpeakers(project: DialogueLensProject): DialogueLensProject {
             if (project.speakers.size < 2) return project
             val keptSpeakers = mutableListOf<Speaker>()
@@ -224,7 +203,14 @@ class AutoSelfHealDetector {
                     val conflictingSides = existing.preferredScreenSideX != null &&
                         speaker.preferredScreenSideX != null &&
                         abs(existing.preferredScreenSideX - speaker.preferredScreenSideX) >= 0.25f
-                    if (bothConfirmedDistinct || (existing.isLocked && speaker.isLocked) || conflictingSides) {
+                    val nearbyKnownPositions = existing.preferredScreenSideX != null && speaker.preferredScreenSideX != null &&
+                        abs(existing.preferredScreenSideX - speaker.preferredScreenSideX) <= 0.05f
+                    val correctedSpeakerIds = project.corrections.flatMap { listOfNotNull(it.previousSpeakerId, it.newSpeakerId) }.toSet()
+                    if (bothConfirmedDistinct || !nearbyKnownPositions || conflictingSides ||
+                        (!existing.isConfirmedCharacter && !speaker.isConfirmedCharacter) ||
+                        existing.id in correctedSpeakerIds || speaker.id in correctedSpeakerIds ||
+                        project.dialogueEvents.any { it.lockedByUser && it.speakerId in setOf(existing.id, speaker.id) } ||
+                        (existing.isLocked && speaker.isLocked)) {
                         // Never merge two distinct confirmed people solely on display name
                         keptSpeakers.add(speaker)
                         continue
@@ -268,6 +254,7 @@ class AutoSelfHealDetector {
          */
         fun sanitizeCorruptedAnchors(events: List<DialogueEvent>): List<DialogueEvent> =
             events.map { evt ->
+                if (evt.lockedByUser) return@map evt
                 val anchor = evt.anchorPosition ?: return@map evt
                 if (anchor.x.isNaN() || anchor.y.isNaN()) {
                     evt.copy(anchorPosition = null)

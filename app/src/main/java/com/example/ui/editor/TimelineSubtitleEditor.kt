@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -60,9 +59,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -103,6 +102,7 @@ import com.example.domain.sentinel.ChapterInspectionStatus
 import com.example.domain.sentinel.SentinelInspectorSnapshot
 import com.example.ui.player.formatBeaconTimestamp
 import com.example.ui.player.healBeaconColor
+import com.example.ui.player.RepairComparison
 import com.example.ui.player.healBeaconStatusLabel
 import com.example.ui.player.healScopeLabel
 import com.example.ui.theme.AmethystHeal
@@ -122,6 +122,7 @@ import com.example.ui.theme.WarmAmber
 import kotlin.math.roundToInt
 
 enum class InspectorTab {
+    OVERVIEW,
     TIMELINE,
     CAST,
     REPAIRS,
@@ -179,16 +180,17 @@ fun TimelineSubtitleEditor(
     onSelectQuotaMode: (QuotaSaverMode) -> Unit = {},
     onRetryAiTranscription: () -> Unit = {},
     onAttachSubtitleFile: () -> Unit = {},
+    verifiedLeadMs: Long = 0L,
+    playbackDurationMs: Long? = null,
+    coverage: com.example.domain.analysis.CoverageSummary = com.example.domain.analysis.CoverageSummary(),
+    layoutPasses: Long = 0L,
     onInspectChapterNow: (String) -> Unit = {},
     onResetStabilityDiagnostics: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    var activeTab by remember { mutableStateOf(initialTab) }
-    LaunchedEffect(initialTab) {
-        activeTab = initialTab
-    }
+    var activeTab by rememberSaveable(initialTab) { mutableStateOf(initialTab) }
     var onlyUncertain by remember { mutableStateOf(false) }
-    var showToolsDrawer by remember { mutableStateOf(true) }
+    var showToolsDrawer by rememberSaveable { mutableStateOf(false) }
     var renamingSpeaker by remember { mutableStateOf<Speaker?>(null) }
     var showAddDialog by remember { mutableStateOf(false) }
     var showGlossaryDialog by remember { mutableStateOf(false) }
@@ -222,6 +224,8 @@ fun TimelineSubtitleEditor(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    FilterChip(selected = activeTab == InspectorTab.OVERVIEW, onClick = { activeTab = InspectorTab.OVERVIEW },
+                        label = { Text("Overview") }, modifier = Modifier.testTag("inspector_tab_overview"))
                     FilterChip(
                         selected = activeTab == InspectorTab.TIMELINE,
                         onClick = { activeTab = InspectorTab.TIMELINE },
@@ -530,6 +534,8 @@ fun TimelineSubtitleEditor(
         }
 
         when (activeTab) {
+            InspectorTab.OVERVIEW -> StudioOverview(project, currentTimeMs, playbackDurationMs, verifiedLeadMs,
+                coverage, layoutPasses, onTab = { activeTab = it })
             InspectorTab.CAST -> {
                 RunningSpeakerGlossaryTab(
                     project = project,
@@ -1516,8 +1522,8 @@ private fun StudioHealBeaconsTab(
                 key = { _, b -> b.id },
             ) { _, beacon ->
                 val accent = healBeaconColor(beacon.status)
-                val canUndo = beacon.status == HealBeaconStatus.HEALED &&
-                    (beacon.preHealSnapshotEvents.isNotEmpty() || beacon.replacedEventIds.isNotEmpty())
+                val canUndo = beacon.status !in setOf(HealBeaconStatus.HEALING, HealBeaconStatus.UNDONE) &&
+                    (beacon.preHealSnapshotEvents.isNotEmpty() || beacon.replacedEventIds.isNotEmpty() || beacon.preRepairCoverage.isNotEmpty())
                 Card(
                     colors = CardDefaults.cardColors(containerColor = CinemaSurface),
                     shape = RoundedCornerShape(14.dp),
@@ -1560,6 +1566,7 @@ private fun StudioHealBeaconsTab(
                             }
                         }
 
+                        RepairComparison(beacon)
                         if (beacon.statusNote.isNotBlank()) {
                             Text(
                                 text = beacon.statusNote,
@@ -1639,14 +1646,22 @@ private fun StudioChaptersTab(
             }
         } else {
             itemsIndexed(project.chapters, key = { _, ch -> ch.id }) { idx, chapter ->
-                val isCurrent = currentTimeMs in chapter.startMs..chapter.endMs
+                val isCurrent = currentTimeMs >= chapter.startMs && currentTimeMs < chapter.endMs
+                val inspection = project.chapterInspections.lastOrNull { it.chapterId == chapter.id && it.boundaryMs == chapter.startMs }
+                val repair = inspection?.beaconId?.let { id -> project.healBeacons.firstOrNull { it.id == id } }
+                val patrolStatus = when {
+                    chapter.startMs == 0L -> "Opening"
+                    inspection == null -> "Awaiting inspection"
+                    repair != null -> "Repair · ${healBeaconStatusLabel(repair.status)}"
+                    inspection.finding.isNotBlank() -> "Needs review · ${inspection.finding}"
+                    else -> "Transcript and pointer checks passed"
+                }
                 val sourceLabel = when (chapter.source) {
                     ChapterSource.YOUTUBE_DESCRIPTION -> "Video chapter"
                     ChapterSource.YOUTUBE_METADATA -> "Video chapter"
                     ChapterSource.INFERRED_EDITORIAL -> "Inferred section"
                 }
                 val patrol = patrolByChapterId[chapter.id]
-                val patrolStatusText = patrol?.status?.label
                 val patrolStatusColor = patrol?.status?.let { chapterInspectionColor(it) }
                 Card(
                     colors = CardDefaults.cardColors(
@@ -1698,7 +1713,7 @@ private fun StudioChaptersTab(
                                     }
                                 }
                                 OutlinedButton(
-                                    onClick = { onChapterHeal(chapter.startMs + 1000L) },
+                                    onClick = { onChapterHeal(chapter.startMs) },
                                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                                 ) {
                                     Icon(Icons.Filled.AutoFixHigh, contentDescription = null, modifier = Modifier.size(14.dp))
@@ -1707,9 +1722,13 @@ private fun StudioChaptersTab(
                                 }
                             }
                         }
-                        if (patrolStatusText != null && patrolStatusColor != null) {
+                        if (patrol == null && chapter.startMs > 0L) {
+                            Text(patrolStatus, style = MaterialTheme.typography.labelSmall)
+                        }
+                        if (patrol != null && patrolStatusColor != null) {
                             Text(
-                                text = "Boundary patrol: $patrolStatusText${patrol.summary.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""}",
+                                text = if (inspection != null && repair == null && inspection.finding.isEmpty()) "Transcript and pointer checks passed"
+                                    else "${patrol.status.label}${patrol.summary.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = patrolStatusColor,
                                 maxLines = 2,
@@ -1786,12 +1805,13 @@ private fun StudioDiagnosticsTab(
                         }
                     }
                     Text(
-                        text = "${visualStabilitySnapshot.totalRelocations} relocations · ${visualStabilitySnapshot.suppressedAbaOscillations} bounces blocked · ${visualStabilitySnapshot.tailVisibilityToggles} tail flips",
+                        text = "${visualStabilitySnapshot.measuredBodyRelocations} on-screen moves · ${visualStabilitySnapshot.suppressedAbaOscillations} bounces blocked · ${visualStabilitySnapshot.tailVisibilityToggles} tail flips",
                         style = MaterialTheme.typography.bodySmall,
                         color = SoftJade,
                     )
                     DiagnosticMetricRow("Layout evaluations", "${visualStabilitySnapshot.layoutEvaluations}")
-                    DiagnosticMetricRow("Committed relocations", "${visualStabilitySnapshot.totalRelocations}")
+                    DiagnosticMetricRow("On-screen balloon moves", "${visualStabilitySnapshot.measuredBodyRelocations}")
+                    DiagnosticMetricRow("Layout proposal moves", "${visualStabilitySnapshot.totalRelocations}")
                     DiagnosticMetricRow("A-B-A bounces blocked", "${visualStabilitySnapshot.suppressedAbaOscillations}")
                     DiagnosticMetricRow("Tail state toggles", "${visualStabilitySnapshot.tailVisibilityToggles}")
                     DiagnosticMetricRow("Tracking dropouts", "${visualStabilitySnapshot.trackingDropouts}")
@@ -1835,6 +1855,9 @@ private fun StudioDiagnosticsTab(
                         "#${diag.seekGeneration} · ${if (!diag.isSeekInFlight) "Acknowledged" else "Awaiting"}",
                     )
                     DiagnosticMetricRow("Buffering episodes", "${diag.bufferingEpisodeCount}")
+                    if (diag.scoutWindowServiceMs > 0L) {
+                        DiagnosticMetricRow("Scout processing time", "${diag.scoutWindowServiceMs / 1000.0}s for ${diag.scoutWindowMediaMs / 1000.0}s of video (rolling average)")
+                    }
                     DiagnosticMetricRow("Auto-resumes", "${diag.autoResumeCount}")
                     if (readinessSnapshot.isWatchNowBypassActive) {
                         DiagnosticMetricRow("Watch Now bypass", "Active for current segment")
@@ -1873,7 +1896,7 @@ private fun StudioDiagnosticsTab(
                     DiagnosticMetricRow(
                         "Chapter patrol",
                         when {
-                            sentinelSnapshot.chapterPatrolRecords.isEmpty() -> "No YouTube chapters"
+                            sentinelSnapshot.chapterPatrolRecords.isEmpty() -> "No chapter inspections queued"
                             sentinelSnapshot.patrolSuspendedForPlayback -> "Suspended (${sentinelSnapshot.patrolSuspensionReason.ifBlank { "buffering priority" }})"
                             else -> "Active (${sentinelSnapshot.chapterPatrolRecords.size} chapters)"
                         },

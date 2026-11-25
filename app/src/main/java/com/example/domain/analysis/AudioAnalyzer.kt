@@ -255,7 +255,7 @@ class AudioAnalyzer(private val context: Context) {
                 audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceIn(1, 8)
             } else 1
             val targetRate = 16000
-            val stepRatio = (srcRate.toDouble() / targetRate.toDouble()).coerceAtLeast(1.0)
+            val stepRatio = srcRate.toDouble() / targetRate
 
             extractor.selectTrack(audioIdx)
             codec = MediaCodec.createDecoderByType(mime).apply {
@@ -276,7 +276,7 @@ class AudioAnalyzer(private val context: Context) {
                     chunks.add(
                         AudioWavChunk(
                             startMs = currentChunkStartMs,
-                            endMs = endMs.coerceAtLeast(currentChunkStartMs + 500L),
+                            endMs = currentChunkStartMs + pcm.size * 1_000L / (2L * targetRate),
                             wavBytes = wrapPcmAsWav(pcm, targetRate),
                         )
                     )
@@ -310,6 +310,7 @@ class AudioAnalyzer(private val context: Context) {
                     val outBuf = codec.getOutputBuffer(outIdx)
                     val ptsMs = (info.presentationTimeUs / 1000L).coerceAtLeast(0L)
                     if (outBuf != null && info.size > 0) {
+                        if (pcmOut.size() == 0) currentChunkStartMs = ptsMs
                         if (ptsMs - currentChunkStartMs >= chunkWindowMs && pcmOut.size() > 3200) {
                             flushChunk(ptsMs)
                         }
@@ -321,7 +322,7 @@ class AudioAnalyzer(private val context: Context) {
                         while (frameIdx < frameCount) {
                             var monoSum = 0
                             for (c in 0 until channels) monoSum += shorts.get().toInt()
-                            if (sampleAccumPos <= 0.0) {
+                            while (sampleAccumPos < 1.0) {
                                 val monoSample = (monoSum / channels).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
                                 pcmOut.write(monoSample.toInt() and 0xFF)
                                 pcmOut.write((monoSample.toInt() shr 8) and 0xFF)
@@ -443,11 +444,11 @@ class AudioAnalyzer(private val context: Context) {
             FileOutputStream(tempFile).use { out ->
                 val initUrl = overlapping.first().initMapUrl
                 if (!initUrl.isNullOrBlank()) {
-                    val initBytes = httpDownloadBytes(initUrl, headers) ?: return@withContext null
+                    val initBytes = httpDownloadBytes(initUrl, headers, credentialUrl = playlistUrl) ?: return@withContext null
                     out.write(initBytes)
                 }
                 for (seg in overlapping) {
-                    val segBytes = httpDownloadBytes(seg.url, headers) ?: continue
+                    val segBytes = httpDownloadBytes(seg.url, headers, credentialUrl = playlistUrl) ?: return@withContext null
                     out.write(segBytes)
                 }
             }
@@ -501,7 +502,7 @@ class AudioAnalyzer(private val context: Context) {
                 audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceIn(1, 8)
             } else 1
             val targetRate = 16000
-            val stepRatio = (srcRate.toDouble() / targetRate.toDouble()).coerceAtLeast(1.0)
+            val stepRatio = srcRate.toDouble() / targetRate
 
             extractor.selectTrack(audioIdx)
             if (padStartMs > 250L) {
@@ -560,7 +561,7 @@ class AudioAnalyzer(private val context: Context) {
                         while (frameIdx < frameCount) {
                             var monoSum = 0
                             for (c in 0 until channels) monoSum += shorts.get().toInt()
-                            if (sampleAccumPos <= 0.0) {
+                            while (sampleAccumPos < 1.0) {
                                 val monoSample = (monoSum / channels)
                                     .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
                                     .toShort()
@@ -583,7 +584,7 @@ class AudioAnalyzer(private val context: Context) {
             val resolvedStart = actualStartMs ?: windowStartMs
             AudioWavChunk(
                 startMs = resolvedStart,
-                endMs = windowEndMs.coerceAtLeast(resolvedStart + 500L),
+                endMs = resolvedStart + pcm.size.toLong() * 1000L / (2L * targetRate),
                 wavBytes = wrapPcmAsWav(pcm, targetRate),
             )
         } finally {
@@ -603,18 +604,20 @@ class AudioAnalyzer(private val context: Context) {
         val variantUrl = pickBestHlsMasterVariantUri(text, playlistUrl)
         val mediaPlaylistUrl = variantUrl ?: playlistUrl
         val mediaText = if (variantUrl != null) {
-            httpDownloadText(variantUrl, headers) ?: return null
+            httpDownloadText(variantUrl, headers, credentialUrl = playlistUrl) ?: return null
         } else {
             text
         }
+        // A sliding live window has no stable zero timestamp for an offline audio slice.
+        if (!mediaText.lineSequence().any { it.trim() == "#EXT-X-ENDLIST" }) return null
         val parsed = parseHlsMediaPlaylist(mediaText, mediaPlaylistUrl) ?: return null
         if (hlsIndexCache.size > 16) hlsIndexCache.clear()
         hlsIndexCache[playlistUrl] = parsed
         return parsed
     }
 
-    private fun httpDownloadText(urlStr: String, headers: Map<String, String>): String? {
-        val bytes = httpDownloadBytes(urlStr, headers, maxBytes = 2 * 1024 * 1024) ?: return null
+    private fun httpDownloadText(urlStr: String, headers: Map<String, String>, credentialUrl: String = urlStr): String? {
+        val bytes = httpDownloadBytes(urlStr, headers, maxBytes = 2 * 1024 * 1024, credentialUrl = credentialUrl) ?: return null
         return String(bytes, Charsets.UTF_8)
     }
 
@@ -622,14 +625,19 @@ class AudioAnalyzer(private val context: Context) {
         urlStr: String,
         headers: Map<String, String>,
         maxBytes: Int = 12 * 1024 * 1024,
+        credentialUrl: String = urlStr,
+        redirectsRemaining: Int = 4,
     ): ByteArray? {
-        val conn = (URL(urlStr).openConnection() as? HttpURLConnection) ?: return null
+        val url = runCatching { URL(urlStr) }.getOrNull() ?: return null
+        if (url.protocol !in setOf("https", "http")) return null
+        val conn = url.openConnection() as HttpURLConnection
         return try {
             conn.requestMethod = "GET"
-            conn.instanceFollowRedirects = true
+            conn.instanceFollowRedirects = false
             conn.connectTimeout = 7_500
             conn.readTimeout = 10_000
-            headers.forEach { (k, v) ->
+            val requestHeaders = headersForMediaRequest(credentialUrl, urlStr, headers)
+            requestHeaders.forEach { (k, v) ->
                 if (k.isNotBlank() && v.isNotBlank()) conn.setRequestProperty(k, v)
             }
             if (!headers.containsKey("User-Agent")) {
@@ -637,6 +645,10 @@ class AudioAnalyzer(private val context: Context) {
                     "User-Agent",
                     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
                 )
+            }
+            if (conn.responseCode in setOf(301, 302, 303, 307, 308) && redirectsRemaining > 0) {
+                val next = conn.getHeaderField("Location") ?: return null
+                return httpDownloadBytes(URL(url, next).toString(), headers, maxBytes, credentialUrl, redirectsRemaining - 1)
             }
             if (conn.responseCode !in 200..299) return null
             conn.inputStream.use { input ->
@@ -647,7 +659,7 @@ class AudioAnalyzer(private val context: Context) {
                     val read = input.read(buf)
                     if (read <= 0) break
                     total += read
-                    if (total > maxBytes) break
+                    if (total > maxBytes) return null
                     out.write(buf, 0, read)
                 }
                 out.toByteArray()
@@ -967,6 +979,17 @@ class AudioAnalyzer(private val context: Context) {
                 }
             }
             return bestUrl
+        }
+
+        internal fun headersForMediaRequest(original: String, target: String, headers: Map<String, String>): Map<String, String> {
+            // Cookies granted to the observed media request must not follow a playlist to another origin.
+            val sameOrigin = runCatching {
+                val from = URL(original)
+                val to = URL(target)
+                from.protocol == to.protocol && from.host.equals(to.host, true) &&
+                    (if (from.port < 0) from.defaultPort else from.port) == (if (to.port < 0) to.defaultPort else to.port)
+            }.getOrDefault(false)
+            return if (sameOrigin) headers else headers.filterKeys { it.equals("User-Agent", true) }
         }
 
         internal fun parseHlsMediaPlaylist(playlistText: String, baseUrl: String): HlsMediaIndex? {

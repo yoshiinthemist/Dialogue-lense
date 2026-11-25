@@ -1,5 +1,7 @@
 package com.example.domain.analysis
 
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import com.example.data.model.CachedVideoTranscript
 import com.example.data.model.CoverageInterval
 import com.example.data.model.CoverageStatus
@@ -101,8 +103,45 @@ class TranscriptCoverageLedger(
     initialIntervals: List<CoverageInterval> = emptyList(),
 ) {
     private val lock = Any()
+    private val revisions = MutableStateFlow(0L)
+    val workRevision: Long get() = revisions.value
+
+    /** Sleep through a temporarily empty queue until a worker or repair releases its reservation. */
+    suspend fun awaitWorkRelease(revision: Long): Boolean {
+        val pending = synchronized(lock) {
+            repairReservations.isNotEmpty() || intervals.any { it.status == CoverageStatus.IN_PROGRESS }
+        }
+        if (workRevision != revision) return true
+        if (!pending) return false
+        revisions.first { it != revision }
+        return true
+    }
+    private val repairReservations = mutableMapOf<String, Pair<Long, Long>>()
+
+    fun tryReserveRepair(key: String, startMs: Long, endMs: Long): Boolean = synchronized(lock) {
+        if (endMs <= startMs || repairReservations.values.any { (s, e) -> s < endMs && e > startMs } ||
+            intervals.any { it.status == CoverageStatus.IN_PROGRESS && it.startMs < endMs && it.endMs > startMs }) {
+            return@synchronized false
+        }
+        repairReservations[key] = startMs to endMs
+        true
+    }
+
+    fun releaseRepair(key: String) {
+        synchronized(lock) { if (repairReservations.remove(key) != null) revisions.value++ }
+    }
+
+    fun revokeRepairReservations(): Boolean = synchronized(lock) {
+        if (repairReservations.isEmpty()) return@synchronized false
+        repairReservations.clear()
+        revisions.value++
+        true
+    }
+
+    fun clearRepairReservations() { revokeRepairReservations() }
     private var totalDurationMs: Long = initialDurationMs.coerceAtLeast(0L)
     private val intervals = mutableListOf<CoverageInterval>()
+    private var verifiedRanges: List<TimeWindowRange> = emptyList()
 
     private var requestedWindows = 0
     private var completedWindows = 0
@@ -126,7 +165,9 @@ class TranscriptCoverageLedger(
         synchronized(lock) {
             totalDurationMs = durationMs.coerceAtLeast(0L)
             activeSource = source
+            revisions.value++
             intervals.clear()
+            verifiedRanges = emptyList()
             requestedWindows = 0
             completedWindows = 0
             acceptedEvents = 0
@@ -172,9 +213,22 @@ class TranscriptCoverageLedger(
             totalDurationMs = safeDur
             if (safeDur <= 0L) {
                 intervals.clear()
+                verifiedRanges = emptyList()
                 return
             }
             rebuildNormalizedLocked(intervals.toList())
+        }
+    }
+
+    /** The decoder can learn the runtime after file import or after the last timed subtitle.
+     * A complete track covers its quiet tail. Partial and generated tracks still require evidence there.
+     */
+    fun reconcileMediaDuration(durationMs: Long, events: List<DialogueEvent>, source: SubtitleSourceKind) {
+        if (durationMs <= 0L) return
+        if (events.isNotEmpty() && (source == SubtitleSourceKind.UPLOADED_FILE || source == SubtitleSourceKind.EMBEDDED_TRACK)) {
+            markAuthoritativeTrack(durationMs, events, source)
+        } else {
+            updateDuration(durationMs)
         }
     }
 
@@ -251,6 +305,43 @@ class TranscriptCoverageLedger(
         }
     }
 
+    /** Release unfinished subranges while preserving any evidence, failures, and retry counts already committed. */
+    fun releaseScoutWindow(startMs: Long, endMs: Long) = synchronized(lock) {
+        if (intervals.any { it.status == CoverageStatus.IN_PROGRESS && it.startMs < endMs && it.endMs > startMs }) {
+            applyIntervalMutationLocked(startMs, endMs) { span ->
+                if (span.status == CoverageStatus.IN_PROGRESS) span.copy(status = CoverageStatus.PENDING) else span
+            }
+        }
+    }
+
+    /** Only newly verified evidence belongs to this repair. Later Scout evidence supersedes its token. */
+    fun recordRepairEvidence(evidence: List<CoverageInterval>, token: String): List<CoverageInterval> = synchronized(lock) {
+        val originals = mutableListOf<CoverageInterval>()
+        for (span in evidence) {
+            if (!span.verified || span.startMs < 0 || span.endMs <= span.startMs ||
+                (span.status == CoverageStatus.VERIFIED_DIALOGUE && span.dialogueCount <= 0)) continue
+            ensureDurationAtLeastLocked(span.endMs)
+            if (sourcePriority(span.source) > sourcePriority(activeSource)) activeSource = span.source
+            applyIntervalMutationLocked(span.startMs, span.endMs) { previous ->
+                if (previous.verified || previous.status == CoverageStatus.IN_PROGRESS) previous else {
+                    originals.add(previous)
+                    span.copy(startMs = previous.startMs, endMs = previous.endMs, repairToken = token)
+                }
+            }
+        }
+        originals
+    }
+
+    fun undoRepairEvidence(originals: List<CoverageInterval>, token: String) {
+        synchronized(lock) {
+            for (original in originals) {
+                applyIntervalMutationLocked(original.startMs, original.endMs) { current ->
+                    if (current.repairToken == token) original.copy(startMs = current.startMs, endMs = current.endMs) else current
+                }
+            }
+        }
+    }
+
     fun recordOutcome(
         startMs: Long,
         endMs: Long,
@@ -270,37 +361,26 @@ class TranscriptCoverageLedger(
             if (sourcePriority(source) >= sourcePriority(activeSource)) {
                 activeSource = source
             }
-            // Epistemic integrity guard (Operation Golden Video Section 3):
-            // Never allow an empty/rejected window with dialogueCount == 0 to be committed as VERIFIED_DIALOGUE.
-            val effectiveStatus = if (status == CoverageStatus.VERIFIED_DIALOGUE && dialogueCount <= 0) {
-                CoverageStatus.FAILED
-            } else {
-                status
-            }
-            val effectiveReason = if (status == CoverageStatus.VERIFIED_DIALOGUE && dialogueCount <= 0) {
-                failureReason.ifBlank { "EMPTY_VERIFIED_DIALOGUE_REJECTED" }
-            } else {
-                failureReason
-            }
-            val effectiveIncrementRetry = incrementRetry ||
-                (status == CoverageStatus.VERIFIED_DIALOGUE && dialogueCount <= 0)
-            val isVerified = effectiveStatus == CoverageStatus.VERIFIED_DIALOGUE ||
-                effectiveStatus == CoverageStatus.VERIFIED_SILENCE
-            val isSilence = effectiveStatus == CoverageStatus.VERIFIED_SILENCE
+            val emptyDialogue = status == CoverageStatus.VERIFIED_DIALOGUE && dialogueCount <= 0
+            val nextStatus = if (emptyDialogue) CoverageStatus.FAILED else status
+            val reason = if (emptyDialogue) failureReason.ifBlank { "EMPTY_VERIFIED_DIALOGUE_REJECTED" } else failureReason
+            val isVerified = nextStatus == CoverageStatus.VERIFIED_DIALOGUE || nextStatus == CoverageStatus.VERIFIED_SILENCE
+            val isSilence = nextStatus == CoverageStatus.VERIFIED_SILENCE
             applyIntervalMutationLocked(s, e) { existing ->
                 if (!forceOverrideHigherAuthority &&
                     existing.verified &&
-                    sourcePriority(existing.source) > sourcePriority(source)
+                    (!isVerified || sourcePriority(existing.source) > sourcePriority(source))
                 ) {
                     existing
                 } else {
-                    val nextRetries = if (effectiveIncrementRetry) existing.retryAttempts + 1 else existing.retryAttempts
+                    val nextRetries = if (incrementRetry || emptyDialogue) existing.retryAttempts + 1 else existing.retryAttempts
                     existing.copy(
-                        status = effectiveStatus,
+                        status = nextStatus,
+                        repairToken = null,
                         source = source,
                         verified = isVerified,
                         retryAttempts = nextRetries,
-                        lastFailureReason = if (isVerified) "" else effectiveReason.ifBlank { existing.lastFailureReason },
+                        lastFailureReason = if (isVerified) "" else reason.ifBlank { existing.lastFailureReason },
                         dialogueCount = if (isSilence) 0 else dialogueCount.coerceAtLeast(0),
                         silenceConfirmed = isSilence,
                         updatedAtEpochMs = nowEpochMs,
@@ -324,11 +404,17 @@ class TranscriptCoverageLedger(
             "markAuthoritativeTrack requires UPLOADED_FILE or EMBEDDED_TRACK"
         }
         val maxCueEnd = events.maxOfOrNull { it.endTimeMs } ?: 0L
-        val effectiveDur = maxOf(durationMs, maxCueEnd).coerceAtLeast(1_000L)
+        val effectiveDur = durationMs.takeIf { it > 0L } ?: maxCueEnd.coerceAtLeast(0L)
         val built = mutableListOf<CoverageInterval>()
         val realSorted = events
-            .filter { it.endTimeMs > it.startTimeMs }
+            .filter { it.endTimeMs > it.startTimeMs && it.endTimeMs > 0L && it.startTimeMs < effectiveDur &&
+                (it.sourceText.isNotBlank() || it.translatedText.isNotBlank()) }
             .sortedBy { it.startTimeMs }
+        if (realSorted.isEmpty()) {
+            // A missing or unparsable track supplies no evidence, including for silence.
+            updateDuration(effectiveDur)
+            return
+        }
 
         var cursor = 0L
         var i = 0
@@ -392,12 +478,7 @@ class TranscriptCoverageLedger(
 
     fun intervalsSnapshot(): List<CoverageInterval> = synchronized(lock) { intervals.toList() }
 
-    fun bufferedRanges(): List<TimeWindowRange> = synchronized(lock) {
-        val verified = intervals
-            .filter { it.verified && it.endMs > it.startMs }
-            .map { TimeWindowRange(it.startMs, it.endMs) }
-        LookaheadWindowPlanner.coalesceBufferedRanges(verified, bridgeGapMs = 1L)
-    }
+    fun bufferedRanges(): List<TimeWindowRange> = synchronized(lock) { verifiedRanges }
 
     fun failedRanges(): List<TimeWindowRange> = synchronized(lock) {
         val failed = intervals
@@ -406,7 +487,7 @@ class TranscriptCoverageLedger(
                     it.endMs > it.startMs
             }
             .map { TimeWindowRange(it.startMs, it.endMs) }
-        LookaheadWindowPlanner.coalesceBufferedRanges(failed, bridgeGapMs = 1L)
+        LookaheadWindowPlanner.coalesceBufferedRanges(failed, bridgeGapMs = 0L)
     }
 
     fun furthestAnalyzedMs(): Long = synchronized(lock) {
@@ -416,65 +497,34 @@ class TranscriptCoverageLedger(
             ?: 0L
     }
 
-    fun continuousVerifiedUpToMs(): Long = synchronized(lock) {
-        var cursor = 0L
-        for (iv in intervals) {
-            if (iv.startMs > cursor) break
-            if (!iv.verified) break
-            cursor = maxOf(cursor, iv.endMs)
-        }
-        cursor
+    /** Continuous verified speech or confirmed silence forward from the actual playhead. */
+    fun verifiedLeadMs(positionMs: Long): Long = synchronized(lock) {
+        val position = positionMs.coerceAtLeast(0L)
+        val index = verifiedRanges.binarySearchBy(position) { it.startMs }
+        val range = verifiedRanges.getOrNull(if (index >= 0) index else -index - 2)
+        if (range == null) 0L else (range.endMs - position).coerceAtLeast(0L)
     }
 
-    /**
-     * Returns the exact duration in milliseconds of contiguous verified coverage
-     * (`VERIFIED_DIALOGUE` or `VERIFIED_SILENCE`) starting at [positionMs] and extending
-     * forward without any unverified gap.
-     */
-    fun continuousVerifiedLeadFrom(positionMs: Long): Long = synchronized(lock) {
-        if (totalDurationMs <= 0L || intervals.isEmpty()) return@synchronized 0L
-        val start = positionMs.coerceIn(0L, totalDurationMs)
-        if (start >= totalDurationMs) return@synchronized 0L
-        var cursor = start
-        for (iv in intervals) {
-            if (iv.endMs <= cursor) continue
-            if (iv.startMs > cursor) break
-            if (!iv.verified) break
-            cursor = maxOf(cursor, iv.endMs)
-        }
-        (cursor - start).coerceAtLeast(0L)
-    }
+    fun continuousVerifiedLeadFrom(positionMs: Long): Long = verifiedLeadMs(positionMs)
 
-    /**
-     * Returns the epistemic [CoverageStatus] at [positionMs], or null if outside known duration.
-     */
     fun coverageStatusAt(positionMs: Long): CoverageStatus? = synchronized(lock) {
-        if (totalDurationMs <= 0L || intervals.isEmpty()) return@synchronized null
-        val clamped = positionMs.coerceIn(0L, (totalDurationMs - 1L).coerceAtLeast(0L))
-        intervals.firstOrNull { clamped in it.startMs until it.endMs }?.status
-            ?: intervals.lastOrNull()?.status
+        if (positionMs !in 0L until totalDurationMs) return@synchronized null
+        val index = intervals.binarySearchBy(positionMs) { it.startMs }
+        intervals.getOrNull(if (index >= 0) index else -index - 2)?.status
     }
 
-    /**
-     * Returns true if [positionMs] falls inside a `FAILED` or `PARTIAL_RECOVERY` interval.
-     */
-    fun hasFailedIntervalAt(positionMs: Long): Boolean {
-        val status = coverageStatusAt(positionMs)
-        return status == CoverageStatus.FAILED || status == CoverageStatus.PARTIAL_RECOVERY
+    fun hasFailedIntervalAt(positionMs: Long): Boolean = when (coverageStatusAt(positionMs)) {
+        CoverageStatus.FAILED, CoverageStatus.PARTIAL_RECOVERY -> true
+        else -> false
     }
 
-    /**
-     * Returns the first unverified interval within `[positionMs, positionMs + horizonMs]`, or null
-     * if the entire horizon is contiguously verified.
-     */
     fun firstUnverifiedGapFrom(positionMs: Long, horizonMs: Long): CoverageInterval? = synchronized(lock) {
-        if (totalDurationMs <= 0L || intervals.isEmpty()) return@synchronized null
         val start = positionMs.coerceIn(0L, totalDurationMs)
-        val end = (start + horizonMs.coerceAtLeast(0L)).coerceAtMost(totalDurationMs)
-        intervals.firstOrNull { iv ->
-            !iv.verified && iv.endMs > start && iv.startMs < end
-        }
+        val end = start + horizonMs.coerceIn(0L, totalDurationMs - start)
+        intervals.firstOrNull { !it.verified && it.endMs > start && it.startMs < end }
     }
+
+    fun continuousVerifiedUpToMs(): Long = verifiedLeadMs(0L)
 
     fun isFullyVerified(): Boolean = synchronized(lock) {
         totalDurationMs > 0L &&
@@ -594,14 +644,29 @@ class TranscriptCoverageLedger(
         lookaheadHorizonMs: Long = 180_000L,
         openingWindowMs: Long = LookaheadWindowPlanner.OPENING_SCOUT_WINDOW_SEC * 1000L,
         rollingWindowMs: Long = LookaheadWindowPlanner.ROLLING_SCOUT_WINDOW_SEC * 1000L,
+        startAtPlayhead: Boolean = false,
     ): CoverageInterval? = synchronized(lock) {
         if (totalDurationMs <= 0L) return@synchronized null
         val safePlayhead = playheadMs.coerceIn(0L, totalDurationMs)
-        val candidates = intervals.filter { iv ->
+        // Keep the remaining unreserved part of each gap available to Scout.
+        val available = if (repairReservations.isEmpty()) intervals else intervals.flatMap { interval ->
+            var slices = listOf(interval)
+            for ((start, end) in repairReservations.values) {
+                slices = slices.flatMap { slice ->
+                    if (slice.endMs <= start || slice.startMs >= end) listOf(slice)
+                    else listOfNotNull(
+                        slice.copy(endMs = start).takeIf { slice.startMs < start },
+                        slice.copy(startMs = end).takeIf { slice.endMs > end },
+                    )
+                }
+            }
+            slices
+        }
+        val candidates = available.filter { iv ->
             !iv.verified &&
                 iv.status != CoverageStatus.IN_PROGRESS &&
                 iv.endMs > iv.startMs &&
-                (iv.status != CoverageStatus.FAILED || iv.retryAttempts < maxRetryAttempts)
+                ((iv.status != CoverageStatus.FAILED && iv.status != CoverageStatus.PARTIAL_RECOVERY) || iv.retryAttempts < maxRetryAttempts)
         }
         if (candidates.isEmpty()) return@synchronized null
 
@@ -618,7 +683,9 @@ class TranscriptCoverageLedger(
             ?: candidates.first()
 
         val maxChunkMs = if (chosen.startMs == 0L) openingWindowMs else rollingWindowMs
-        val sliceStart = if (safePlayhead in chosen.startMs until chosen.endMs &&
+        val sliceStart = if (startAtPlayhead && safePlayhead in chosen.startMs until chosen.endMs) {
+            safePlayhead
+        } else if (safePlayhead in chosen.startMs until chosen.endMs &&
             (chosen.endMs - chosen.startMs) > maxChunkMs &&
             chosen.status != CoverageStatus.FAILED
         ) {
@@ -629,11 +696,7 @@ class TranscriptCoverageLedger(
         } else {
             chosen.startMs
         }
-        val sliceEnd = if (chosen.status == CoverageStatus.FAILED || chosen.status == CoverageStatus.PARTIAL_RECOVERY) {
-            minOf(chosen.endMs, sliceStart + maxChunkMs)
-        } else {
-            minOf(chosen.endMs, sliceStart + maxChunkMs)
-        }
+        val sliceEnd = minOf(chosen.endMs, sliceStart + maxChunkMs)
         chosen.copy(startMs = sliceStart, endMs = sliceEnd.coerceAtLeast(sliceStart))
     }
 
@@ -698,6 +761,7 @@ class TranscriptCoverageLedger(
     private fun rebuildNormalizedLocked(rawList: List<CoverageInterval>) {
         if (totalDurationMs <= 0L) {
             intervals.clear()
+            verifiedRanges = emptyList()
             return
         }
         val clipped = rawList
@@ -773,6 +837,7 @@ class TranscriptCoverageLedger(
                 prev.verified == iv.verified &&
                 prev.retryAttempts == iv.retryAttempts &&
                 prev.lastFailureReason == iv.lastFailureReason &&
+                prev.repairToken == iv.repairToken &&
                 prev.silenceConfirmed == iv.silenceConfirmed
             ) {
                 coalesced[coalesced.lastIndex] = prev.copy(
@@ -787,13 +852,16 @@ class TranscriptCoverageLedger(
 
         intervals.clear()
         intervals.addAll(coalesced)
+        verifiedRanges = LookaheadWindowPlanner.coalesceBufferedRanges(
+            coalesced.filter { it.verified }.map { TimeWindowRange(it.startMs, it.endMs) }, bridgeGapMs = 0L)
+        revisions.value++
     }
 
     companion object {
         fun sourcePriority(source: SubtitleSourceKind): Int = when (source) {
             SubtitleSourceKind.BUILT_IN_DEMO -> 0
             SubtitleSourceKind.AI_DRAFT -> 1
-            SubtitleSourceKind.EMBEDDED_TRACK -> 2
+            SubtitleSourceKind.EMBEDDED_TRACK, SubtitleSourceKind.EMBEDDED_PARTIAL -> 2
             SubtitleSourceKind.UPLOADED_FILE -> 3
         }
 

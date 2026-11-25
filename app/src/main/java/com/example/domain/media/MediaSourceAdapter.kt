@@ -224,22 +224,31 @@ class YouTubeMediaAdapter : MediaSourceAdapter {
     override val providerKind: MediaProviderKind = MediaProviderKind.YOUTUBE_EMBED
     override val displayName: String = "YouTube"
 
+    private companion object {
+        val VIDEO_ID = Regex("[A-Za-z0-9_-]{11}")
+    }
+
     fun extractVideoId(rawInput: String): String? {
-        val trimmed = rawInput.trim()
-        if (trimmed.isBlank()) return null
-        if (trimmed.matches(Regex("^[A-Za-z0-9_-]{11}$"))) return trimmed
-        val patterns = listOf(
-            Regex("(?:youtube\\.com/watch\\?(?:[^#\\s]*&)?v=)([A-Za-z0-9_-]{11})"),
-            Regex("(?:youtu\\.be/)([A-Za-z0-9_-]{11})"),
-            Regex("(?:youtube\\.com/embed/)([A-Za-z0-9_-]{11})"),
-            Regex("(?:youtube\\.com/shorts/)([A-Za-z0-9_-]{11})"),
-            Regex("(?:youtube\\.com/live/)([A-Za-z0-9_-]{11})"),
-        )
-        for (regex in patterns) {
-            val id = regex.find(trimmed)?.groupValues?.getOrNull(1)
-            if (!id.isNullOrBlank()) return id
+        val value = rawInput.trim()
+        if (VIDEO_ID.matches(value)) return value
+        val uri = runCatching {
+            URI(if (value.contains("://")) value else "https://$value")
+        }.getOrNull() ?: return null
+        if (!(uri.scheme.equals("https", true) || uri.scheme.equals("http", true))) return null
+        val host = uri.host?.lowercase(Locale.US) ?: return null
+        val path = uri.path.orEmpty().trim('/').split('/')
+        val id = when {
+            host == "youtu.be" || host == "www.youtu.be" -> path.singleOrNull()
+            host == "youtube.com" || host.endsWith(".youtube.com") ||
+                host == "youtube-nocookie.com" || host.endsWith(".youtube-nocookie.com") -> when {
+                path == listOf("watch") -> uri.rawQuery.orEmpty().split('&')
+                    .firstOrNull { it.startsWith("v=") }?.removePrefix("v=")
+                path.size == 2 && path.first() in setOf("embed", "shorts", "live") -> path[1]
+                else -> null
+            }
+            else -> null
         }
-        return null
+        return id?.takeIf(VIDEO_ID::matches)
     }
 
     override fun canHandleInput(rawInput: String): Boolean = extractVideoId(rawInput) != null

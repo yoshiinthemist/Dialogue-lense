@@ -28,6 +28,8 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -72,26 +74,26 @@ fun FirstTimeOnboardingOverlay(
         listOf(
             OnboardingStep(
                 title = "Dialogue that belongs to the speaker",
-                body = "DialogueLens places calm, readable speech bubbles near who is talking, with consistent colors for each voice and clear lip-reading zones.",
+                body = "Open a video link or file. Speech bubbles appear beside the speaker when their position is known.",
                 icon = Icons.Rounded.ChatBubbleOutline,
                 accent = SoftJade,
             ),
             OnboardingStep(
                 title = "Pause. Mark. Heal. Continue.",
-                body = "Notice a line or speaker that looks off? Pause and tap \"Heal this moment\" to mark it for localized repair while you keep watching.",
+                body = "Pause and tap “Heal this moment” to mark a line for review. You can press Play immediately.",
                 icon = Icons.Rounded.AutoFixHigh,
                 accent = AmethystHeal,
             ),
             OnboardingStep(
                 title = "Tuned for effortless reading",
-                body = "Switch between Cinema, Manga, or Reading Comfort styles anytime, or open Studio to refine cast names, chapters, and timing.",
+                body = "Open Subtitle settings to try Reading Comfort. Studio has the timeline, characters, and repair history.",
                 icon = Icons.Rounded.PlayCircleOutline,
                 accent = WarmAmber,
             ),
         )
     }
 
-    var currentStep by remember { mutableIntStateOf(0) }
+    var currentStep by androidx.compose.runtime.saveable.rememberSaveable { mutableIntStateOf(0) }
     val step = steps[currentStep]
     val isLast = currentStep == steps.lastIndex
 
@@ -112,7 +114,7 @@ fun FirstTimeOnboardingOverlay(
                 .widthIn(max = 420.dp),
         ) {
             Column(
-                modifier = Modifier.padding(24.dp),
+                modifier = Modifier.verticalScroll(rememberScrollState()).padding(24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
@@ -210,7 +212,7 @@ fun FirstTimeOnboardingOverlay(
                                 .heightIn(min = 48.dp)
                                 .testTag("onboarding_get_started_button"),
                         ) {
-                            Text("Go to Library", color = InkPrimary)
+                            Text("Choose a video", color = InkPrimary)
                         }
                     }
                 } else {

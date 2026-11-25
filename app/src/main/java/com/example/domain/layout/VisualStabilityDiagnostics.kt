@@ -28,6 +28,7 @@ data class VisualStabilityDiagnosticsSnapshot(
     val identityPreservedRefinements: Int = 0,
     val relocationsPerEventMax: Int = 0,
     val recentRelocations: List<RelocationReasonRecord> = emptyList(),
+    val measuredBodyRelocations: Long = 0L,
 )
 
 class VisualStabilityDiagnostics {

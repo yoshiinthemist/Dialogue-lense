@@ -29,6 +29,16 @@ class MainActivity : ComponentActivity() {
         dispatchIncomingIntent(intent)
     }
 
+    override fun onStart() {
+        super.onStart()
+        viewModel.onAppVisible()
+    }
+
+    override fun onStop() {
+        if (!isChangingConfigurations) viewModel.onAppHidden()
+        super.onStop()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)

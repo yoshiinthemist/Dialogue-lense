@@ -1,5 +1,8 @@
 package com.example.ui.player
 
+import com.example.domain.analysis.MediaTransport
+import com.example.domain.analysis.ViewerTransportSample
+
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.graphics.Bitmap
@@ -29,12 +32,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.example.domain.analysis.RedirectDecision
 import com.example.domain.analysis.WebNavigationGuard
 
-/**
- * Official compliant YouTube IFrame Player API wrapper via Android WebView with automatic
- * YouTube Mobile Watch fallback when a creator/network restricts third-party iframe embeds
- * (Error 101 / 150 / 152 / 153). Keeps playback timestamps, transport controls, and native
- * caption visibility synchronized with DialogueLens bubbles in both modes.
- */
+/** Official embedded player; provider restrictions surface with an external viewing option. */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun YouTubeEmbeddedPlayer(
@@ -43,6 +41,7 @@ fun YouTubeEmbeddedPlayer(
     playbackSpeed: Float = 1.0f,
     playRequest: Pair<Int, Boolean>? = null,
     seekRequest: Pair<Int, Long>?,
+    onViewerTransport: ((ViewerTransportSample) -> Unit)? = null,
     onPlaybackState: (positionMs: Long, durationMs: Long, isPlaying: Boolean) -> Unit,
     isScoutInstance: Boolean = false,
     suppressNativeCaptions: Boolean = false,
@@ -52,25 +51,22 @@ fun YouTubeEmbeddedPlayer(
     onCapturedTimedTextBody: (url: String, body: String, cookies: String?, userAgent: String?) -> Unit = { _, _, _, _ -> },
     modifier: Modifier = Modifier,
 ) {
+    val transportCallback by rememberUpdatedState(onViewerTransport)
     val latestCallback by rememberUpdatedState(onPlaybackState)
     val latestTrackStatusCallback by rememberUpdatedState(onCaptionTrackStatus)
     val latestEmbedFallbackCallback by rememberUpdatedState(onEmbedFallback)
-    val latestPreferredLang by rememberUpdatedState(preferredCaptionLang)
     val latestCapturedTimedTextCallback by rememberUpdatedState(onCapturedTimedTextBody)
     val seenTimedTextUrls = remember(videoId) { mutableSetOf<String>() }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    PauseWebMediaWhenHidden(webViewRef, "window.dlPause && window.dlPause();")
     var loadedVideoId by remember { mutableStateOf<String?>(null) }
     var playerReady by remember { mutableStateOf(false) }
-    var usingMobileWatchFallback by remember { mutableStateOf(false) }
-    var fallbackAttempted by remember { mutableStateOf(false) }
     var lastHandledPlaySeq by remember { mutableStateOf(0) }
     var lastHandledSeekSeq by remember { mutableStateOf(0) }
 
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val effectiveMuted = isMuted || isScoutInstance
     val effectiveSuppressCc = suppressNativeCaptions
-    val latestMuted by rememberUpdatedState(effectiveMuted)
-    val latestSuppressCc by rememberUpdatedState(effectiveSuppressCc)
 
     DisposableEffect(Unit) {
         onDispose {
@@ -83,34 +79,34 @@ fun YouTubeEmbeddedPlayer(
         }
     }
 
-    LaunchedEffect(playRequest, playerReady, usingMobileWatchFallback) {
+    LaunchedEffect(playRequest, playerReady) {
         val req = playRequest ?: return@LaunchedEffect
         if (!playerReady || req.first == lastHandledPlaySeq) return@LaunchedEffect
         lastHandledPlaySeq = req.first
-        val js = if (req.second) "window.dlPlay && window.dlPlay();" else "window.dlPause && window.dlPause();"
+        val js = if (req.second) "window.__dlPlaySequence = ${req.first}; window.dlPlay && window.dlPlay();" else "window.__dlPlaySequence = ${req.first}; window.dlPause && window.dlPause();"
         webViewRef?.evaluateJavascript(js, null)
     }
 
-    LaunchedEffect(effectiveMuted, playerReady, usingMobileWatchFallback) {
+    LaunchedEffect(effectiveMuted, playerReady) {
         if (!playerReady) return@LaunchedEffect
         val js = if (effectiveMuted) "window.dlMute && window.dlMute();" else "window.dlUnmute && window.dlUnmute();"
         webViewRef?.evaluateJavascript(js, null)
     }
 
-    LaunchedEffect(playbackSpeed, playerReady, usingMobileWatchFallback) {
+    LaunchedEffect(playbackSpeed, playerReady) {
         if (!playerReady) return@LaunchedEffect
         webViewRef?.evaluateJavascript("window.dlRate && window.dlRate($playbackSpeed);", null)
     }
 
-    LaunchedEffect(seekRequest, playerReady, usingMobileWatchFallback) {
+    LaunchedEffect(seekRequest, playerReady) {
         val req = seekRequest ?: return@LaunchedEffect
         if (!playerReady || req.first == lastHandledSeekSeq) return@LaunchedEffect
         lastHandledSeekSeq = req.first
         val seconds = (req.second / 1000.0)
-        webViewRef?.evaluateJavascript("window.dlSeek && window.dlSeek($seconds);", null)
+        webViewRef?.evaluateJavascript("window.__dlSeekSequence = ${req.first}; window.dlSeek && window.dlSeek($seconds);", null)
     }
 
-    LaunchedEffect(effectiveSuppressCc, playerReady, usingMobileWatchFallback) {
+    LaunchedEffect(effectiveSuppressCc, playerReady) {
         if (!playerReady) return@LaunchedEffect
         val flag = if (effectiveSuppressCc) "true" else "false"
         webViewRef?.evaluateJavascript("window.dlSetSuppressCc && window.dlSetSuppressCc($flag);", null)
@@ -215,29 +211,6 @@ fun YouTubeEmbeddedPlayer(
                             ) is RedirectDecision.Block
                         ) {
                             view?.stopLoading()
-                            val activeId = loadedVideoId?.replace(Regex("[^0-9A-Za-z_-]"), "").orEmpty()
-                            if (usingMobileWatchFallback && activeId.isNotEmpty()) {
-                                val safeLang = latestPreferredLang.lowercase().replace(Regex("[^a-z-]"), "").ifBlank { "en" }
-                                view?.loadUrl("https://m.youtube.com/watch?v=$activeId&hl=$safeLang")
-                            }
-                            return
-                        }
-                    }
-
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        super.onPageFinished(view, url)
-                        if (usingMobileWatchFallback &&
-                            !url.isNullOrBlank() &&
-                            url.contains("youtube.com", ignoreCase = true)
-                        ) {
-                            view?.evaluateJavascript(
-                                buildYouTubeMobileWatchHookScript(
-                                    isScoutInstance = isScoutInstance,
-                                    suppressNativeCaptions = latestSuppressCc,
-                                    initialMuted = latestMuted,
-                                ),
-                                null,
-                            )
                         }
                     }
                 }
@@ -249,8 +222,19 @@ fun YouTubeEmbeddedPlayer(
                     }
 
                     @JavascriptInterface
-                    fun onProgress(posMs: Long, durMs: Long, playing: Boolean) {
-                        mainHandler.post { latestCallback(posMs, durMs, playing) }
+                    fun onProgress(posMs: Long, durMs: Long, code: Int, seekSeq: Int, playSeq: Int) {
+                        val transport = when (code) {
+                            1 -> MediaTransport.PLAYING
+                            2 -> MediaTransport.PAUSED
+                            3 -> MediaTransport.BUFFERING
+                            4 -> MediaTransport.ENDED
+                            else -> MediaTransport.UNAVAILABLE
+                        }
+                        mainHandler.post {
+                            val callback = transportCallback
+                            if (callback != null) callback(ViewerTransportSample(posMs, durMs, transport, seekSeq, playSeq))
+                            else latestCallback(posMs, durMs, transport == MediaTransport.PLAYING)
+                        }
                     }
 
                     @JavascriptInterface
@@ -279,20 +263,8 @@ fun YouTubeEmbeddedPlayer(
                     @JavascriptInterface
                     fun onEmbedBlocked(errorCode: Int) {
                         mainHandler.post {
-                            val activeId = loadedVideoId?.replace(Regex("[^0-9A-Za-z_-]"), "").orEmpty()
-                            if (!fallbackAttempted && activeId.isNotEmpty()) {
-                                fallbackAttempted = true
-                                usingMobileWatchFallback = true
-                                playerReady = false
-                                lastHandledPlaySeq = 0
-                                lastHandledSeekSeq = 0
-                                latestEmbedFallbackCallback(errorCode)
-                                val safeLang = latestPreferredLang
-                                    .lowercase()
-                                    .replace(Regex("[^a-z-]"), "")
-                                    .ifBlank { "en" }
-                                webViewRef?.loadUrl("https://m.youtube.com/watch?v=$activeId&hl=$safeLang")
-                            }
+                            playerReady = false
+                            latestEmbedFallbackCallback(errorCode)
                         }
                     }
 
@@ -320,8 +292,6 @@ fun YouTubeEmbeddedPlayer(
             if (loadedVideoId != videoId && videoId.isNotBlank()) {
                 loadedVideoId = videoId
                 playerReady = false
-                usingMobileWatchFallback = false
-                fallbackAttempted = false
                 lastHandledPlaySeq = 0
                 lastHandledSeekSeq = 0
                 val packageOrigin = (webView.tag as? String) ?: "https://${webView.context.packageName}"
@@ -414,11 +384,10 @@ private fun buildYouTubeIframeHtml(
             var ytReady = false;
             var pollTimer = null;
             var pendingDesiredPlay = null;
-            var playGraceUntilMs = 0;
             var forceScoutMute = $forceMuteFlag;
             var suppressCc = $initialSuppressFlag;
             var hasAppliedSoftMute = false;
-            var switchedToWatchFallback = false;
+            var embedUnavailable = false;
 
             var lastReportedTrackCount = -1;
 
@@ -463,11 +432,9 @@ private fun buildYouTubeIframeHtml(
                     if (window.DialogueLensYt) window.DialogueLensYt.onReady();
                     setTimeout(reportNativeCaptionTracks, 900);
                     if (pendingDesiredPlay === true && ytPlayer.playVideo) {
-                      playGraceUntilMs = Date.now() + 2500;
                       ytPlayer.playVideo();
                       pendingDesiredPlay = null;
                     } else if (pendingDesiredPlay === false && ytPlayer.pauseVideo) {
-                      playGraceUntilMs = 0;
                       ytPlayer.pauseVideo();
                       pendingDesiredPlay = null;
                     }
@@ -483,21 +450,21 @@ private fun buildYouTubeIframeHtml(
                   },
                   onError: function(e) {
                     var code = (e && typeof e.data === 'number' ? e.data : 0);
-                    if ((code === 101 || code === 150 || code === 152 || code === 153) &&
-                        !switchedToWatchFallback &&
+                    if (!embedUnavailable &&
                         window.DialogueLensYt &&
                         typeof window.DialogueLensYt.onEmbedBlocked === 'function') {
-                      switchedToWatchFallback = true;
+                      embedUnavailable = true;
                       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
                       window.DialogueLensYt.onEmbedBlocked(code);
-                      return;
                     }
                     var el = document.getElementById('errBanner');
                     var txt = document.getElementById('errText');
                     if (el && txt) {
                       el.style.display = 'flex';
-                      if (code === 101 || code === 150 || code === 152 || code === 153) {
-                        txt.textContent = 'This video (' + code + ') restricts embedded playback by creator/network policy. Open it in the YouTube app or attach subtitles here.';
+                      if (code === 101 || code === 150) {
+                        txt.textContent = 'The owner allows this video to play on YouTube.';
+                      } else if (code === 153) {
+                        txt.textContent = 'YouTube could not verify this embedded player.';
                       } else {
                         txt.textContent = 'YouTube player notice (' + (code || 'unknown') + '). Check network or open directly in the YouTube app.';
                       }
@@ -513,8 +480,8 @@ private fun buildYouTubeIframeHtml(
 
             // Guard in case iframe_api loaded synchronously or before callback fired
             setTimeout(function() {
-              if (!ytReady && !switchedToWatchFallback) attachYtPlayer();
-              if (!ytReady && !switchedToWatchFallback && window.DialogueLensYt) {
+              if (!ytReady && !embedUnavailable) attachYtPlayer();
+              if (!ytReady && !embedUnavailable && window.DialogueLensYt) {
                 window.DialogueLensYt.onReady();
                 startPolling();
               }
@@ -526,15 +493,12 @@ private fun buildYouTubeIframeHtml(
             }
 
             function pushState() {
-              if (switchedToWatchFallback || !ytPlayer || !ytPlayer.getCurrentTime || !window.DialogueLensYt) return;
+              if (embedUnavailable || !ytPlayer || !ytPlayer.getCurrentTime || !window.DialogueLensYt) return;
               var curMs = Math.round((ytPlayer.getCurrentTime() || 0) * 1000);
               var durMs = Math.round((ytPlayer.getDuration ? (ytPlayer.getDuration() || 0) : 0) * 1000);
               var st = ytPlayer.getPlayerState ? ytPlayer.getPlayerState() : -1;
-              if (st === 1 || st === 2 || st === 0) {
-                playGraceUntilMs = 0;
-              }
-              var playing = (st === 1) || (st === 3) || (Date.now() < playGraceUntilMs && st !== 2 && st !== 0);
-              window.DialogueLensYt.onProgress(curMs, durMs, playing);
+              var code = st === 1 ? 1 : st === 3 ? 3 : st === 0 ? 4 : 2;
+              window.DialogueLensYt.onProgress(curMs, durMs, code, window.__dlSeekSequence || 0, window.__dlPlaySequence || 0);
             }
 
             function postYtCommand(func, args) {
@@ -550,7 +514,6 @@ private fun buildYouTubeIframeHtml(
             }
 
             window.dlPlay = function() {
-              playGraceUntilMs = Date.now() + 2500;
               if (forceScoutMute) {
                 if (ytPlayer && typeof ytPlayer.mute === 'function') ytPlayer.mute();
                 else postYtCommand('mute');
@@ -563,7 +526,6 @@ private fun buildYouTubeIframeHtml(
               }
             };
             window.dlPause = function() {
-              playGraceUntilMs = 0;
               if (ytPlayer && typeof ytPlayer.pauseVideo === 'function') {
                 ytPlayer.pauseVideo();
               } else {
@@ -604,270 +566,3 @@ private fun buildYouTubeIframeHtml(
         </html>
     """.trimIndent()
 }
-
-/**
- * Injected into m.youtube.com/watch?v=... when third-party iframe embedding is restricted
- * by creator/network policy (Error 101 / 150 / 152 / 153). Frames YouTube's official mobile
- * video player cleanly inside the 16:9 stage and bridges timestamps + transport controls
- * directly to DialogueLens so AI Scout speech bubbles stay locked in sync.
- */
-private fun buildYouTubeMobileWatchHookScript(
-    isScoutInstance: Boolean,
-    suppressNativeCaptions: Boolean,
-    initialMuted: Boolean,
-): String = """
-(function() {
-  var forceScoutMute = ${if (isScoutInstance) "true" else "false"};
-  var suppressCc = ${if (suppressNativeCaptions) "true" else "false"};
-  var desiredMuted = ${if (initialMuted || isScoutInstance) "true" else "false"};
-
-  if (window.__dlYtmHookInstalled) {
-    if (window.dlSetSuppressCc) window.dlSetSuppressCc(suppressCc);
-    return;
-  }
-  window.__dlYtmHookInstalled = true;
-  var notifiedReady = false;
-  var playGraceUntilMs = 0;
-  var pendingPlay = false;
-  var pendingSeekSec = null;
-  var lastReportedTracks = -1;
-
-  function ensureStageCss() {
-    if (document.getElementById('dl-ytm-stage-css')) return;
-    var style = document.createElement('style');
-    style.id = 'dl-ytm-stage-css';
-    style.textContent =
-      'html, body { margin: 0 !important; padding: 0 !important; width: 100% !important; height: 100% !important; overflow: hidden !important; background: #000 !important; }' +
-      'ytm-app, #app, .page-container { padding-top: 0 !important; margin-top: 0 !important; background: #000 !important; }' +
-      'ytm-mobile-topbar-renderer, .mobile-topbar-header, #header-bar, ytm-watch-below-the-player, .watch-below-the-player, ytm-single-column-watch-next-results-renderer, ytm-pivot-bar-renderer, .watch-page-banner { display: none !important; }' +
-      '#player-container-id, .player-container { position: fixed !important; inset: 0 !important; top: 0 !important; left: 0 !important; width: 100vw !important; height: 100vh !important; max-height: 100vh !important; margin: 0 !important; padding: 0 !important; z-index: 999 !important; background: #000 !important; }' +
-      '#player-container-id .html5-video-player, #player-container-id .html5-video-container, #player-container-id video, .player-container video { width: 100% !important; height: 100% !important; max-width: 100% !important; max-height: 100% !important; top: 0 !important; left: 0 !important; object-fit: contain !important; }';
-    (document.head || document.documentElement).appendChild(style);
-  }
-
-  function applyCcVisibilityCss() {
-    var existing = document.getElementById('dl-ytm-hide-cc');
-    if (suppressCc) {
-      if (!existing) {
-        var st = document.createElement('style');
-        st.id = 'dl-ytm-hide-cc';
-        st.textContent =
-          '.ytp-caption-window-container, .caption-window, .captions-text { opacity: 0 !important; pointer-events: none !important; }';
-        (document.head || document.documentElement).appendChild(st);
-      }
-    } else if (existing && existing.parentNode) {
-      existing.parentNode.removeChild(existing);
-    }
-  }
-
-  function findVideo() {
-    return document.querySelector('#player-container-id video, .html5-video-player video, video');
-  }
-
-  function isAdPlaying() {
-    var p = document.querySelector('.html5-video-player');
-    return !!(p && (p.classList.contains('ad-showing') || p.classList.contains('ad-interrupting')));
-  }
-
-  var sentTimedTextBody = false;
-  function emitTimedTextBody(url, text) {
-    try {
-      if (!window.DialogueLensYt || !window.DialogueLensYt.onTimedTextCaptured) return;
-      if (!text || text.length < 16) return;
-      sentTimedTextBody = true;
-      window.DialogueLensYt.onTimedTextCaptured(url || '', text);
-    } catch (e) {}
-  }
-
-  // Intercept live XHR & fetch responses for /api/timedtext (which carry browser PO-tokens & cookies)
-  (function installTimedTextInterceptors() {
-    if (window.__dlTtHooked) return;
-    window.__dlTtHooked = true;
-    try {
-      var origFetch = window.fetch;
-      if (typeof origFetch === 'function') {
-        window.fetch = function(input, init) {
-          var reqUrl = (typeof input === 'string') ? input : (input && input.url ? String(input.url) : '');
-          var p = origFetch.apply(this, arguments);
-          if (reqUrl.indexOf('/api/timedtext') !== -1) {
-            p.then(function(resp) {
-              try {
-                if (resp && resp.ok && typeof resp.clone === 'function') {
-                  resp.clone().text().then(function(body) { emitTimedTextBody(reqUrl, body); }).catch(function(){});
-                }
-              } catch (e) {}
-            }).catch(function(){});
-          }
-          return p;
-        };
-      }
-    } catch (e) {}
-    try {
-      var OrigXhrOpen = XMLHttpRequest.prototype.open;
-      var OrigXhrSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.open = function(method, url) {
-        this.__dlUrl = (typeof url === 'string') ? url : String(url || '');
-        return OrigXhrOpen.apply(this, arguments);
-      };
-      XMLHttpRequest.prototype.send = function() {
-        var self = this;
-        if (self.__dlUrl && self.__dlUrl.indexOf('/api/timedtext') !== -1) {
-          self.addEventListener('load', function() {
-            try {
-              if (self.status >= 200 && self.status < 300 && typeof self.responseText === 'string') {
-                emitTimedTextBody(self.__dlUrl, self.responseText);
-              }
-            } catch (e) {}
-          });
-        }
-        return OrigXhrSend.apply(this, arguments);
-      };
-    } catch (e) {}
-  })();
-
-  function tryHarvestInitialPlayerCaptions() {
-    if (sentTimedTextBody) return;
-    try {
-      var pr = window.ytInitialPlayerResponse;
-      var tracks = pr && pr.captions && pr.captions.playerCaptionsTracklistRenderer && pr.captions.playerCaptionsTracklistRenderer.captionTracks;
-      if (Array.isArray(tracks) && tracks.length > 0 && tracks[0].baseUrl) {
-        if (!window.__dlProbedInitUrl) {
-          window.__dlProbedInitUrl = true;
-          var baseUrl = String(tracks[0].baseUrl);
-          if (baseUrl.indexOf('fmt=') === -1) baseUrl += '&fmt=json3';
-          fetch(baseUrl, { credentials: 'include' })
-            .then(function(r) { return r.ok ? r.text() : ''; })
-            .then(function(t) { emitTimedTextBody(baseUrl, t); })
-            .catch(function(){});
-        }
-      }
-    } catch (e) {}
-  }
-
-  function reportTrackInfo() {
-    try {
-      if (!window.DialogueLensYt || !window.DialogueLensYt.onCaptionTrackInfo) return;
-      var mp = document.getElementById('movie_player');
-      if (mp && typeof mp.getOption === 'function') {
-        var list = mp.getOption('captions', 'tracklist');
-        var active = mp.getOption('captions', 'track');
-        var count = Array.isArray(list) ? list.length : 0;
-        var lang = (active && active.languageCode) ? String(active.languageCode) :
-          (Array.isArray(list) && list.length > 0 && list[0].languageCode ? String(list[0].languageCode) : '');
-        if (count !== lastReportedTracks) {
-          lastReportedTracks = count;
-          window.DialogueLensYt.onCaptionTrackInfo(count, lang);
-        }
-        if (count > 0 && !sentTimedTextBody && typeof mp.setOption === 'function' && (!active || !active.languageCode)) {
-          try {
-            mp.setOption('captions', 'track', { languageCode: lang || 'en' });
-          } catch (e) {}
-        }
-      }
-      tryHarvestInitialPlayerCaptions();
-    } catch (e) {}
-  }
-
-  function kickVideoPlay(v) {
-    if (!v) return;
-    v.muted = forceScoutMute || desiredMuted;
-    if (typeof v.play === 'function') {
-      var pr = v.play();
-      if (pr && typeof pr.catch === 'function') {
-        pr.catch(function() {
-          // If browser required muted kickstart, retry muted briefly
-          try {
-            var btn = document.querySelector('.ytp-large-play-button, .player-control-play-pause-icon, button[aria-label*="Play"]');
-            if (btn) btn.click();
-          } catch (e) {}
-        });
-      }
-    }
-  }
-
-  window.dlPlay = function() {
-    playGraceUntilMs = Date.now() + 2500;
-    pendingPlay = true;
-    var v = findVideo();
-    if (v) {
-      pendingPlay = false;
-      kickVideoPlay(v);
-    }
-  };
-  window.dlPause = function() {
-    playGraceUntilMs = 0;
-    pendingPlay = false;
-    var v = findVideo();
-    if (v && typeof v.pause === 'function') v.pause();
-  };
-  window.dlMute = function() {
-    desiredMuted = true;
-    var v = findVideo();
-    if (v) v.muted = true;
-  };
-  window.dlUnmute = function() {
-    if (forceScoutMute) return;
-    desiredMuted = false;
-    var v = findVideo();
-    if (v) {
-      v.muted = false;
-      try {
-        var unmuteBtn = document.querySelector('.ytp-unmute');
-        if (unmuteBtn && unmuteBtn.offsetParent !== null) unmuteBtn.click();
-      } catch (e) {}
-    }
-  };
-  window.dlRate = function(rate) {
-    var v = findVideo();
-    if (v) v.playbackRate = rate;
-  };
-  window.dlSeek = function(sec) {
-    var v = findVideo();
-    if (v && isFinite(sec)) {
-      v.currentTime = sec;
-      pendingSeekSec = null;
-    } else {
-      pendingSeekSec = sec;
-    }
-  };
-  window.dlSetSuppressCc = function(flag) {
-    suppressCc = !!flag;
-    applyCcVisibilityCss();
-  };
-
-  ensureStageCss();
-  applyCcVisibilityCss();
-
-  setInterval(function() {
-    ensureStageCss();
-    applyCcVisibilityCss();
-    var v = findVideo();
-    if (!v || !window.DialogueLensYt) return;
-
-    if (!notifiedReady) {
-      notifiedReady = true;
-      window.DialogueLensYt.onReady();
-    }
-    if (forceScoutMute) {
-      v.muted = true;
-      v.volume = 0;
-    }
-    if (pendingSeekSec !== null && isFinite(v.duration) && v.duration > 0) {
-      v.currentTime = pendingSeekSec;
-      pendingSeekSec = null;
-    }
-    if (pendingPlay) {
-      pendingPlay = false;
-      kickVideoPlay(v);
-    }
-
-    reportTrackInfo();
-    if (isAdPlaying()) return;
-
-    var curMs = Math.round((v.currentTime || 0) * 1000);
-    var durMs = (isFinite(v.duration) && v.duration > 0) ? Math.round(v.duration * 1000) : 0;
-    var playing = (!v.paused && !v.ended) || (Date.now() < playGraceUntilMs && !v.ended);
-    window.DialogueLensYt.onProgress(curMs, durMs, playing);
-  }, 50);
-})();
-""".trimIndent()

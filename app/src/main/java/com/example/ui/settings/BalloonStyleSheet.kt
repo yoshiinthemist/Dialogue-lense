@@ -17,6 +17,12 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.height
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -26,6 +32,16 @@ import com.example.data.model.BalloonStyleSettings
 import com.example.data.model.BubbleVisualStyle
 import com.example.data.model.SpeakerLabelMode
 import kotlin.math.roundToInt
+
+internal fun BalloonStyleSettings.withVisualPreset(preset: BubbleVisualStyle): BalloonStyleSettings {
+    return when {
+        preset == BubbleVisualStyle.READING_COMFORT -> copy(visualStyle = preset, reducedMotion = true,
+            stablePositioning = true, highContrastMode = true, showTail = false, showConfidenceIndicators = false,
+            showSpeakerLabels = true, labelMode = SpeakerLabelMode.ALWAYS, fontScale = fontScale.coerceAtLeast(1.1f))
+        visualStyle == BubbleVisualStyle.READING_COMFORT -> copy(visualStyle = preset, highContrastMode = false)
+        else -> copy(visualStyle = preset)
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -53,7 +69,7 @@ fun BalloonStyleSheet(
                 }
             }
 
-            Text("Bubble Visual Preset", style = MaterialTheme.typography.labelMedium)
+            Text("Reading style", style = MaterialTheme.typography.labelMedium)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -63,9 +79,28 @@ fun BalloonStyleSheet(
                 BubbleVisualStyle.entries.forEach { preset ->
                     FilterChip(
                         selected = settings.visualStyle == preset,
-                        onClick = { onUpdate(settings.copy(visualStyle = preset)) },
+                        onClick = { onUpdate(settings.withVisualPreset(preset)) },
                         label = { Text(preset.label) },
                         modifier = Modifier.testTag("preset_${preset.name.lowercase()}"),
+                    )
+                }
+            }
+
+            val sample = remember {
+                val demo = com.example.data.project.DemoScenarioFactory.createDemoProject()
+                val first = demo.dialogueEvents.first()
+                com.example.domain.layout.BalloonLayoutEngine().computeLayout(demo, first.startTimeMs + 1).firstOrNull()
+            }
+            if (sample != null) {
+                Text("Preview", style = MaterialTheme.typography.labelMedium)
+                BoxWithConstraints(Modifier.fillMaxWidth().height(128.dp).clearAndSetSemantics { contentDescription = "Subtitle style preview" }) {
+                    val density = LocalDensity.current
+                    val rect = com.example.data.model.NormalizedRect(0.08f, 0.06f, 0.82f, 0.75f)
+                    com.example.ui.player.SpeechBalloonView(
+                        placed = sample.copy(rect = rect, tailTarget = null), translationMode = com.example.data.model.TranslationMode.NATURAL,
+                        style = settings, isEditMode = false, isSelected = false,
+                        containerWidthPx = with(density) { maxWidth.toPx() }, containerHeightPx = with(density) { maxHeight.toPx() },
+                        committedRect = rect, onMeasure = {}, onClick = {}, onDragCommit = {},
                     )
                 }
             }
@@ -82,7 +117,7 @@ fun BalloonStyleSheet(
             )
 
             Text(
-                text = "Balloon Opacity (${(settings.balloonOpacity * 100).roundToInt()}%) · 86% tuned for moving video",
+                text = "Balloon Opacity (${(settings.balloonOpacity * 100).roundToInt()}%)",
                 style = MaterialTheme.typography.labelMedium,
             )
             Slider(

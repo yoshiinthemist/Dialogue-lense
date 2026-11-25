@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import com.google.gms.googleservices.GoogleServicesTask
 
 plugins {
   alias(libs.plugins.android.application)
@@ -16,8 +17,8 @@ android {
     applicationId = "com.aistudio.dialoguelens.vkpzmx"
     minSdk = 24
     targetSdk = 36
-    versionCode = 29
-    versionName = "29.0"
+    versionCode = 30
+    versionName = "2.0.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -80,6 +81,20 @@ secrets {
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
+// Public CI exercises offline features. Release packages must ship the registered Firebase app.
+tasks.withType<GoogleServicesTask>().configureEach {
+  if (name == "processReleaseGoogleServices") {
+    missingGoogleServicesStrategy.set(MissingGoogleServicesStrategy.ERROR)
+    // The plugin omits its missing-config policy from the cache key. Isolate release
+    // output so a cached offline debug build cannot satisfy this release task.
+    inputs.property("requiresRegisteredFirebaseApp", true)
+    doFirst {
+      val configs = (this as GoogleServicesTask).googleServicesJsonFiles.get()
+      check(configs.any { it.isFile }) { "Release requires the registered app/google-services.json." }
+    }
+  }
+}
+
 // Some unused dependencies are commented out below instead of being removed.
 // This makes it easy to add them back in the future if needed.
 dependencies {
@@ -104,6 +119,8 @@ dependencies {
   implementation(libs.androidx.lifecycle.viewmodel.compose)
   implementation(libs.androidx.navigation.compose)
   implementation(libs.androidx.media3.exoplayer)
+  implementation(libs.androidx.media3.hls)
+  implementation(libs.androidx.media3.dash)
   implementation(libs.androidx.media3.ui)
   implementation(libs.androidx.media3.common)
   implementation(libs.androidx.media3.transformer)
