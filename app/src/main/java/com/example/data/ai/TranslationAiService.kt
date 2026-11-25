@@ -8,12 +8,15 @@ import com.example.data.model.DialogueType
 import com.example.data.model.GlossaryEntry
 import com.example.data.model.NormalizedRect
 import com.example.data.model.Speaker
+import com.example.domain.analysis.LookaheadWindowPlanner
+import com.example.domain.analysis.TranscriptionOutcome
 import com.google.firebase.Firebase
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.Schema
 import com.google.firebase.ai.type.Tool
 import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
+import com.squareup.moshi.Moshi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -71,6 +74,28 @@ data class AiYouTubeTranscriptionResult(
     val cues: List<AiTranscribedCue> = emptyList(),
     val speakerUpdates: List<AiCastSlotAssignment> = emptyList(),
     val summary: String = "",
+    val outcome: TranscriptionOutcome = if (cues.isNotEmpty()) {
+        TranscriptionOutcome.DIALOGUE_DETECTED
+    } else {
+        TranscriptionOutcome.EMPTY_UNCONFIRMED
+    },
+    val noSpeechConfirmed: Boolean = false,
+    val invalidCueCount: Int = 0,
+    val outOfBoundsCueCount: Int = 0,
+    val discardedDuplicateCount: Int = 0,
+    val diagnosticNote: String = "",
+)
+
+data class AiAudioTranscriptionResult(
+    val cues: List<AiTranscribedCue> = emptyList(),
+    val outcome: TranscriptionOutcome = if (cues.isNotEmpty()) {
+        TranscriptionOutcome.DIALOGUE_DETECTED
+    } else {
+        TranscriptionOutcome.EMPTY_UNCONFIRMED
+    },
+    val noSpeechConfirmed: Boolean = false,
+    val invalidCueCount: Int = 0,
+    val diagnosticNote: String = "",
 )
 
 class TranslationAiService {
@@ -152,6 +177,9 @@ class TranslationAiService {
 
     private val audioTranscriptionSchema = Schema.obj(
         properties = mapOf(
+            "noSpeechConfirmed" to Schema.boolean(
+                description = "Set true ONLY when this audio clip genuinely contains zero audible speech or meaningful sound throughout the entire clip. Set false whenever any speech exists or when uncertain."
+            ),
             "cues" to Schema.array(
                 items = Schema.obj(
                     properties = mapOf(
@@ -337,6 +365,9 @@ class TranslationAiService {
             "summary" to Schema.string(
                 description = "Concise 1-sentence overview of the speakers and scene in this video segment"
             ),
+            "noSpeechConfirmed" to Schema.boolean(
+                description = "Set true ONLY when you listened to the entire requested segment and confirmed there is genuinely zero audible speech or meaningful sound. NEVER set true if speech exists or if uncertain."
+            ),
             "speakerUpdates" to speakerUpdatesProperty,
             "cues" to Schema.array(
                 items = Schema.obj(
@@ -493,6 +524,7 @@ class TranslationAiService {
         glossary: List<GlossaryEntry> = emptyList(),
         preferLiteModel: Boolean = true,
         priorWindowNormalizedTexts: Set<String> = emptySet(),
+        timestampClarificationRetry: Boolean = false,
     ): Result<AiYouTubeTranscriptionResult> {
         val cleanId = videoId.replace(Regex("[^0-9A-Za-z_-]"), "")
         if (cleanId.isBlank()) {
@@ -540,20 +572,23 @@ class TranslationAiService {
 
             val promptText = buildString {
                 appendLine(taskInstruction)
+                if (timestampClarificationRetry) {
+                    appendLine("CRITICAL TIMESTAMP CORRECTION: Your previous output had timestamps outside ${windowStartSec}s–${windowEndSec}s or echoed an earlier scene. Inspect ONLY audio/video between ${windowStartSec}.0s and ${windowEndSec}.0s and emit exact absolute seconds in [${windowStartSec}.0, ${windowEndSec}.0].")
+                }
                 if (videoContext.isNotBlank()) {
                     appendLine("Video metadata (CONTEXT ONLY — NEVER blindly attach title celebrity names to unconfirmed faces!): $videoContext")
                 }
                 if (rosterBlock.isNotBlank()) append(rosterBlock)
                 if (glossaryBlock.isNotBlank()) append(glossaryBlock)
                 appendLine("Rules:")
-                appendLine("1. Output EVERY spoken sentence, short interjection, and cross-talk turn occurring STRICTLY between ${windowStartSec}s and ${windowEndSec}s using accurate ABSOLUTE video timestamps in seconds (between ${windowStartSec}.0 and ${windowEndSec}.0 — never reset timestamps to 0, and NEVER repeat, echo, or transcribe dialogue from earlier minutes or later sections outside ${windowStartSec}s–${windowEndSec}s). Do NOT skip rapid replies or duplicate any line.")
+                appendLine("1. Output EVERY spoken sentence, short interjection, repeated exclamation, and cross-talk turn occurring STRICTLY between ${windowStartSec}s and ${windowEndSec}s using accurate ABSOLUTE video timestamps in seconds (between ${windowStartSec}.0 and ${windowEndSec}.0 — never reset timestamps to 0, and NEVER echo dialogue from earlier minutes outside ${windowStartSec}s–${windowEndSec}s). If two speakers or the same speaker legitimately repeat a line at distinct moments inside this segment, emit BOTH occurrences with their exact timestamps.")
                 appendLine("2. Break speech into crisp, compact 1-2 line speech-balloon cues (ideally 6-14 words, 1.4s to 4.0s each) matching exact speech timing with no missing stretches.")
                 appendLine("3. STRICT SPEAKER CONSISTENCY: Match each line to speakerSlot (A-L) by face/lip movement and voice timbre. NEVER assign a new person (such as someone in an embedded news/podcast/video clip) to a slot already occupied by a different person! Either assign them the next unused slot letter (up to L) and register them in speakerUpdates, OR output speakerSlot=UNCERTAIN if they only speak briefly or all 12 slots are taken.")
                 appendLine("4. ACCURATE LIPS/MOUTH POSITION & DEAD SPACE: Report the speaking person's actual LIPS/MOUTH center via speakerPosition AND anchorX (0.12..0.88) and anchorY (typically 0.18..0.38 in seated panel/medium shots; NEVER report chest/suit/tie coordinates below the chin) ONLY when you visually confirm THAT person's lips are moving in sync with those words. Also set deadSpaceZone to the cleanest unobstructed background pocket (empty wall/margin/upper corner) that avoids ALL faces, hair/foreheads, hands, and on-screen graphics, and populate avoidBoxes with bounding boxes for ALL visible heads/faces (speaker + bystanders) and lower-third chyrons/text banners so bubbles never clip anyone.")
                 appendLine("5. STRICT VISUAL CONFIRMATION (NO MISATTRIBUTIONS!): In speakerUpdates, set isVisuallyConfirmed=true and isRolePlaceholder=false ONLY when you have DIRECT in-video proof of that specific person's real name (an on-screen lower-third/chyron/title card, explicit spoken introduction/address like 'Welcome Michael' or 'I'm Roy', or unmistakable visual match). NEVER guess or stamp a celebrity name from the video title onto a panelist/host who is NOT that person! Until visually confirmed, set isVisuallyConfirmed=false, isRolePlaceholder=true, give a brief appearance/role note in visualVoiceNotes (e.g. 'Man in brown blazer, right seat') so the app keeps them dotted gray until visually confirmed in this or a later window.")
                 appendLine("6. Mark non-speech sound/music cues (e.g. '[applause]', '[♪ upbeat synth music]') with dialogueType=SOUND_DESCRIPTION and speakerSlot=UNCERTAIN.")
                 appendLine("7. CUTAWAY & REACTION-SHOT CONTINUITY (CRITICAL!): Whenever the camera shows a host or panelist LISTENING SILENTLY, smiling, nodding, or holding cards while a DIFFERENT person's voice speaks off-screen (or during B-roll), NEVER output dialogueType=SPOKEN or point anchorX/anchorY at the silent listener! SPLIT at the exact cut timestamp, KEEP the actual voice's speakerSlot, and tag the cutaway portion as OFF_SCREEN_LEFT, OFF_SCREEN_RIGHT, or OFF_SCREEN_BEHIND.")
-                appendLine("8. If there is no new speech or significant sound in ${windowStartSec}s–${windowEndSec}s, return an empty cues array.")
+                appendLine("8. ONLY if there is genuinely zero audible speech or meaningful sound anywhere in ${windowStartSec}s–${windowEndSec}s, return an empty cues array AND set noSpeechConfirmed=true. Otherwise set noSpeechConfirmed=false.")
             }
 
             val youtubeWatchUrl = "https://www.youtube.com/watch?v=$cleanId"
@@ -569,158 +604,12 @@ class TranslationAiService {
             val rawJson = response.text
                 ?: return Result.failure(IllegalStateException("Gemini returned an empty transcript response."))
 
-            val root = parseJsonObjectLenient(rawJson)
-            val summary = root.optString("summary", "").trim()
-            val speakerUpdates = parseSpeakerUpdates(root)
-            val cuesJson = root.optJSONArray("cues")
-            val hardWindowStartMs = windowStartSec.toLong().coerceAtLeast(0L) * 1000L
-            val hardWindowEndMs = windowEndSec.toLong().coerceAtLeast(windowStartSec + 1L) * 1000L
-            val minWindowMs = (windowStartSec.toLong() - 1L).coerceAtLeast(0L) * 1000L
-            val maxWindowMs = (hardWindowEndMs - 1L).coerceAtLeast(minWindowMs)
-
-            // Detect whether Gemini accidentally emitted 0-based chunk-relative timestamps or echoed opening dialogue
-            val rawStartSecs = mutableListOf<Double>()
-            val rawCueTexts = mutableListOf<String>()
-            if (cuesJson != null) {
-                for (i in 0 until cuesJson.length()) {
-                    val obj = cuesJson.optJSONObject(i) ?: continue
-                    val s = obj.optDouble("startSec", -1.0)
-                    if (s >= 0.0 && !s.isNaN()) rawStartSecs.add(s)
-                    val t = obj.optString("sourceText", "").trim()
-                    if (t.isNotBlank()) rawCueTexts.add(t)
-                }
-            }
-            val windowSpanSec = (windowEndSec - windowStartSec).coerceAtLeast(10).toDouble()
-            val timestampOffsetSec = resolveYouTubeTimestampOffsetSec(
-                rawStartSecs = rawStartSecs,
-                windowStartSec = windowStartSec,
-                windowEndSec = windowEndSec,
-                windowSpanSec = windowSpanSec,
-                rawCueTexts = rawCueTexts,
-                priorWindowNormalizedTexts = priorWindowNormalizedTexts,
-            )
-            if (timestampOffsetSec.isNaN()) {
-                return Result.success(
-                    AiYouTubeTranscriptionResult(
-                        cues = emptyList(),
-                        speakerUpdates = speakerUpdates,
-                        summary = summary,
-                    )
-                )
-            }
-
-            val seenNormalizedInChunk = mutableListOf<Pair<Long, String>>()
-            val parsedCues = buildList {
-                if (cuesJson != null) {
-                    for (i in 0 until cuesJson.length()) {
-                        val obj = cuesJson.optJSONObject(i) ?: continue
-                        val src = obj.optString("sourceText", "").trim()
-                        if (src.isBlank()) continue
-                        val rawStartSec = obj.optDouble("startSec", -1.0)
-                        if (rawStartSec < 0.0 || rawStartSec.isNaN()) continue
-                        val absStartSec = rawStartSec + timestampOffsetSec
-                        val rawStartMs = (absStartSec * 1000.0).toLong().coerceAtLeast(0L)
-                        if (rawStartMs < minWindowMs || rawStartMs > maxWindowMs) continue
-                        val startMs = rawStartMs.coerceIn(hardWindowStartMs, (hardWindowEndMs - 450L).coerceAtLeast(hardWindowStartMs))
-                        val normSrc = src.lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), "")
-                        if (normSrc.isNotBlank() && seenNormalizedInChunk.any { (prevMs, prevNorm) ->
-                                prevNorm == normSrc && kotlin.math.abs(prevMs - startMs) < 16_000L
-                            }
-                        ) {
-                            continue
-                        }
-                        if (normSrc.isNotBlank()) seenNormalizedInChunk.add(startMs to normSrc)
-                        val rawEndSec = obj.optDouble("endSec", rawStartSec + 2.2)
-                        val absEndSec = rawEndSec + timestampOffsetSec
-                        val endMs = (absEndSec * 1000.0).toLong()
-                            .coerceAtLeast(startMs + 500L)
-                            .coerceAtMost(startMs + 9_500L)
-                            .coerceAtMost(hardWindowEndMs)
-                        val typeName = obj.optString("dialogueType", "SPOKEN")
-                        val rawPos = obj.optString("speakerPosition", "CENTER").trim().uppercase()
-                        var dialogueType = DialogueType.entries.firstOrNull { it.name == typeName }
-                            ?: DialogueType.SPOKEN
-                        if (dialogueType == DialogueType.SPOKEN) {
-                            when (rawPos) {
-                                "OFF_SCREEN_LEFT" -> dialogueType = DialogueType.OFF_SCREEN_LEFT
-                                "OFF_SCREEN_RIGHT" -> dialogueType = DialogueType.OFF_SCREEN_RIGHT
-                                "OFF_SCREEN_BEHIND" -> dialogueType = DialogueType.OFF_SCREEN_BEHIND
-                                "VOICE_OVER" -> dialogueType = DialogueType.VOICE_OVER
-                            }
-                        }
-                        val rawX = obj.optDouble("anchorX", Double.NaN)
-                        val rawY = obj.optDouble("anchorY", Double.NaN)
-                        val resolvedX = when {
-                            !rawX.isNaN() && rawX in 0.02..0.98 -> rawX.toFloat().coerceIn(0.12f, 0.88f)
-                            rawPos == "LEFT" -> 0.22f
-                            rawPos == "CENTER_LEFT" -> 0.35f
-                            rawPos == "CENTER_RIGHT" -> 0.65f
-                            rawPos == "RIGHT" -> 0.78f
-                            rawPos == "CENTER" -> 0.50f
-                            else -> null
-                        }
-                        val resolvedY = if (!rawY.isNaN() && rawY in 0.04..0.95) {
-                            rawY.toFloat().coerceIn(0.14f, 0.78f)
-                        } else if (resolvedX != null) {
-                            0.36f
-                        } else {
-                            null
-                        }
-                        val rawDeadSpace = obj.optString("deadSpaceZone", "AUTO").trim().uppercase()
-                        val resolvedDeadSpace = DeadSpaceZone.entries.firstOrNull { it.name == rawDeadSpace }
-                            ?: DeadSpaceZone.AUTO
-                        val parsedAvoidBoxes = buildList {
-                            val arr = obj.optJSONArray("avoidBoxes")
-                            if (arr != null) {
-                                for (bIdx in 0 until arr.length().coerceAtMost(6)) {
-                                    val bObj = arr.optJSONObject(bIdx) ?: continue
-                                    val l = bObj.optDouble("left", Double.NaN)
-                                    val t = bObj.optDouble("top", Double.NaN)
-                                    val r = bObj.optDouble("right", Double.NaN)
-                                    val b = bObj.optDouble("bottom", Double.NaN)
-                                    if (!l.isNaN() && !t.isNaN() && !r.isNaN() && !b.isNaN() && r > l && b > t) {
-                                        val rect = NormalizedRect(
-                                            left = l.toFloat().coerceIn(0f, 1f),
-                                            top = t.toFloat().coerceIn(0f, 1f),
-                                            right = r.toFloat().coerceIn(0f, 1f),
-                                            bottom = b.toFloat().coerceIn(0f, 1f),
-                                        )
-                                        if (rect.width >= 0.04f && rect.height >= 0.04f && rect.width <= 0.85f && rect.height <= 0.75f) {
-                                            add(rect)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        val natural = obj.optString("naturalTranslation", src).trim().ifBlank { src }
-                        add(
-                            AiTranscribedCue(
-                                startMs = startMs,
-                                endMs = endMs,
-                                sourceText = src,
-                                naturalTranslation = natural,
-                                literalTranslation = obj.optString("literalTranslation", "").trim(),
-                                romanization = obj.optString("romanization", "").trim(),
-                                dialogueType = dialogueType,
-                                suggestedSpeakerSlot = obj.optString("speakerSlot", "UNCERTAIN").trim(),
-                                contextReason = obj.optString("contextReason", "").trim(),
-                                culturalNote = obj.optString("culturalNote", "").trim(),
-                                speakerPosition = rawPos,
-                                anchorX = resolvedX,
-                                anchorY = resolvedY,
-                                deadSpaceZone = resolvedDeadSpace,
-                                avoidBoxes = parsedAvoidBoxes,
-                            )
-                        )
-                    }
-                }
-            }.sortedBy { it.startMs }
-
             Result.success(
-                AiYouTubeTranscriptionResult(
-                    cues = parsedCues,
-                    speakerUpdates = speakerUpdates,
-                    summary = summary,
+                parseYouTubeTranscriptionPayload(
+                    rawJson = rawJson,
+                    windowStartSec = windowStartSec,
+                    windowEndSec = windowEndSec,
+                    priorWindowNormalizedTexts = priorWindowNormalizedTexts,
                 )
             )
         } catch (e: CancellationException) {
@@ -880,7 +769,34 @@ class TranslationAiService {
         audioMimeType: String = "audio/wav",
         preferLiteModel: Boolean = true,
     ): Result<List<AiTranscribedCue>> {
-        if (wavBytes.isEmpty()) return Result.success(emptyList())
+        return transcribeAndTranslateAudioDetailed(
+            wavBytes = wavBytes,
+            chunkStartMs = chunkStartMs,
+            sourceLanguage = sourceLanguage,
+            targetLanguage = targetLanguage,
+            glossary = glossary,
+            audioMimeType = audioMimeType,
+            preferLiteModel = preferLiteModel,
+        ).map { it.cues }
+    }
+
+    suspend fun transcribeAndTranslateAudioDetailed(
+        wavBytes: ByteArray,
+        chunkStartMs: Long,
+        sourceLanguage: String,
+        targetLanguage: String,
+        glossary: List<GlossaryEntry> = emptyList(),
+        audioMimeType: String = "audio/wav",
+        preferLiteModel: Boolean = true,
+    ): Result<AiAudioTranscriptionResult> {
+        if (wavBytes.isEmpty()) {
+            return Result.success(
+                AiAudioTranscriptionResult(
+                    outcome = TranscriptionOutcome.EMPTY_UNCONFIRMED,
+                    diagnosticNote = "Empty audio buffer",
+                )
+            )
+        }
         return try {
             val glossaryBlock = if (glossary.isNotEmpty()) {
                 buildString {
@@ -905,7 +821,8 @@ class TranslationAiService {
                 - Keep naturalTranslation concise and evocative for Deaf/hard-of-hearing cinema viewers reading inside spatial speech balloons.
                 - Use SOUND_DESCRIPTION for impactful ambient SFX, music shifts, and emotional vocal non-speech sounds (e.g. "[rain patters softly]", "[♪ tense strings swell]", "[door slams]", "[sighs quietly]") so viewers feel the sonic atmosphere.
                 - Prefix softly murmured lines with calm natural wording and flag clear off-screen voices as OFF_SCREEN_BEHIND.
-                - Assign consistent speakerSlot (A/B/C/D) by vocal timbre & turn-taking.
+                - Assign consistent speakerSlot (A/B/C/D) by vocal timbre & turn-taking. Preserve legitimate repeated phrases at distinct timestamps.
+                - ONLY set noSpeechConfirmed=true if the entire audio clip genuinely contains zero audible speech or meaningful sound. Otherwise set noSpeechConfirmed=false.
                 - Include a brief culturalNote only if there is an idiom, honorific nuance, or slang worth noting.
             """.trimIndent()
 
@@ -921,36 +838,7 @@ class TranslationAiService {
             val rawJson = response.text
                 ?: return Result.failure(IllegalStateException("Audio transcription returned an empty response."))
 
-            val root = JSONObject(rawJson)
-            val cuesJson = root.getJSONArray("cues")
-            val parsed = buildList {
-                for (i in 0 until cuesJson.length()) {
-                    val obj = cuesJson.getJSONObject(i)
-                    val sMs = chunkStartMs + (obj.optDouble("startOffsetSec", 0.0) * 1000.0).toLong().coerceAtLeast(0L)
-                    val eMs = (chunkStartMs + (obj.optDouble("endOffsetSec", 1.5) * 1000.0).toLong())
-                        .coerceAtLeast(sMs + 950L)
-                    val typeName = obj.optString("dialogueType", "SPOKEN")
-                    val dialogueType = DialogueType.entries.firstOrNull { it.name == typeName } ?: DialogueType.SPOKEN
-                    val src = obj.optString("sourceText", "").trim()
-                    if (src.isNotBlank()) {
-                        add(
-                            AiTranscribedCue(
-                                startMs = sMs,
-                                endMs = eMs,
-                                sourceText = src,
-                                naturalTranslation = obj.optString("naturalTranslation", src).ifBlank { src },
-                                literalTranslation = obj.optString("literalTranslation", ""),
-                                romanization = obj.optString("romanization", ""),
-                                dialogueType = dialogueType,
-                                suggestedSpeakerSlot = obj.optString("speakerSlot", "UNCERTAIN"),
-                                contextReason = obj.optString("contextReason", ""),
-                                culturalNote = obj.optString("culturalNote", ""),
-                            )
-                        )
-                    }
-                }
-            }
-            Result.success(parsed)
+            Result.success(parseAudioTranscriptionPayload(rawJson = rawJson, chunkStartMs = chunkStartMs))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1227,6 +1115,406 @@ class TranslationAiService {
     }
 
     companion object {
+        private val staticJsonMapAdapter = Moshi.Builder().build().adapter(Map::class.java)
+
+        private fun Map<*, *>.jsonString(key: String, default: String = ""): String {
+            val v = this[key] ?: return default
+            return when (v) {
+                is String -> v
+                else -> v.toString()
+            }
+        }
+
+        private fun Map<*, *>.jsonDouble(key: String, default: Double = Double.NaN): Double {
+            val v = this[key] ?: return default
+            return when (v) {
+                is Number -> v.toDouble()
+                is String -> v.trim().toDoubleOrNull() ?: default
+                else -> default
+            }
+        }
+
+        private fun Map<*, *>.jsonBoolean(key: String, default: Boolean = false): Boolean {
+            val v = this[key] ?: return default
+            return when (v) {
+                is Boolean -> v
+                is String -> when (v.trim().lowercase()) {
+                    "true" -> true
+                    "false" -> false
+                    else -> default
+                }
+                else -> default
+            }
+        }
+
+        private fun Map<*, *>.jsonList(key: String): List<Any?>? {
+            val v = this[key] ?: return null
+            return v as? List<*>
+        }
+
+        /**
+         * Parses and validates a YouTube transcription JSON payload with explicit epistemic outcomes
+         * and identity-aware deduplication (never discarding non-overlapping repeated dialogue).
+         */
+        fun parseYouTubeTranscriptionPayload(
+            rawJson: String,
+            windowStartSec: Int,
+            windowEndSec: Int,
+            priorWindowNormalizedTexts: Set<String> = emptySet(),
+        ): AiYouTubeTranscriptionResult {
+            val root = runCatching { parseJsonMapLenientStatic(rawJson) }.getOrNull()
+                ?: return AiYouTubeTranscriptionResult(
+                    outcome = TranscriptionOutcome.INVALID_AI_RESPONSE,
+                    diagnosticNote = "Malformed YouTube transcript JSON",
+                )
+
+            val summary = root.jsonString("summary", "").trim()
+            val speakerUpdates = parseSpeakerUpdatesStatic(root)
+            val noSpeechConfirmed = root.jsonBoolean("noSpeechConfirmed", false)
+            val cuesList = root.jsonList("cues")
+                ?: return AiYouTubeTranscriptionResult(
+                    cues = emptyList(),
+                    speakerUpdates = speakerUpdates,
+                    summary = summary,
+                    outcome = TranscriptionOutcome.INVALID_AI_RESPONSE,
+                    noSpeechConfirmed = false,
+                    diagnosticNote = "Missing cues array in AI response",
+                )
+
+            val hardWindowStartMs = windowStartSec.toLong().coerceAtLeast(0L) * 1000L
+            val hardWindowEndMs = windowEndSec.toLong().coerceAtLeast(windowStartSec + 1L) * 1000L
+            val minWindowMs = (windowStartSec.toLong() - 1L).coerceAtLeast(0L) * 1000L
+            val maxWindowMs = (hardWindowEndMs - 1L).coerceAtLeast(minWindowMs)
+
+            val rawStartSecs = mutableListOf<Double>()
+            val rawCueTexts = mutableListOf<String>()
+            for (item in cuesList) {
+                val obj = item as? Map<*, *> ?: continue
+                val s = obj.jsonDouble("startSec", Double.NaN)
+                if (!s.isNaN() && s >= 0.0) rawStartSecs.add(s)
+                val t = obj.jsonString("sourceText", "").trim()
+                if (t.isNotBlank()) rawCueTexts.add(t)
+            }
+            val windowSpanSec = (windowEndSec - windowStartSec).coerceAtLeast(10).toDouble()
+            val timestampOffsetSec = resolveYouTubeTimestampOffsetSec(
+                rawStartSecs = rawStartSecs,
+                windowStartSec = windowStartSec,
+                windowEndSec = windowEndSec,
+                windowSpanSec = windowSpanSec,
+                rawCueTexts = rawCueTexts,
+                priorWindowNormalizedTexts = priorWindowNormalizedTexts,
+            )
+            if (timestampOffsetSec.isNaN()) {
+                return AiYouTubeTranscriptionResult(
+                    cues = emptyList(),
+                    speakerUpdates = speakerUpdates,
+                    summary = summary,
+                    outcome = TranscriptionOutcome.INVALID_OR_AMBIGUOUS_TIMESTAMPS,
+                    noSpeechConfirmed = false,
+                    outOfBoundsCueCount = cuesList.size,
+                    diagnosticNote = "Ambiguous or echoed timestamps rejected for ${windowStartSec}s-${windowEndSec}s",
+                )
+            }
+
+            var invalidCueCount = 0
+            var outOfBoundsCueCount = 0
+            var majorOutOfBoundsCount = 0
+            var discardedDuplicateCount = 0
+            val acceptedCues = mutableListOf<AiTranscribedCue>()
+
+            for (item in cuesList) {
+                val obj = item as? Map<*, *>
+                if (obj == null) {
+                    invalidCueCount++
+                    continue
+                }
+                val src = obj.jsonString("sourceText", "").trim()
+                if (src.isBlank()) {
+                    invalidCueCount++
+                    continue
+                }
+                val rawStartSec = obj.jsonDouble("startSec", Double.NaN)
+                if (rawStartSec.isNaN() || rawStartSec < 0.0) {
+                    invalidCueCount++
+                    continue
+                }
+                val absStartSec = rawStartSec + timestampOffsetSec
+                val rawStartMs = (absStartSec * 1000.0).toLong().coerceAtLeast(0L)
+                if (rawStartMs < minWindowMs || rawStartMs > maxWindowMs) {
+                    outOfBoundsCueCount++
+                    if (rawStartMs < minWindowMs - 2_000L || rawStartMs > hardWindowEndMs + 2_000L) {
+                        majorOutOfBoundsCount++
+                    }
+                    continue
+                }
+                val startMs = rawStartMs.coerceIn(
+                    hardWindowStartMs,
+                    (hardWindowEndMs - 450L).coerceAtLeast(hardWindowStartMs),
+                )
+                val rawEndSec = obj.jsonDouble("endSec", rawStartSec + 2.2)
+                val safeRawEndSec = if (rawEndSec.isNaN() || rawEndSec < rawStartSec) rawStartSec + 2.0 else rawEndSec
+                val absEndSec = safeRawEndSec + timestampOffsetSec
+                val endMs = (absEndSec * 1000.0).toLong()
+                    .coerceAtLeast(startMs + 500L)
+                    .coerceAtMost(startMs + 9_500L)
+                    .coerceAtMost(hardWindowEndMs)
+
+                val candSlot = obj.jsonString("speakerSlot", "UNCERTAIN").trim()
+                val isGenuineDuplicate = acceptedCues.any { prev ->
+                    LookaheadWindowPlanner.areSpeakersCompatible(prev.suggestedSpeakerSlot, candSlot) &&
+                        LookaheadWindowPlanner.areTemporallyOverlappingEquivalentText(
+                            prevStartMs = prev.startMs,
+                            prevEndMs = prev.endMs,
+                            prevText = prev.sourceText,
+                            candStartMs = startMs,
+                            candEndMs = endMs,
+                            candText = src,
+                        )
+                }
+                if (isGenuineDuplicate) {
+                    discardedDuplicateCount++
+                    continue
+                }
+
+                val typeName = obj.jsonString("dialogueType", "SPOKEN")
+                val rawPos = obj.jsonString("speakerPosition", "CENTER").trim().uppercase()
+                var dialogueType = DialogueType.entries.firstOrNull { it.name == typeName }
+                    ?: DialogueType.SPOKEN
+                if (dialogueType == DialogueType.SPOKEN) {
+                    when (rawPos) {
+                        "OFF_SCREEN_LEFT" -> dialogueType = DialogueType.OFF_SCREEN_LEFT
+                        "OFF_SCREEN_RIGHT" -> dialogueType = DialogueType.OFF_SCREEN_RIGHT
+                        "OFF_SCREEN_BEHIND" -> dialogueType = DialogueType.OFF_SCREEN_BEHIND
+                        "VOICE_OVER" -> dialogueType = DialogueType.VOICE_OVER
+                    }
+                }
+                val rawX = obj.jsonDouble("anchorX", Double.NaN)
+                val rawY = obj.jsonDouble("anchorY", Double.NaN)
+                val resolvedX = when {
+                    !rawX.isNaN() && rawX in 0.02..0.98 -> rawX.toFloat().coerceIn(0.12f, 0.88f)
+                    rawPos == "LEFT" -> 0.22f
+                    rawPos == "CENTER_LEFT" -> 0.35f
+                    rawPos == "CENTER_RIGHT" -> 0.65f
+                    rawPos == "RIGHT" -> 0.78f
+                    rawPos == "CENTER" -> 0.50f
+                    else -> null
+                }
+                val resolvedY = if (!rawY.isNaN() && rawY in 0.04..0.95) {
+                    rawY.toFloat().coerceIn(0.14f, 0.78f)
+                } else if (resolvedX != null) {
+                    0.36f
+                } else {
+                    null
+                }
+                val rawDeadSpace = obj.jsonString("deadSpaceZone", "AUTO").trim().uppercase()
+                val resolvedDeadSpace = DeadSpaceZone.entries.firstOrNull { it.name == rawDeadSpace }
+                    ?: DeadSpaceZone.AUTO
+                val parsedAvoidBoxes = buildList {
+                    val arr = obj.jsonList("avoidBoxes")
+                    if (arr != null) {
+                        for (bItem in arr.take(6)) {
+                            val bObj = bItem as? Map<*, *> ?: continue
+                            val l = bObj.jsonDouble("left", Double.NaN)
+                            val t = bObj.jsonDouble("top", Double.NaN)
+                            val r = bObj.jsonDouble("right", Double.NaN)
+                            val b = bObj.jsonDouble("bottom", Double.NaN)
+                            if (!l.isNaN() && !t.isNaN() && !r.isNaN() && !b.isNaN() && r > l && b > t) {
+                                val rect = NormalizedRect(
+                                    left = l.toFloat().coerceIn(0f, 1f),
+                                    top = t.toFloat().coerceIn(0f, 1f),
+                                    right = r.toFloat().coerceIn(0f, 1f),
+                                    bottom = b.toFloat().coerceIn(0f, 1f),
+                                )
+                                if (rect.width >= 0.04f && rect.height >= 0.04f && rect.width <= 0.85f && rect.height <= 0.75f) {
+                                    add(rect)
+                                }
+                            }
+                        }
+                    }
+                }
+                val natural = obj.jsonString("naturalTranslation", src).trim().ifBlank { src }
+                acceptedCues.add(
+                    AiTranscribedCue(
+                        startMs = startMs,
+                        endMs = endMs,
+                        sourceText = src,
+                        naturalTranslation = natural,
+                        literalTranslation = obj.jsonString("literalTranslation", "").trim(),
+                        romanization = obj.jsonString("romanization", "").trim(),
+                        dialogueType = dialogueType,
+                        suggestedSpeakerSlot = candSlot,
+                        contextReason = obj.jsonString("contextReason", "").trim(),
+                        culturalNote = obj.jsonString("culturalNote", "").trim(),
+                        speakerPosition = rawPos,
+                        anchorX = resolvedX,
+                        anchorY = resolvedY,
+                        deadSpaceZone = resolvedDeadSpace,
+                        avoidBoxes = parsedAvoidBoxes,
+                    )
+                )
+            }
+
+            val sortedCues = acceptedCues.sortedBy { it.startMs }
+            val outcome = when {
+                sortedCues.isNotEmpty() && (invalidCueCount > 0 || majorOutOfBoundsCount > 0) ->
+                    TranscriptionOutcome.PARTIAL_SUCCESS
+                sortedCues.isNotEmpty() ->
+                    TranscriptionOutcome.DIALOGUE_DETECTED
+                cuesList.isNotEmpty() && outOfBoundsCueCount > 0 ->
+                    TranscriptionOutcome.INVALID_OR_AMBIGUOUS_TIMESTAMPS
+                cuesList.isNotEmpty() && invalidCueCount > 0 ->
+                    TranscriptionOutcome.INVALID_AI_RESPONSE
+                noSpeechConfirmed ->
+                    TranscriptionOutcome.VERIFIED_SILENCE
+                else ->
+                    TranscriptionOutcome.EMPTY_UNCONFIRMED
+            }
+
+            return AiYouTubeTranscriptionResult(
+                cues = sortedCues,
+                speakerUpdates = speakerUpdates,
+                summary = summary,
+                outcome = outcome,
+                noSpeechConfirmed = noSpeechConfirmed && sortedCues.isEmpty(),
+                invalidCueCount = invalidCueCount,
+                outOfBoundsCueCount = outOfBoundsCueCount,
+                discardedDuplicateCount = discardedDuplicateCount,
+                diagnosticNote = "outcome=$outcome cues=${sortedCues.size} invalid=$invalidCueCount oob=$outOfBoundsCueCount",
+            )
+        }
+
+        fun parseAudioTranscriptionPayload(
+            rawJson: String,
+            chunkStartMs: Long,
+        ): AiAudioTranscriptionResult {
+            val root = runCatching { parseJsonMapLenientStatic(rawJson) }.getOrNull()
+                ?: return AiAudioTranscriptionResult(
+                    outcome = TranscriptionOutcome.INVALID_AI_RESPONSE,
+                    diagnosticNote = "Malformed audio transcript JSON",
+                )
+            val noSpeechConfirmed = root.jsonBoolean("noSpeechConfirmed", false)
+            val cuesList = root.jsonList("cues")
+                ?: return AiAudioTranscriptionResult(
+                    outcome = TranscriptionOutcome.INVALID_AI_RESPONSE,
+                    diagnosticNote = "Missing cues array in audio transcript JSON",
+                )
+
+            var invalidCueCount = 0
+            val parsed = buildList {
+                for (item in cuesList) {
+                    val obj = item as? Map<*, *>
+                    if (obj == null) {
+                        invalidCueCount++
+                        continue
+                    }
+                    val src = obj.jsonString("sourceText", "").trim()
+                    val startOffsetSec = obj.jsonDouble("startOffsetSec", Double.NaN)
+                    if (src.isBlank() || startOffsetSec.isNaN() || startOffsetSec < 0.0) {
+                        invalidCueCount++
+                        continue
+                    }
+                    val sMs = chunkStartMs + (startOffsetSec * 1000.0).toLong().coerceAtLeast(0L)
+                    val rawEndOffset = obj.jsonDouble("endOffsetSec", startOffsetSec + 1.5)
+                    val safeEndOffset = if (rawEndOffset.isNaN() || rawEndOffset < startOffsetSec) startOffsetSec + 1.5 else rawEndOffset
+                    val eMs = (chunkStartMs + (safeEndOffset * 1000.0).toLong()).coerceAtLeast(sMs + 950L)
+                    val typeName = obj.jsonString("dialogueType", "SPOKEN")
+                    val dialogueType = DialogueType.entries.firstOrNull { it.name == typeName } ?: DialogueType.SPOKEN
+                    add(
+                        AiTranscribedCue(
+                            startMs = sMs,
+                            endMs = eMs,
+                            sourceText = src,
+                            naturalTranslation = obj.jsonString("naturalTranslation", src).ifBlank { src },
+                            literalTranslation = obj.jsonString("literalTranslation", ""),
+                            romanization = obj.jsonString("romanization", ""),
+                            dialogueType = dialogueType,
+                            suggestedSpeakerSlot = obj.jsonString("speakerSlot", "UNCERTAIN"),
+                            contextReason = obj.jsonString("contextReason", ""),
+                            culturalNote = obj.jsonString("culturalNote", ""),
+                        )
+                    )
+                }
+            }.sortedBy { it.startMs }
+
+            val outcome = when {
+                parsed.isNotEmpty() && invalidCueCount > 0 -> TranscriptionOutcome.PARTIAL_SUCCESS
+                parsed.isNotEmpty() -> TranscriptionOutcome.DIALOGUE_DETECTED
+                cuesList.isNotEmpty() && invalidCueCount > 0 -> TranscriptionOutcome.INVALID_AI_RESPONSE
+                noSpeechConfirmed -> TranscriptionOutcome.VERIFIED_SILENCE
+                else -> TranscriptionOutcome.EMPTY_UNCONFIRMED
+            }
+            return AiAudioTranscriptionResult(
+                cues = parsed,
+                outcome = outcome,
+                noSpeechConfirmed = noSpeechConfirmed && parsed.isEmpty(),
+                invalidCueCount = invalidCueCount,
+                diagnosticNote = "audioOutcome=$outcome cues=${parsed.size} invalid=$invalidCueCount",
+            )
+        }
+
+        private fun parseJsonMapLenientStatic(raw: String): Map<*, *>? {
+            val trimmed = raw.trim()
+            val unwrapped = if (trimmed.startsWith("```")) {
+                trimmed
+                    .removePrefix("```json")
+                    .removePrefix("```")
+                    .removeSuffix("```")
+                    .trim()
+            } else {
+                trimmed
+            }
+            return try {
+                staticJsonMapAdapter.fromJson(unwrapped)
+            } catch (_: Exception) {
+                val firstBrace = unwrapped.indexOf('{')
+                val lastBrace = unwrapped.lastIndexOf('}')
+                if (firstBrace >= 0 && lastBrace > firstBrace) {
+                    staticJsonMapAdapter.fromJson(unwrapped.substring(firstBrace, lastBrace + 1))
+                } else {
+                    null
+                }
+            }
+        }
+
+        private fun parseSpeakerUpdatesStatic(root: Map<*, *>): List<AiCastSlotAssignment> {
+            val arr = root.jsonList("speakerUpdates") ?: return emptyList()
+            val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
+            return buildList {
+                for (item in arr) {
+                    val obj = item as? Map<*, *> ?: continue
+                    val slot = obj.jsonString("slot", "").trim().uppercase()
+                    val name = obj.jsonString("displayName", "").trim()
+                    val isRole = obj.jsonBoolean("isRolePlaceholder", false)
+                    val visuallyConfirmed = if (obj.containsKey("isVisuallyConfirmed")) {
+                        obj.jsonBoolean("isVisuallyConfirmed", false)
+                    } else {
+                        !isRole
+                    }
+                    val notes = obj.jsonString("visualVoiceNotes", "").trim().take(80)
+                    if (slot in validSlots && (name.isNotBlank() || notes.isNotBlank())) {
+                        add(
+                            AiCastSlotAssignment(
+                                slot = slot,
+                                displayName = cleanWordBoundaryNameStatic(name, 26),
+                                isRolePlaceholder = isRole,
+                                rationale = obj.jsonString("rationale", "").trim(),
+                                visualVoiceNotes = notes,
+                                isVisuallyConfirmed = visuallyConfirmed,
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        private fun cleanWordBoundaryNameStatic(raw: String, maxChars: Int): String {
+            val trimmed = raw.trim().replace(Regex("\\s+"), " ")
+            if (trimmed.length <= maxChars) return trimmed
+            val cut = trimmed.take(maxChars)
+            val lastSpace = cut.lastIndexOf(' ')
+            return if (lastSpace >= 8) cut.substring(0, lastSpace).trimEnd(',', '-', ':', '/') else cut.trim()
+        }
+
         fun isQuotaOrCreditExhaustedError(error: Throwable?): Boolean {
             if (error == null) return false
             val combined = buildString {
@@ -1306,4 +1594,5 @@ class TranslationAiService {
         }
     }
 }
+
 

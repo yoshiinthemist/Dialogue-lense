@@ -391,23 +391,62 @@ object LookaheadWindowPlanner {
         }
     }
 
+    data class WindowMergeReport(
+        val events: List<DialogueEvent>,
+        val acceptedCount: Int,
+        val rejectedCount: Int,
+        val decisions: List<DuplicateDecisionRecord>,
+    )
+
     fun mergeWindowDialogueEvents(
         existing: List<DialogueEvent>,
         incoming: List<DialogueEvent>,
         windowStartMs: Long,
         windowEndMs: Long,
-    ): List<DialogueEvent> {
-        val keptOutside = existing.filter { evt ->
-            evt.lockedByUser || evt.startTimeMs < windowStartMs || evt.startTimeMs >= windowEndMs
+    ): List<DialogueEvent> = mergeWindowDialogueEventsWithReport(
+        existing = existing,
+        incoming = incoming,
+        windowStartMs = windowStartMs,
+        windowEndMs = windowEndMs,
+    ).events
+
+    fun mergeWindowDialogueEventsWithReport(
+        existing: List<DialogueEvent>,
+        incoming: List<DialogueEvent>,
+        windowStartMs: Long,
+        windowEndMs: Long,
+    ): WindowMergeReport {
+        val incomingIds = incoming.map { it.id }.toSet()
+        // Additive & idempotent merge: NEVER blindly wipe existing unlocked cues inside [windowStartMs, windowEndMs),
+        // because overlapping windows, bisected partial recoveries, or simultaneous speakers may contribute cues
+        // across passes. Only replace an existing unlocked event when an incoming event updates that exact ID.
+        val keptExisting = existing.filter { evt ->
+            evt.lockedByUser || evt.id !in incomingIds
         }
-        val lockedInWindow = keptOutside.filter { evt ->
+        val lockedInWindow = keptExisting.filter { evt ->
             evt.lockedByUser && evt.startTimeMs in windowStartMs until windowEndMs
         }
 
-        val merged = keptOutside.toMutableList()
+        val merged = keptExisting.toMutableList()
+        val decisions = mutableListOf<DuplicateDecisionRecord>()
+        var acceptedCount = 0
+        var rejectedCount = 0
+
         for (rawCandidate in incoming.sortedBy { it.startTimeMs }) {
             // Never let an earlier window spill cues past its [windowStartMs, windowEndMs) ceiling into the next section
-            if (rawCandidate.startTimeMs >= windowEndMs) continue
+            if (rawCandidate.startTimeMs >= windowEndMs) {
+                rejectedCount++
+                decisions.add(
+                    DuplicateDecisionRecord(
+                        accepted = false,
+                        reason = "OUT_OF_WINDOW_SPILLOVER",
+                        incomingTextPreview = rawCandidate.sourceText.take(48),
+                        incomingStartMs = rawCandidate.startTimeMs,
+                        speakerId = rawCandidate.speakerId,
+                    )
+                )
+                continue
+            }
 
             val clampedEndMs = if (rawCandidate.endTimeMs > windowEndMs && windowEndMs - rawCandidate.startTimeMs >= 450L) {
                 windowEndMs
@@ -420,34 +459,109 @@ object LookaheadWindowPlanner {
                 rawCandidate
             }
 
-            val overlapsLocked = lockedInWindow.any { locked ->
-                abs(locked.startTimeMs - candidate.startTimeMs) < 900L
+            // User-locked event protection: only suppress incoming candidate when it genuinely
+            // overlaps the same speaker/unassigned turn at the locked time span. Simultaneous or
+            // adjacent lines from a distinct speaker are ALWAYS preserved.
+            val matchedLocked = lockedInWindow.firstOrNull { locked ->
+                areDuplicateUtterances(locked, candidate) ||
+                    (areSpeakersCompatible(locked.speakerId, candidate.speakerId) &&
+                        temporalOverlapRatio(locked, candidate) >= 0.70f &&
+                        abs(locked.startTimeMs - candidate.startTimeMs) <= 350L)
             }
-            val duplicateTextNearBoundary = merged.any { prev ->
-                isEquivalentOrOverlappingCueText(
-                    prevText = prev.sourceText,
-                    candText = candidate.sourceText,
-                    deltaMs = abs(prev.startTimeMs - candidate.startTimeMs),
+            if (matchedLocked != null) {
+                rejectedCount++
+                decisions.add(
+                    DuplicateDecisionRecord(
+                        accepted = false,
+                        reason = "OVERLAPS_USER_LOCKED_UTTERANCE",
+                        incomingTextPreview = candidate.sourceText.take(48),
+                        incomingStartMs = candidate.startTimeMs,
+                        matchedStartMs = matchedLocked.startTimeMs,
+                        speakerId = candidate.speakerId,
+                    )
                 )
+                continue
             }
-            // If a lookback overlap cue sits slightly before windowStartMs, only rescue it if that moment isn't already covered
-            val stalePreBoundary = candidate.startTimeMs < windowStartMs && (
-                candidate.startTimeMs < (windowStartMs - 4_500L) ||
-                    merged.any { prev ->
-                        abs(prev.startTimeMs - candidate.startTimeMs) < 1_400L ||
-                            (candidate.startTimeMs <= prev.endTimeMs + 350L && candidate.endTimeMs >= prev.startTimeMs - 350L)
+
+            val duplicateMatch = merged.firstOrNull { prev ->
+                areDuplicateUtterances(prev, candidate)
+            }
+            if (duplicateMatch != null) {
+                rejectedCount++
+                decisions.add(
+                    DuplicateDecisionRecord(
+                        accepted = false,
+                        reason = "TEMPORAL_OVERLAP_SAME_UTTERANCE",
+                        incomingTextPreview = candidate.sourceText.take(48),
+                        incomingStartMs = candidate.startTimeMs,
+                        matchedStartMs = duplicateMatch.startTimeMs,
+                        speakerId = candidate.speakerId,
+                    )
+                )
+                continue
+            }
+
+            // Lookback pre-boundary cue rescue: only drop if the exact pre-boundary moment
+            // already has a covered cue from the same/compatible speaker or falls >4.5s earlier.
+            val stalePreBoundaryMatch = if (candidate.startTimeMs < windowStartMs) {
+                if (candidate.startTimeMs < (windowStartMs - 4_500L)) {
+                    candidate
+                } else {
+                    merged.firstOrNull { prev ->
+                        val overlapsOrSameMoment =
+                            (candidate.startTimeMs <= prev.endTimeMs + 350L && candidate.endTimeMs >= prev.startTimeMs - 350L) ||
+                                abs(prev.startTimeMs - candidate.startTimeMs) < 900L
+                        overlapsOrSameMoment && (
+                            areDuplicateUtterances(prev, candidate) ||
+                                areSpeakersCompatible(prev.speakerId, candidate.speakerId)
+                            )
                     }
+                }
+            } else {
+                null
+            }
+            if (stalePreBoundaryMatch != null) {
+                rejectedCount++
+                decisions.add(
+                    DuplicateDecisionRecord(
+                        accepted = false,
+                        reason = "COVERED_PREBOUNDARY_OVERLAP",
+                        incomingTextPreview = candidate.sourceText.take(48),
+                        incomingStartMs = candidate.startTimeMs,
+                        matchedStartMs = stalePreBoundaryMatch.startTimeMs,
+                        speakerId = candidate.speakerId,
+                    )
                 )
-            if (!overlapsLocked && !duplicateTextNearBoundary && !stalePreBoundary) {
-                merged.add(candidate)
+                continue
+            }
+
+            merged.add(candidate)
+            acceptedCount++
+            if (decisions.size < 24) {
+                decisions.add(
+                    DuplicateDecisionRecord(
+                        accepted = true,
+                        reason = "ACCEPTED_EVENT",
+                        incomingTextPreview = candidate.sourceText.take(48),
+                        incomingStartMs = candidate.startTimeMs,
+                        speakerId = candidate.speakerId,
+                    )
+                )
             }
         }
-        return merged.sortedBy { it.startTimeMs }
+        return WindowMergeReport(
+            events = merged.sortedBy { it.startTimeMs },
+            acceptedCount = acceptedCount,
+            rejectedCount = rejectedCount,
+            decisions = decisions,
+        )
     }
 
     /**
-     * Suppresses hallucinated opening/earlier-scene subtitle echoes when a late video window
-     * replays dialogue that already appeared much earlier in the video.
+     * Suppresses hallucinated opening-scene subtitle echoes ONLY when a late video window replays
+     * opening dialogue at the start of the window (or across the majority of the chunk) with
+     * compatible speaker identity. Legitimate repeated phrases, choruses, callbacks, or distinct-speaker
+     * echoes elsewhere in a window are never discarded.
      */
     fun filterEchoedOpeningCues(
         existing: List<DialogueEvent>,
@@ -455,52 +569,122 @@ object LookaheadWindowPlanner {
         windowStartMs: Long,
     ): List<DialogueEvent> {
         if (incoming.isEmpty() || existing.isEmpty() || windowStartMs < 35_000L) return incoming
-        val priorLongNormalized = existing
-            .asSequence()
-            .filter { it.startTimeMs < (windowStartMs - 20_000L).coerceAtLeast(0L) }
-            .map { normalizeCueComparisonText(it.sourceText) }
-            .filter { it.length >= 16 }
-            .toSet()
-        if (priorLongNormalized.isEmpty()) return incoming
-
-        val matchedCount = incoming.count { evt ->
-            val norm = normalizeCueComparisonText(evt.sourceText)
-            norm.length >= 16 && norm in priorLongNormalized
+        val priorAnchors = existing.filter {
+            it.startTimeMs < (windowStartMs - 40_000L).coerceAtLeast(0L) &&
+                normalizeCueComparisonText(it.sourceText).length >= 16
         }
-        if (matchedCount >= 2 && matchedCount * 10 >= incoming.size * 4) {
+        if (priorAnchors.isEmpty()) return incoming
+
+        val matchingIndices = mutableSetOf<Int>()
+        incoming.forEachIndexed { idx, evt ->
+            val norm = normalizeCueComparisonText(evt.sourceText)
+            if (norm.length < 16) return@forEachIndexed
+            val matchedPrior = priorAnchors.any { prior ->
+                normalizeCueComparisonText(prior.sourceText) == norm &&
+                    areSpeakersCompatible(prior.speakerId, evt.speakerId)
+            }
+            if (matchedPrior) {
+                matchingIndices.add(idx)
+            }
+        }
+
+        // Whole-chunk opening hallucination: >=2 matching lines making up >=50% of incoming chunk
+        if (matchingIndices.size >= 2 && matchingIndices.size * 10 >= incoming.size * 5) {
             return emptyList()
         }
-        return incoming.filterNot { evt ->
+
+        // Leading-edge echo guard: only suppress a lone opening-edge replay (within first 4s of windowStartMs,
+        // >=26 normalized chars) from the same/unassigned speaker when matching an earlier-scene line.
+        return incoming.filterIndexed { idx, evt ->
+            if (idx !in matchingIndices) return@filterIndexed true
             val norm = normalizeCueComparisonText(evt.sourceText)
-            norm.length >= 22 && norm in priorLongNormalized
+            val atWindowOpening = (evt.startTimeMs - windowStartMs) in -1_000L..4_000L
+            !(atWindowOpening && norm.length >= 26)
         }
     }
 
-    fun isEquivalentOrOverlappingCueText(
-        prevText: String,
-        candText: String,
-        deltaMs: Long,
+    /**
+     * Identity-aware utterance deduplication: two events represent the same spoken utterance
+     * ONLY when they share compatible speaker identity AND genuine temporal overlap (or tiny
+     * re-segmentation boundary jitter) alongside equivalent text.
+     *
+     * Identical dialogue at distinct non-overlapping timestamps (or from distinct speakers)
+     * is ALWAYS preserved.
+     */
+    fun areDuplicateUtterances(
+        prev: DialogueEvent,
+        cand: DialogueEvent,
     ): Boolean {
+        if (!areSpeakersCompatible(prev.speakerId, cand.speakerId)) return false
+        return areTemporallyOverlappingEquivalentText(
+            prevStartMs = prev.startTimeMs,
+            prevEndMs = prev.endTimeMs,
+            prevText = prev.sourceText,
+            candStartMs = cand.startTimeMs,
+            candEndMs = cand.endTimeMs,
+            candText = cand.sourceText,
+        )
+    }
+
+    fun areTemporallyOverlappingEquivalentText(
+        prevStartMs: Long,
+        prevEndMs: Long,
+        prevText: String,
+        candStartMs: Long,
+        candEndMs: Long,
+        candText: String,
+    ): Boolean {
+        val prevSafeEnd = maxOf(prevEndMs, prevStartMs + 350L)
+        val candSafeEnd = maxOf(candEndMs, candStartMs + 350L)
+        val overlapMs = minOf(prevSafeEnd, candSafeEnd) - maxOf(prevStartMs, candStartMs)
+        val minDurMs = minOf(prevSafeEnd - prevStartMs, candSafeEnd - candStartMs).coerceAtLeast(350L)
+        val startDeltaMs = abs(prevStartMs - candStartMs)
+        val endDeltaMs = abs(prevSafeEnd - candSafeEnd)
+
+        // Require genuine interval overlap OR tiny re-encoding boundary jitter
+        val hasTemporalOverlap = overlapMs >= minOf(250L, (minDurMs * 0.40f).toLong())
+        val hasJitterMatch = startDeltaMs <= 650L && (endDeltaMs <= 900L || overlapMs > 0L)
+        if (!hasTemporalOverlap && !hasJitterMatch) {
+            return false
+        }
+
+        return isTextEquivalent(prevText, candText)
+    }
+
+    fun areSpeakersCompatible(firstSpeakerId: String?, secondSpeakerId: String?): Boolean {
+        val a = firstSpeakerId?.trim()?.takeIf { it.isNotEmpty() && !it.equals("UNCERTAIN", ignoreCase = true) }
+        val b = secondSpeakerId?.trim()?.takeIf { it.isNotEmpty() && !it.equals("UNCERTAIN", ignoreCase = true) }
+        if (a != null && b != null) {
+            return a.equals(b, ignoreCase = true)
+        }
+        return true
+    }
+
+    private fun temporalOverlapRatio(a: DialogueEvent, b: DialogueEvent): Float {
+        val aEnd = maxOf(a.endTimeMs, a.startTimeMs + 350L)
+        val bEnd = maxOf(b.endTimeMs, b.startTimeMs + 350L)
+        val overlap = (minOf(aEnd, bEnd) - maxOf(a.startTimeMs, b.startTimeMs)).coerceAtLeast(0L)
+        val minDur = minOf(aEnd - a.startTimeMs, bEnd - b.startTimeMs).coerceAtLeast(1L)
+        return overlap.toFloat() / minDur.toFloat()
+    }
+
+    fun isTextEquivalent(prevText: String, candText: String): Boolean {
         val prevNorm = normalizeCueComparisonText(prevText)
         val candNorm = normalizeCueComparisonText(candText)
         if (prevNorm.isEmpty() || candNorm.isEmpty()) return false
+        if (prevNorm == candNorm) return true
 
-        val exactHorizonMs = if (minOf(prevNorm.length, candNorm.length) >= 10) 24_000L else 4_500L
-        if (deltaMs < exactHorizonMs && prevNorm == candNorm) return true
-
-        if (deltaMs < 10_000L) {
-            val shorter = minOf(prevNorm.length, candNorm.length)
-            if (shorter >= 12 && (prevNorm.contains(candNorm) || candNorm.contains(prevNorm))) {
+        val shorter = minOf(prevNorm.length, candNorm.length)
+        if (shorter >= 12 && (prevNorm.contains(candNorm) || candNorm.contains(prevNorm))) {
+            return true
+        }
+        val prevWords = tokenizeComparisonWords(prevText)
+        val candWords = tokenizeComparisonWords(candText)
+        if (prevWords.size >= 3 && candWords.size >= 3) {
+            val intersection = prevWords.intersect(candWords).size
+            val union = prevWords.union(candWords).size.coerceAtLeast(1)
+            if (intersection.toFloat() / union.toFloat() >= 0.72f) {
                 return true
-            }
-            val prevWords = tokenizeComparisonWords(prevText)
-            val candWords = tokenizeComparisonWords(candText)
-            if (prevWords.size >= 3 && candWords.size >= 3) {
-                val intersection = prevWords.intersect(candWords).size
-                val union = prevWords.union(candWords).size.coerceAtLeast(1)
-                if (intersection.toFloat() / union.toFloat() >= 0.72f) {
-                    return true
-                }
             }
         }
         return false
@@ -515,3 +699,4 @@ object LookaheadWindowPlanner {
     private fun normalizeCueComparisonText(raw: String): String =
         raw.trim().lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), "")
 }
+

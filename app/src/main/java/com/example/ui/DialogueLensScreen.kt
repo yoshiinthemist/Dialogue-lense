@@ -927,6 +927,7 @@ fun DialogueLensScreen(
                         dualInstanceEnabled = state.dualInstanceEnabled,
                         scoutedUpToMs = state.scoutedUpToMs,
                         bufferedRanges = state.bufferedWindowRanges,
+                        failedRanges = state.coverageSummary.failedRanges,
                         analysisStatus = state.analysisStatus,
                         onTogglePlayPause = viewModel::togglePlayPause,
                         onSeekTo = viewModel::seekTo,
@@ -1160,13 +1161,16 @@ private fun QuietScoutTopPill(
     val isError = cap is ScoutCaptionState.Error || hb.status == ScoutHeartbeatStatus.QUOTA_EXHAUSTED
     val isWorking = cap is ScoutCaptionState.FetchingCaptions || cap is ScoutCaptionState.AiTranscribing || isReconnecting
     val isReady = cap is ScoutCaptionState.Ready || state.project.dialogueEvents.isNotEmpty()
+    val isPartial = cap is ScoutCaptionState.Ready && cap.sourceLabel.contains("Partial", ignoreCase = true)
     val accent = when {
         isError -> LensAmber
         isReconnecting -> LensAmber
+        isPartial -> LensAmber
         isWorking -> LensSky
         isReady -> LensMint
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
+    val verifiedPct = (state.coverageSummary.verifiedFraction * 100).toInt()
     val label = when {
         cap is ScoutCaptionState.Error && cap.isQuotaExhausted -> "Credits"
         hb.status == ScoutHeartbeatStatus.RECONNECTING -> "Retry ${hb.retryAttempt}/${hb.maxRetries}"
@@ -1176,7 +1180,10 @@ private fun QuietScoutTopPill(
             "Scout ${state.scoutCompletedWindows}/${state.scoutTotalWindows}"
         isWorking -> "Scout"
         cap is ScoutCaptionState.Ready && cap.sourceLabel.contains("CC", ignoreCase = true) -> "CC Free"
+        cap is ScoutCaptionState.Ready && isPartial ->
+            "Partial ${verifiedPct}% · ${state.project.dialogueEvents.size}"
         cap is ScoutCaptionState.Ready && cap.sourceLabel.contains("Cached", ignoreCase = true) -> "Cached"
+        cap is ScoutCaptionState.Ready && cap.sourceLabel.contains("Silent", ignoreCase = true) -> "Silent · 0"
         cap is ScoutCaptionState.Ready && cap.sourceLabel.contains("Full", ignoreCase = true) ->
             "Full · ${state.project.dialogueEvents.size}"
         else -> "${state.project.dialogueEvents.size}"
@@ -1605,8 +1612,9 @@ private fun ToolsQuickSettingsHeader(
                         }
                         val diagLine = state.scoutDiagnosticDetail.ifBlank { AppCheckDiagnostics.summaryLine() }
                         val hbBadge = state.scoutHeartbeat.summaryBadge()
+                        val coverageDiag = state.transcriptDiagnostics.summaryLine()
                         Text(
-                            text = "$ccSummary · $hbBadge · App Check: $diagLine",
+                            text = "$ccSummary · $hbBadge · Coverage: $coverageDiag · App Check: $diagLine",
                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.5.sp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.testTag("scout_diagnostics_detail_text"),

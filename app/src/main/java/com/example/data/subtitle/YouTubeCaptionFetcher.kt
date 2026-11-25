@@ -687,47 +687,52 @@ object YouTubeCaptionFetcher {
                 result.add(cue)
                 continue
             }
-            val gapMs = kotlin.math.abs(cue.startTimeMs - prev.startTimeMs)
+            val overlapMs = minOf(prev.endTimeMs, cue.endTimeMs) - cue.startTimeMs
+            val startDeltaMs = kotlin.math.abs(cue.startTimeMs - prev.startTimeMs)
+            val hasGenuineOverlap = overlapMs >= 150L || startDeltaMs <= 300L
+            if (!hasGenuineOverlap) {
+                result.add(cue)
+                continue
+            }
+
             val prevNorm = prev.text.trim().lowercase(Locale.US).replace(Regex("[^\\p{L}\\p{N}]+"), "")
             val currNorm = cue.text.trim().lowercase(Locale.US).replace(Regex("[^\\p{L}\\p{N}]+"), "")
-            if (gapMs < 4_500L && prevNorm.isNotEmpty() && prevNorm == currNorm) {
+            if (prevNorm.isNotEmpty() && prevNorm == currNorm) {
                 result[result.lastIndex] = prev.copy(endTimeMs = maxOf(prev.endTimeMs, cue.endTimeMs))
                 continue
             }
 
-            if (gapMs < 4_500L) {
-                val prevWords = prev.text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-                val currWords = cue.text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-                if (prevWords.isNotEmpty() && currWords.isNotEmpty()) {
-                    // Case 1: Rolling ASR repeats prev as prefix of curr -> keep only new suffix words
-                    if (currWords.size > prevWords.size &&
-                        currWords.take(prevWords.size).map { it.lowercase(Locale.US) } ==
-                        prevWords.map { it.lowercase(Locale.US) }
-                    ) {
-                        val trimmed = currWords.drop(prevWords.size).joinToString(" ").trim()
-                        if (trimmed.isNotEmpty()) {
-                            result.add(cue.copy(text = trimmed))
-                        }
-                        continue
+            val prevWords = prev.text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            val currWords = cue.text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            if (prevWords.isNotEmpty() && currWords.isNotEmpty()) {
+                // Case 1: Rolling ASR repeats prev as prefix of curr -> keep only new suffix words
+                if (currWords.size > prevWords.size &&
+                    currWords.take(prevWords.size).map { it.lowercase(Locale.US) } ==
+                    prevWords.map { it.lowercase(Locale.US) }
+                ) {
+                    val trimmed = currWords.drop(prevWords.size).joinToString(" ").trim()
+                    if (trimmed.isNotEmpty()) {
+                        result.add(cue.copy(text = trimmed))
                     }
-                    // Case 2: Rolling ASR starts curr with last k >= 2 words of prev -> strip overlap
-                    val maxOverlap = minOf(prevWords.size, currWords.size)
-                    var matchedK = 0
-                    for (k in maxOverlap downTo 2) {
-                        val tail = prevWords.takeLast(k).map { it.lowercase(Locale.US).trim(',', '.', '!', '?') }
-                        val head = currWords.take(k).map { it.lowercase(Locale.US).trim(',', '.', '!', '?') }
-                        if (tail == head) {
-                            matchedK = k
-                            break
-                        }
+                    continue
+                }
+                // Case 2: Rolling ASR starts curr with last k >= 2 words of prev -> strip overlap
+                val maxOverlap = minOf(prevWords.size, currWords.size)
+                var matchedK = 0
+                for (k in maxOverlap downTo 2) {
+                    val tail = prevWords.takeLast(k).map { it.lowercase(Locale.US).trim(',', '.', '!', '?') }
+                    val head = currWords.take(k).map { it.lowercase(Locale.US).trim(',', '.', '!', '?') }
+                    if (tail == head) {
+                        matchedK = k
+                        break
                     }
-                    if (matchedK >= 2) {
-                        val remaining = currWords.drop(matchedK).joinToString(" ").trim()
-                        if (remaining.isNotEmpty()) {
-                            result.add(cue.copy(text = remaining))
-                        }
-                        continue
+                }
+                if (matchedK >= 2) {
+                    val remaining = currWords.drop(matchedK).joinToString(" ").trim()
+                    if (remaining.isNotEmpty()) {
+                        result.add(cue.copy(text = remaining))
                     }
+                    continue
                 }
             }
             result.add(cue)

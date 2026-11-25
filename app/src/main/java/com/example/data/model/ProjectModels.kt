@@ -424,6 +424,30 @@ fun isBubbleNonSpeakerSpecific(event: DialogueEvent, style: BalloonStyleSettings
     return !style.speakerSpecificColors
 }
 
+enum class CoverageStatus {
+    VERIFIED_DIALOGUE,
+    VERIFIED_SILENCE,
+    PARTIAL_RECOVERY,
+    PENDING,
+    IN_PROGRESS,
+    FAILED,
+    LEGACY_UNVERIFIED,
+}
+
+@JsonClass(generateAdapter = true)
+data class CoverageInterval(
+    val startMs: Long,
+    val endMs: Long,
+    val status: CoverageStatus,
+    val source: SubtitleSourceKind = SubtitleSourceKind.AI_DRAFT,
+    val verified: Boolean = status == CoverageStatus.VERIFIED_DIALOGUE || status == CoverageStatus.VERIFIED_SILENCE,
+    val retryAttempts: Int = 0,
+    val lastFailureReason: String = "",
+    val dialogueCount: Int = 0,
+    val silenceConfirmed: Boolean = status == CoverageStatus.VERIFIED_SILENCE,
+    val updatedAtEpochMs: Long = 0L,
+)
+
 @JsonClass(generateAdapter = true)
 data class CachedVideoTranscript(
     val canonicalKey: String,
@@ -440,6 +464,13 @@ data class CachedVideoTranscript(
     val scoutedUpToMs: Long = 0L,
     val castDiscoverySummary: String = "",
     val cachedAtEpochMs: Long = System.currentTimeMillis(),
-)
+    val cacheVersion: Int = 1,
+    val coverageIntervals: List<CoverageInterval> = emptyList(),
+) {
+    companion object {
+        const val CURRENT_CACHE_VERSION = 2
+    }
+}
+
 
 

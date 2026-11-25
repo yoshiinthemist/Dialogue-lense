@@ -90,6 +90,7 @@ fun PlayerControlsBar(
     dualInstanceEnabled: Boolean = true,
     scoutedUpToMs: Long = 0L,
     bufferedRanges: List<TimeWindowRange> = emptyList(),
+    failedRanges: List<TimeWindowRange> = emptyList(),
     analysisStatus: AnalysisStatus,
     onTogglePlayPause: () -> Unit,
     onSeekTo: (Long) -> Unit,
@@ -232,8 +233,11 @@ fun PlayerControlsBar(
                             cornerRadius = corner,
                         )
 
-                        // Scout lookahead buffered segments (coalesced into smooth continuous tubes)
-                        val coalescedBuffered = LookaheadWindowPlanner.coalesceBufferedRanges(bufferedRanges)
+                        // Verified Scout coverage segments (never bridge across unverified/failed gaps)
+                        val coalescedBuffered = LookaheadWindowPlanner.coalesceBufferedRanges(
+                            ranges = bufferedRanges,
+                            bridgeGapMs = 1L,
+                        )
                         if (coalescedBuffered.isNotEmpty()) {
                             coalescedBuffered.forEach { range ->
                                 val sFrac = (range.startMs.toFloat() / durF).coerceIn(0f, 1f)
@@ -258,6 +262,23 @@ fun PlayerControlsBar(
                                     cornerRadius = corner,
                                 )
                             }
+                        }
+
+                        // Unresolved / failed gap intervals shown honestly in subtle amber
+                        val coalescedFailed = LookaheadWindowPlanner.coalesceBufferedRanges(
+                            ranges = failedRanges,
+                            bridgeGapMs = 1L,
+                        )
+                        coalescedFailed.forEach { range ->
+                            val sFrac = (range.startMs.toFloat() / durF).coerceIn(0f, 1f)
+                            val eFrac = (range.endMs.toFloat() / durF).coerceIn(sFrac, 1f)
+                            val segW = ((eFrac - sFrac) * size.width).coerceAtLeast(3.dp.toPx())
+                            drawRoundRect(
+                                color = LensAmber.copy(alpha = 0.55f),
+                                topLeft = Offset(sFrac * size.width, trackTop),
+                                size = Size(segW, trackH),
+                                cornerRadius = corner,
+                            )
                         }
 
                         // Coalesced speaker-colored dialogue ticks along bottom edge of rail

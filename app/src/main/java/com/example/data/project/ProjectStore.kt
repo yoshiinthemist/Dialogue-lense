@@ -28,6 +28,10 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 private val Context.settingsDataStore by preferencesDataStore(name = "dialoguelens_prefs")
 
@@ -170,9 +174,46 @@ class ProjectStore(private val context: Context) {
         }
     }
 
+    private val ioWriteLock = Any()
+
+    private fun writeTextAtomically(targetFile: File, content: String) {
+        synchronized(ioWriteLock) {
+            val parent = targetFile.parentFile
+            if (parent != null && !parent.exists()) {
+                parent.mkdirs()
+            }
+            val tmpFile = File(parent ?: context.filesDir, "${targetFile.name}.tmp.${System.nanoTime()}")
+            try {
+                FileOutputStream(tmpFile).use { fos ->
+                    fos.write(content.toByteArray(Charsets.UTF_8))
+                    fos.flush()
+                    runCatching { fos.fd.sync() }
+                }
+                try {
+                    Files.move(
+                        tmpFile.toPath(),
+                        targetFile.toPath(),
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                } catch (_: AtomicMoveNotSupportedException) {
+                    Files.move(
+                        tmpFile.toPath(),
+                        targetFile.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                }
+            } finally {
+                if (tmpFile.exists()) {
+                    runCatching { tmpFile.delete() }
+                }
+            }
+        }
+    }
+
     suspend fun saveProject(project: DialogueLensProject) = withContext(Dispatchers.IO) {
         val file = File(projectsDir, "${project.id}.dlens.json")
-        file.writeText(projectAdapter.toJson(project))
+        writeTextAtomically(file, projectAdapter.toJson(project))
     }
 
     suspend fun listSavedProjects(): List<DialogueLensProject> = withContext(Dispatchers.IO) {
@@ -194,9 +235,13 @@ class ProjectStore(private val context: Context) {
 
     suspend fun saveCachedTranscript(entry: CachedVideoTranscript) = withContext(Dispatchers.IO) {
         val safeKey = entry.canonicalKey.replace(Regex("[^A-Za-z0-9_-]"), "_").take(80)
-        if (safeKey.isBlank() || entry.dialogueEvents.isEmpty()) return@withContext
+        val hasCoverageProgress = entry.coverageIntervals.any {
+            it.verified || it.status == com.example.data.model.CoverageStatus.FAILED ||
+                it.status == com.example.data.model.CoverageStatus.PARTIAL_RECOVERY
+        }
+        if (safeKey.isBlank() || (entry.dialogueEvents.isEmpty() && !hasCoverageProgress)) return@withContext
         val file = File(videoCacheDir, "$safeKey.cache.json")
-        runCatching { file.writeText(cachedTranscriptAdapter.toJson(entry)) }
+        runCatching { writeTextAtomically(file, cachedTranscriptAdapter.toJson(entry)) }
     }
 
     suspend fun loadCachedTranscript(canonicalKey: String): CachedVideoTranscript? = withContext(Dispatchers.IO) {
@@ -218,7 +263,7 @@ class ProjectStore(private val context: Context) {
         } else {
             cache
         }
-        runCatching { translationCacheFile.writeText(translationCacheAdapter.toJson(trimmed)) }
+        runCatching { writeTextAtomically(translationCacheFile, translationCacheAdapter.toJson(trimmed)) }
     }
 
     companion object {
