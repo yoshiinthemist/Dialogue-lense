@@ -1,0 +1,48 @@
+name: DialogueLens UX APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ux-edition]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK
+        run: sdkmanager "platforms;android-36.1" "build-tools;36.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+      - name: Configure test signing and optional Firebase
+        env:
+          FIREBASE_CONFIG: ${{ secrets.UX_GOOGLE_SERVICES_JSON }}
+        run: |
+          keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          if [ -n "$FIREBASE_CONFIG" ]; then
+            printf '%s' "$FIREBASE_CONFIG" > app/google-services.json
+          else
+            echo "::warning::No UX Firebase configuration. APK will be for local/demo testing only."
+          fi
+      - name: Assemble debug APK
+        run: gradle :app:assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DialogueLens-UX-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+      - name: Run engine tests
+        run: gradle :app:testDebugUnitTest --stacktrace
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DialogueLens-UX-test-results
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
