@@ -1,0 +1,6 @@
+{
+  "name": "DialogueLens",
+  "description": "Foreign-language video player with spatially anchored speech-balloon translations, multimodal speaker-to-face attribution, confidence fallback, and timeline editor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
