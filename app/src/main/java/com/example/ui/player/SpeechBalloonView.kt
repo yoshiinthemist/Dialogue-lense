@@ -223,7 +223,6 @@ fun SpeechBalloonView(
     // Real-pixel face & sibling-bubble repulsion guarantee: scan open 2D space freely so wrapped lines never clip faces or neighbors
     val (bubbleLeftPx, bubbleTopPx) = if (
         measuredSize != IntSize.Zero &&
-        (faceExclusionRects.isNotEmpty() || occupiedBubbleRects.isNotEmpty()) &&
         event.placementMode != PlacementMode.MANUAL_OVERRIDE
     ) {
         resolveFaceSafePixelPosition(
