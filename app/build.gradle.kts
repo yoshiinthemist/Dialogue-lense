@@ -16,8 +16,8 @@ android {
     applicationId = "com.aistudio.dialoguelens.vkpzmx"
     minSdk = 24
     targetSdk = 36
-    versionCode = 27
-    versionName = "27.0"
+    versionCode = 28
+    versionName = "2.0.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -104,6 +104,8 @@ dependencies {
   implementation(libs.androidx.lifecycle.viewmodel.compose)
   implementation(libs.androidx.navigation.compose)
   implementation(libs.androidx.media3.exoplayer)
+  implementation(libs.androidx.media3.hls)
+  implementation(libs.androidx.media3.dash)
   implementation(libs.androidx.media3.ui)
   implementation(libs.androidx.media3.common)
   implementation(libs.androidx.media3.transformer)
