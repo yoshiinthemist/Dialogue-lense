@@ -184,7 +184,9 @@ class HierarchicalContextEngine {
             )
         }
 
-        if (jumpedSeek || shotChanged || chapterChanged) {
+        // A chapter marker alone updates Layer B ChapterMemory without counting as a confirmed visual
+        // camera cut or resetting Layer A speaker identities / active SceneMemory face tracks.
+        if (jumpedSeek || shotChanged) {
             sceneMemory = prevScene.copy(
                 sceneEpoch = prevScene.sceneEpoch + 1,
                 activeShotId = activeShotId,

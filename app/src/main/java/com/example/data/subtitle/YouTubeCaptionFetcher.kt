@@ -1,7 +1,10 @@
 package com.example.data.subtitle
 
+import com.example.data.model.CaptionOriginKind
 import com.example.data.model.ChapterSource
 import com.example.data.model.DialogueType
+import com.example.data.model.ReferenceCaptionCue
+import com.example.data.model.ReferenceCaptionTrack
 import com.example.data.model.VideoChapter
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
@@ -19,7 +22,37 @@ data class YouTubeCaptionResult(
     val languageCode: String? = null,
     val cues: List<RawSubtitleCue> = emptyList(),
     val chapters: List<VideoChapter> = emptyList(),
-)
+    val trackId: String = "",
+    val originKind: CaptionOriginKind = CaptionOriginKind.UNKNOWN,
+    val isAutoTranslated: Boolean = false,
+    val translationSourceLang: String? = null,
+    val sourceRevision: Long = System.currentTimeMillis(),
+) {
+    fun toReferenceTrack(mediaId: String, provenanceLabel: String = "YouTube native captions"): ReferenceCaptionTrack? {
+        if (cues.isEmpty()) return null
+        val lang = languageCode?.trim().orEmpty()
+        return ReferenceCaptionTrack(
+            mediaId = mediaId,
+            trackId = trackId.ifBlank { "yt_${mediaId}_${lang.ifBlank { "und" }}_${originKind.name.lowercase()}" },
+            languageCode = lang,
+            translationSourceLang = translationSourceLang,
+            originKind = originKind,
+            isAutoTranslated = isAutoTranslated,
+            sourceRevision = sourceRevision,
+            fetchedAtEpochMs = sourceRevision,
+            provenanceLabel = provenanceLabel,
+            cues = cues.mapIndexed { idx, c ->
+                ReferenceCaptionCue(
+                    cueId = "ref_${mediaId}_${idx}_${c.startTimeMs}",
+                    startMs = c.startTimeMs,
+                    endMs = c.endTimeMs,
+                    text = c.text,
+                    languageCode = lang,
+                )
+            },
+        )
+    }
+}
 
 /**
  * Fetches publicly available Closed Caption / WebVTT / JSON3 accessibility tracks and basic
@@ -109,14 +142,20 @@ object YouTubeCaptionFetcher {
                     if (cues.isNotEmpty()) {
                         val finalDesc = bestDescription ?: meta.description
                         val finalDur = bestDurationMs ?: meta.durationMs
+                        val originKind = classifyOriginKind(track.kind, track.baseUrl)
+                        val tlang = Regex("[?&]tlang=([^&]+)").find(track.baseUrl)?.groupValues?.getOrNull(1)
                         return@withTimeoutOrNull YouTubeCaptionResult(
                             title = bestTitle ?: meta.title,
                             channelName = bestChannelName ?: meta.channelName,
                             description = finalDesc,
                             durationMs = finalDur,
-                            languageCode = track.languageCode,
+                            languageCode = tlang ?: track.languageCode,
                             cues = cues,
                             chapters = extractChaptersFromDescription(finalDesc, finalDur ?: 0L),
+                            trackId = "${cleanId}:${track.languageCode}:${track.kind.ifBlank { "authored" }}",
+                            originKind = originKind,
+                            isAutoTranslated = !tlang.isNullOrBlank(),
+                            translationSourceLang = if (!tlang.isNullOrBlank()) track.languageCode else null,
                         )
                     } else {
                         emptyDownloadAttempts++
@@ -132,6 +171,51 @@ object YouTubeCaptionFetcher {
             description = bestDescription,
             durationMs = bestDurationMs,
             chapters = extractChaptersFromDescription(bestDescription, bestDurationMs ?: 0L),
+        )
+    }
+
+    fun classifyOriginKind(kind: String?, url: String? = null): CaptionOriginKind {
+        val cleanKind = kind?.trim()?.lowercase().orEmpty()
+        val cleanUrl = url.orEmpty().lowercase()
+        return when {
+            cleanKind == "asr" || cleanUrl.contains("kind=asr") -> CaptionOriginKind.AUTOMATIC_ASR
+            cleanKind.isNotBlank() && cleanKind != "asr" -> CaptionOriginKind.AUTHORED
+            cleanUrl.contains("/api/timedtext") && !cleanUrl.contains("kind=asr") -> CaptionOriginKind.AUTHORED
+            else -> CaptionOriginKind.UNKNOWN
+        }
+    }
+
+    fun buildReferenceTrackFromObservedTimedText(
+        mediaId: String,
+        observedUrl: String,
+        cues: List<RawSubtitleCue>,
+        fetchedAtEpochMs: Long = System.currentTimeMillis(),
+    ): ReferenceCaptionTrack? {
+        if (cues.isEmpty()) return null
+        val lang = Regex("[?&]lang=([^&]+)").find(observedUrl)?.groupValues?.getOrNull(1).orEmpty()
+        val tlang = Regex("[?&]tlang=([^&]+)").find(observedUrl)?.groupValues?.getOrNull(1)
+        val kind = Regex("[?&]kind=([^&]+)").find(observedUrl)?.groupValues?.getOrNull(1)
+        val originKind = classifyOriginKind(kind, observedUrl)
+        val displayLang = tlang?.takeIf { it.isNotBlank() } ?: lang
+        return ReferenceCaptionTrack(
+            mediaId = mediaId,
+            trackId = "timedtext_${mediaId}_${displayLang.ifBlank { "und" }}_${originKind.name.lowercase()}",
+            languageCode = displayLang,
+            translationSourceLang = if (!tlang.isNullOrBlank()) lang.takeIf { it.isNotBlank() } else null,
+            originKind = originKind,
+            isAutoTranslated = !tlang.isNullOrBlank(),
+            sourceRevision = fetchedAtEpochMs,
+            fetchedAtEpochMs = fetchedAtEpochMs,
+            provenanceLabel = "YouTube player timedtext (${originKind.label})",
+            cues = cues.mapIndexed { idx, c ->
+                ReferenceCaptionCue(
+                    cueId = "ref_tt_${mediaId}_${idx}_${c.startTimeMs}",
+                    startMs = c.startTimeMs,
+                    endMs = c.endTimeMs,
+                    text = c.text,
+                    languageCode = displayLang,
+                )
+            },
         )
     }
 

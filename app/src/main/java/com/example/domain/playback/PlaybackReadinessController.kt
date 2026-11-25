@@ -84,6 +84,9 @@ data class PlaybackTimingDiagnostics(
     val watchNowBypassActive: Boolean = false,
     val waitTimedOut: Boolean = false,
     val statusDetail: String = "",
+    val contiguousReleasedLeadMs: Long = contiguousVerifiedLeadMs,
+    val measuredProcessingLatencyMs: Long = 0L,
+    val isUsingUnverifiedFallback: Boolean = false,
 )
 
 data class PlaybackReadinessSnapshot(
@@ -99,6 +102,8 @@ data class PlaybackReadinessSnapshot(
     val availableRecoveryActions: List<BufferingFailureAction> = emptyList(),
     val pendingAutoResume: AutoResumeDirective? = null,
     val diagnostics: PlaybackTimingDiagnostics = PlaybackTimingDiagnostics(),
+    val contiguousReleasedLeadMs: Long = contiguousVerifiedLeadMs,
+    val isUsingUnverifiedFallback: Boolean = false,
 ) {
     /**
      * True strictly when the user deliberately paused playback (NOT during buffering or seeks).
@@ -144,6 +149,8 @@ class PlaybackReadinessController(
     private var waitTimedOut: Boolean = false
     private var failureReason: String = ""
     private var lastContiguousLeadMs: Long = 0L
+    private var lastVerifiedLeadMs: Long = 0L
+    private var measuredLatencyEmaMs: Long = 0L
     private var requiresCoverageGate: Boolean = true
 
     fun resetForMedia(
@@ -169,12 +176,23 @@ class PlaybackReadinessController(
         this.waitTimedOut = false
         this.failureReason = ""
         this.lastContiguousLeadMs = 0L
+        this.lastVerifiedLeadMs = 0L
+        this.measuredLatencyEmaMs = 0L
         this.state = if (requiresCoverageGate) {
             PlaybackReadinessState.LOADING_MEDIA
         } else {
             PlaybackReadinessState.READY_PAUSED
         }
         return snapshot()
+    }
+
+    fun recordProcessingLatencyMs(latencyMs: Long) {
+        val clamped = latencyMs.coerceIn(200L, MAX_TRACKED_LATENCY_MS)
+        measuredLatencyEmaMs = if (measuredLatencyEmaMs <= 0L) {
+            clamped
+        } else {
+            ((measuredLatencyEmaMs * 0.65) + (clamped * 0.35)).roundToLong()
+        }
     }
 
     fun setPlaybackSpeed(speed: Float): PlaybackReadinessSnapshot {
@@ -209,8 +227,9 @@ class PlaybackReadinessController(
             return snapshot()
         }
 
-        val lead = ledger.continuousVerifiedLeadFrom(pos)
+        val lead = ledger.continuousReleasedLeadFrom(pos)
         lastContiguousLeadMs = lead
+        lastVerifiedLeadMs = ledger.continuousVerifiedLeadFrom(pos)
         val reqInitial = requiredInitialOrSeekLeadMs(pos)
         if (lead >= reqInitial || isAtOrPastVerifiedTail(pos, lead)) {
             activeWatchNowBypass = null
@@ -276,8 +295,9 @@ class PlaybackReadinessController(
             return snapshot()
         }
 
-        val lead = ledger.continuousVerifiedLeadFrom(clamped)
+        val lead = ledger.continuousReleasedLeadFrom(clamped)
         lastContiguousLeadMs = lead
+        lastVerifiedLeadMs = ledger.continuousVerifiedLeadFrom(clamped)
         val reqSeekLead = requiredInitialOrSeekLeadMs(clamped)
         if (lead >= reqSeekLead || isAtOrPastVerifiedTail(clamped, lead)) {
             state = PlaybackReadinessState.SEEKING
@@ -329,8 +349,9 @@ class PlaybackReadinessController(
             return snapshot()
         }
 
-        val lead = ledger.continuousVerifiedLeadFrom(currentPositionMs)
+        val lead = ledger.continuousReleasedLeadFrom(currentPositionMs)
         lastContiguousLeadMs = lead
+        lastVerifiedLeadMs = ledger.continuousVerifiedLeadFrom(currentPositionMs)
 
         // If user chose Watch Now and playback has now re-entered verified coverage, clear the temporary bypass
         val bypass = activeWatchNowBypass
@@ -392,8 +413,9 @@ class PlaybackReadinessController(
         } else {
             currentPositionMs
         }
-        val lead = ledger.continuousVerifiedLeadFrom(evalPos)
+        val lead = ledger.continuousReleasedLeadFrom(evalPos)
         lastContiguousLeadMs = lead
+        lastVerifiedLeadMs = ledger.continuousVerifiedLeadFrom(evalPos)
 
         if (isBufferingState(state)) {
             val required = requiredLeadForState(state, evalPos)
@@ -499,16 +521,16 @@ class PlaybackReadinessController(
     // -------------------------------------------------------------------------
 
     fun requiredInitialOrSeekLeadMs(positionMs: Long): Long =
-        capToRemaining(scaleBySpeed(BASE_START_AND_RESUME_LEAD_MS), positionMs)
+        capToRemaining(scaleBySpeedAndLatency(BASE_START_AND_RESUME_LEAD_MS), positionMs)
 
     fun midPlaybackBufferTriggerMs(positionMs: Long): Long =
         capToRemaining(scaleBySpeed(BASE_MID_PLAYBACK_TRIGGER_MS), positionMs)
 
     fun healthyLeadTargetMs(positionMs: Long): Long =
-        capToRemaining(scaleBySpeed(BASE_HEALTHY_LEAD_MS), positionMs)
+        capToRemaining(scaleBySpeedAndLatency(BASE_HEALTHY_LEAD_MS), positionMs)
 
     fun comfortableLeadTargetMs(positionMs: Long): Long =
-        capToRemaining(scaleBySpeed(BASE_COMFORTABLE_LEAD_MS), positionMs)
+        capToRemaining(scaleBySpeedAndLatency(BASE_COMFORTABLE_LEAD_MS), positionMs)
 
     private fun requiredLeadForState(s: PlaybackReadinessState, positionMs: Long): Long = when (s) {
         PlaybackReadinessState.BUFFERING_INITIAL_WINDOW,
@@ -519,6 +541,13 @@ class PlaybackReadinessController(
 
     private fun scaleBySpeed(baseMs: Long): Long =
         (baseMs.toDouble() * playbackSpeed.coerceIn(0.5f, 3.0f)).roundToLong()
+
+    private fun scaleBySpeedAndLatency(baseMs: Long): Long {
+        val speedScaled = scaleBySpeed(baseMs)
+        if (measuredLatencyEmaMs <= LATENCY_BASELINE_MS) return speedScaled
+        val extraLatency = ((measuredLatencyEmaMs - LATENCY_BASELINE_MS) * playbackSpeed.coerceIn(0.5f, 3.0f)).roundToLong()
+        return (speedScaled + extraLatency.coerceAtMost(MAX_LATENCY_LEAD_BONUS_MS))
+    }
 
     private fun capToRemaining(desiredMs: Long, positionMs: Long): Long {
         if (knownDurationMs <= 0L) {
@@ -582,6 +611,7 @@ class PlaybackReadinessController(
         } else {
             emptyList()
         }
+        val usingFallback = lastContiguousLeadMs > lastVerifiedLeadMs
         val diag = PlaybackTimingDiagnostics(
             readinessState = state,
             userIntent = userIntent,
@@ -589,7 +619,7 @@ class PlaybackReadinessController(
             currentPositionMs = currentPositionMs,
             targetPositionMs = targetPositionMs,
             knownDurationMs = knownDurationMs,
-            contiguousVerifiedLeadMs = lastContiguousLeadMs,
+            contiguousVerifiedLeadMs = lastVerifiedLeadMs,
             requiredInitialLeadMs = requiredInitialOrSeekLeadMs(evalPos),
             requiredSeekLeadMs = requiredInitialOrSeekLeadMs(evalPos),
             requiredResumeLeadMs = requiredInitialOrSeekLeadMs(evalPos),
@@ -605,12 +635,15 @@ class PlaybackReadinessController(
             watchNowBypassActive = activeWatchNowBypass != null,
             waitTimedOut = waitTimedOut,
             statusDetail = failureReason,
+            contiguousReleasedLeadMs = lastContiguousLeadMs,
+            measuredProcessingLatencyMs = measuredLatencyEmaMs,
+            isUsingUnverifiedFallback = usingFallback,
         )
         return PlaybackReadinessSnapshot(
             state = state,
             userIntent = userIntent,
             targetPositionMs = targetPositionMs,
-            contiguousVerifiedLeadMs = lastContiguousLeadMs,
+            contiguousVerifiedLeadMs = lastVerifiedLeadMs,
             requiredLeadMs = reqLead,
             isBufferingHoldActive = isBufferingState(state),
             isWatchNowBypassActive = activeWatchNowBypass != null,
@@ -619,6 +652,8 @@ class PlaybackReadinessController(
             availableRecoveryActions = actions,
             pendingAutoResume = pendingAutoResume,
             diagnostics = diag,
+            contiguousReleasedLeadMs = lastContiguousLeadMs,
+            isUsingUnverifiedFallback = usingFallback,
         )
     }
 
@@ -632,5 +667,8 @@ class PlaybackReadinessController(
         const val END_OF_MEDIA_TOLERANCE_MS = 1_200L
         const val SEEK_ACK_TOLERANCE_MS = 1_800L
         const val DEFAULT_WAIT_TIMEOUT_MS = 24_000L
+        const val LATENCY_BASELINE_MS = 3_500L
+        const val MAX_TRACKED_LATENCY_MS = 18_000L
+        const val MAX_LATENCY_LEAD_BONUS_MS = 8_000L
     }
 }

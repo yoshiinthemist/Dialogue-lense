@@ -21,6 +21,7 @@ enum class SentinelPriorityTier(val rank: Int, val label: String) {
 
 enum class SentinelTaskKind {
     PLAYBACK_LOOKAHEAD,
+    SCOUT2_REQUIRED_REVIEW,
     USER_HEAL_BEACON,
     CHAPTER_BOUNDARY_PATROL,
     CHANGEOVER_PRELISTEN,
@@ -430,6 +431,78 @@ class SentinelWorkforceCoordinator {
     private fun changeoverSeamKey(seamMs: Long): String = "prelisten_${seamMs / 5_000L}"
 
     /**
+     * Enqueues a mandatory Scout 2 independent review for a newly staged Scout 1 draft interval.
+     * Always scheduled at [SentinelPriorityTier.CRITICAL_PLAYBACK_RECOVERY] so required review
+     * remains eligible even when playback lead is short or buffering is active.
+     */
+    fun enqueueScout2Review(
+        intervalId: String,
+        startMs: Long,
+        endMs: Long,
+        playheadMs: Long,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): Boolean = synchronized(lock) {
+        val distanceAhead = if (endMs >= playheadMs) {
+            (startMs - playheadMs).coerceAtLeast(0L)
+        } else {
+            1_000_000_000L + (playheadMs - endMs)
+        }
+        val item = SentinelWorkItem(
+            id = "scout2_review_$intervalId",
+            tier = SentinelPriorityTier.CRITICAL_PLAYBACK_RECOVERY,
+            kind = SentinelTaskKind.SCOUT2_REQUIRED_REVIEW,
+            startMs = startMs,
+            endMs = endMs,
+            beaconId = intervalId,
+            chapterTitle = "Review ${startMs / 1000L}s–${endMs / 1000L}s",
+            createdAtEpochMs = distanceAhead.coerceAtLeast(0L),
+        )
+        enqueueLocked(item)
+    }
+
+    /**
+     * Claims the nearest unresolved [SentinelTaskKind.SCOUT2_REQUIRED_REVIEW] interval ahead of
+     * [playheadMs]. Deliberately bypasses [isPatrolSuspendedLocked] because Scout 2 review is a
+     * required stage in Prepare -> Review -> Release, never optional background patrol.
+     */
+    fun claimRequiredReviewWork(
+        workerId: String = WORKER_2_ID,
+        playheadMs: Long = 0L,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): Pair<SentinelWorkItem, IntervalReservation>? = synchronized(lock) {
+        val activeCount = workers.values.count { it.isActive }
+        val isWorkerAlreadyActive = workers[workerId]?.isActive == true
+        if (!isWorkerAlreadyActive && activeCount >= maxAllowedWorkersLocked()) {
+            return@synchronized null
+        }
+
+        val reviewCandidates = queue
+            .filter { it.kind == SentinelTaskKind.SCOUT2_REQUIRED_REVIEW }
+            .sortedWith(
+                compareBy<SentinelWorkItem> { item ->
+                    if (item.endMs >= playheadMs) 0 else 1
+                }.thenBy { item ->
+                    if (item.endMs >= playheadMs) (item.startMs - playheadMs).coerceAtLeast(0L) else (playheadMs - item.endMs)
+                }
+            )
+        for (item in reviewCandidates) {
+            val reservation = tryReserveInterval(workerId, item.startMs, item.endMs, item.tier, nowEpochMs)
+                ?: continue
+            queue.remove(item)
+            workers[workerId] = SentinelWorkerState(
+                workerId = workerId,
+                isActive = true,
+                currentTaskLabel = "Reviewing ${item.chapterTitle ?: "upcoming dialogue"}",
+                activeStartMs = item.startMs,
+                activeEndMs = item.endMs,
+                tier = item.tier,
+            )
+            return@synchronized item to reservation
+        }
+        null
+    }
+
+    /**
      * Explicit Studio user action: queue or re-queue a chapter boundary for immediate inspection.
      */
     fun requestManualChapterInspection(
@@ -541,6 +614,11 @@ class SentinelWorkforceCoordinator {
     }
 
     private fun maxAllowedWorkersLocked(): Int {
+        val hasRequiredReview = queue.any { it.kind == SentinelTaskKind.SCOUT2_REQUIRED_REVIEW }
+        if (hasRequiredReview && !isBatteryOrThermalConstrained) {
+            // Deterministic Scout 2 review is local & zero-cloud, so it stays active even in ZERO_CLOUD or quota-limited runs
+            return 2
+        }
         if (quotaMode == QuotaSaverMode.ZERO_CLOUD) return 1
         if (consecutiveQuotaErrors > 0 || isBatteryOrThermalConstrained) return 1
         val hasHighPriorityOrPreListenWork = queue.any {
@@ -559,7 +637,7 @@ class SentinelWorkforceCoordinator {
     /**
      * Dispatches the highest-priority eligible work item to [workerId] while respecting:
      * - 4-tier priority ordering
-     * - Patrol suspension during playback buffering / low lead
+     * - Patrol suspension during playback buffering / low lead (never suspends SCOUT2_REQUIRED_REVIEW)
      * - Shared interval reservations (never double-assigns overlapping windows)
      */
     fun claimNextWork(
@@ -576,7 +654,10 @@ class SentinelWorkforceCoordinator {
         val iterator = queue.iterator()
         while (iterator.hasNext()) {
             val item = iterator.next()
-            if (suspendPatrol && item.tier.rank >= SentinelPriorityTier.PREVENTIVE_MAINTENANCE.rank) {
+            if (suspendPatrol &&
+                item.kind != SentinelTaskKind.SCOUT2_REQUIRED_REVIEW &&
+                item.tier.rank >= SentinelPriorityTier.PREVENTIVE_MAINTENANCE.rank
+            ) {
                 continue
             }
             val reservation = tryReserveInterval(workerId, item.startMs, item.endMs, item.tier, nowEpochMs)
@@ -587,6 +668,7 @@ class SentinelWorkforceCoordinator {
                 isActive = true,
                 currentTaskLabel = when (item.kind) {
                     SentinelTaskKind.PLAYBACK_LOOKAHEAD -> "Preparing playback window"
+                    SentinelTaskKind.SCOUT2_REQUIRED_REVIEW -> "Reviewing ${item.chapterTitle ?: "upcoming dialogue"}"
                     SentinelTaskKind.USER_HEAL_BEACON -> "Healing marked moment"
                     SentinelTaskKind.CHAPTER_BOUNDARY_PATROL -> "Inspecting ${item.chapterTitle ?: "chapter"}"
                     SentinelTaskKind.CHANGEOVER_PRELISTEN -> "Pre-listening ${item.chapterTitle ?: "scene changeover"}"

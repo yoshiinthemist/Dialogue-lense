@@ -50,6 +50,14 @@ data class PlacedBalloon(
     val locationConfidence: Float = 0f,
 )
 
+data class CuePlacementStabilityReport(
+    val eventId: String,
+    val isWithinBounds: Boolean,
+    val hasSevereFaceCollision: Boolean,
+    val maxDriftNorm: Float,
+    val reason: String,
+)
+
 class BalloonLayoutEngine {
 
     val stabilityDiagnostics: VisualStabilityDiagnostics = VisualStabilityDiagnostics()
@@ -115,6 +123,93 @@ class BalloonLayoutEngine {
         cachedEventsRef = null
     }
 
+    /**
+     * Invalidates spatial layout caches when viewport size, orientation, font scale, or display
+     * mode changes, while preserving dialogue and speaker attribution caches untouched.
+     */
+    fun invalidateLayoutCacheForViewportOrStyleChange() {
+        smoothedPositions.clear()
+        smoothedTailTargets.clear()
+        committedBodies.clear()
+        lastTailWasLiveTracked.clear()
+    }
+
+    /**
+     * Deterministic multi-frame presentation check called by Scout 2 using the exact same
+     * layout engine logic that playback uses (without mutating live playback smoothing state).
+     */
+    fun evaluateCuePlacementStability(
+        project: DialogueLensProject,
+        event: DialogueEvent,
+        styleSettings: BalloonStyleSettings = project.styleSettings,
+        liveFaces: List<LiveFaceObservation> = emptyList(),
+        fixedZoneTaillessMode: Boolean = false,
+    ): CuePlacementStabilityReport {
+        val sandbox = BalloonLayoutEngine()
+        val dur = (event.endTimeMs - event.startTimeMs).coerceAtLeast(300L)
+        val sampleTimes = listOf(
+            event.startTimeMs + 50L,
+            event.startTimeMs + dur / 2L,
+            (event.endTimeMs - 50L).coerceAtLeast(event.startTimeMs + 50L),
+        ).distinct()
+        val placedSamples = sampleTimes.mapNotNull { t ->
+            sandbox.computeLayout(
+                project = project,
+                currentMs = t,
+                styleSettings = styleSettings,
+                liveFaces = liveFaces,
+                sceneEpoch = 1,
+                hasLiveVisionSignal = liveFaces.isNotEmpty(),
+                liveFrameObservedEmpty = false,
+                fixedZoneTaillessMode = fixedZoneTaillessMode,
+            ).firstOrNull { it.event.id == event.id }
+        }
+        if (placedSamples.isEmpty()) {
+            return CuePlacementStabilityReport(
+                eventId = event.id,
+                isWithinBounds = true,
+                hasSevereFaceCollision = false,
+                maxDriftNorm = 0f,
+                reason = "No active placement sample",
+            )
+        }
+        var withinBounds = true
+        var severeFaceCollision = false
+        var maxDrift = 0f
+        val firstCenter = placedSamples.first().rect.let { NormalizedPoint(it.centerX, it.centerY) }
+        for (sample in placedSamples) {
+            val r = sample.rect
+            if (r.left < -0.01f || r.right > 1.01f || r.top < -0.01f || r.bottom > 1.01f) {
+                withinBounds = false
+            }
+            val drift = hypot(
+                (r.centerX - firstCenter.x).toDouble(),
+                (r.centerY - firstCenter.y).toDouble(),
+            ).toFloat()
+            if (drift > maxDrift) maxDrift = drift
+            for (face in liveFaces) {
+                val faceArea = (face.boundingBox.width * face.boundingBox.height).coerceAtLeast(0.0001f)
+                val overlapFrac = face.boundingBox.intersectionArea(r) / faceArea
+                if (overlapFrac >= 0.25f) {
+                    severeFaceCollision = true
+                }
+            }
+        }
+        val reason = when {
+            !withinBounds -> "out-of-bounds rect"
+            severeFaceCollision -> "severe face obstruction"
+            maxDrift > 0.16f -> "excessive multi-frame drift"
+            else -> "stable"
+        }
+        return CuePlacementStabilityReport(
+            eventId = event.id,
+            isWithinBounds = withinBounds,
+            hasSevereFaceCollision = severeFaceCollision,
+            maxDriftNorm = maxDrift,
+            reason = reason,
+        )
+    }
+
     fun computeLayout(
         project: DialogueLensProject,
         currentMs: Long,
@@ -150,8 +245,10 @@ class BalloonLayoutEngine {
 
         val activeShot = project.shots.firstOrNull { currentMs in it.startMs..it.endMs }
         val shotId = activeShot?.id ?: activeEvents.first().shotId
-        val effectiveSceneKey = if (sceneEpoch > 0 || !activeChapterId.isNullOrBlank()) {
-            "$shotId#ep$sceneEpoch#${activeChapterId.orEmpty()}"
+        // A chapter boundary alone must NOT reset sceneEpoch or invalidate active visual tracking;
+        // only confirmed shot cuts / visual sceneEpoch increments change effectiveSceneKey.
+        val effectiveSceneKey = if (sceneEpoch > 0) {
+            "$shotId#ep$sceneEpoch"
         } else {
             shotId
         }
@@ -801,6 +898,13 @@ class BalloonLayoutEngine {
                     forceResponsiveTracking = false,
                 )
                 val finalRect = centeredRect(committedCenter.x, committedCenter.y, scoutEstWidth, scoutEstHeight)
+                if (liveConvertedSamples.isNotEmpty()) {
+                    committedBodies[event.id]?.let { state ->
+                        if (state.missingFaceStreak > 0) {
+                            committedBodies[event.id] = state.copy(missingFaceStreak = 0)
+                        }
+                    }
+                }
                 val rawMouthY = targetY.coerceIn(0.14f, 0.78f)
                 val rawTailCandidate = NormalizedPoint(targetX, rawMouthY)
                 val withinTailReach = HierarchicalContextEngine.isDistanceWithinRestrainedTailReach(
@@ -853,6 +957,49 @@ class BalloonLayoutEngine {
             }
 
             if (event.confidenceTier == ConfidenceTier.LOW || trackSample == null) {
+                // Brief single/double-frame face tracking dropout grace hold:
+                // Never teleport an already-committed active balloon to bottom-center on a transient
+                // ML Kit dropout within the same scene epoch; hold its stable body position (tailless
+                // if frame is empty) and only release to neutral fallback on sustained absence.
+                val heldBody = committedBodies[event.id]?.takeIf { it.sceneKey == effectiveSceneKey }
+                if (event.confidenceTier != ConfidenceTier.LOW &&
+                    heldBody != null &&
+                    heldBody.missingFaceStreak < 2
+                ) {
+                    val heldRect = centeredRect(heldBody.center.x, heldBody.center.y, estWidth, estHeight)
+                    val collidesNow = faceExclusionZones.any { heldRect.intersectionArea(it) > 0.002f } ||
+                        occupiedBalloonRects.any { heldRect.intersectionArea(it) > 0.002f }
+                    if (!collidesNow) {
+                        committedBodies[event.id] = heldBody.copy(
+                            missingFaceStreak = heldBody.missingFaceStreak + 1,
+                        )
+                        stabilityDiagnostics.recordTrackingDropout()
+                        occupiedBalloonRects.add(heldRect)
+                        val emphasis = resolveEmphasis(event)
+                        results.add(
+                            PlacedBalloon(
+                                event = event,
+                                speaker = speaker,
+                                rect = heldRect,
+                                tailTarget = null,
+                                tailDirection = TailDirection.NONE,
+                                placementMode = PlacementMode.AUTO,
+                                isOffScreenEdge = false,
+                                edgeSide = null,
+                                isAmbiguousFallback = false,
+                                emphasisScore = emphasis.first,
+                                isShouted = emphasis.second,
+                                sceneLuminance = shotLuminance,
+                                speakerLineOrdinal = lineOrdinal,
+                                isUnknownSpeaker = isUnknown,
+                                identityConfidence = if (isUnknown) 0.35f else event.speakerConfidence,
+                                locationConfidence = 0.55f,
+                            )
+                        )
+                        continue
+                    }
+                }
+
                 val neutralRect = placeNeutralFallbackRect(
                     w = estWidth,
                     h = estHeight,
@@ -1414,15 +1561,18 @@ class BalloonLayoutEngine {
             )
             return null
         }
+        // Intentionally tailless bubble on a non-empty frame (e.g., provisional speaker or out-of-reach tail):
+        // do not conflate intentional tailless rendering with a face-tracking dropout streak.
+        if (state.lastTailTarget == null) {
+            return null
+        }
         val nextStreak = state.missingFaceStreak + 1
-        if (state.lastTailTarget != null && nextStreak < LiveStageFaceTracker.CONFIRMED_EMPTY_FRAME_STREAK) {
+        if (nextStreak < LiveStageFaceTracker.CONFIRMED_EMPTY_FRAME_STREAK) {
             stabilityDiagnostics.recordTrackingDropout()
             committedBodies[eventId] = state.copy(missingFaceStreak = nextStreak)
             return state.lastTailTarget
         }
-        if (state.lastTailTarget != null) {
-            stabilityDiagnostics.recordTailToggle()
-        }
+        stabilityDiagnostics.recordTailToggle()
         committedBodies[eventId] = state.copy(
             missingFaceStreak = nextStreak,
             lastTailTarget = null,
@@ -1744,6 +1894,14 @@ class BalloonLayoutEngine {
         liveSamples: List<Pair<String, com.example.data.model.FaceSample>>,
     ): Pair<String, com.example.data.model.FaceSample>? {
         if (liveSamples.isEmpty()) return null
+        // Visible face alone never proves speaker identity: do not attach uncertain/neutral cues to a visible face.
+        if (!event.lockedByUser &&
+            (event.placementMode == PlacementMode.NEUTRAL_FALLBACK ||
+                event.speakerId.isNullOrBlank() ||
+                event.speakerConfidence < 0.55f)
+        ) {
+            return null
+        }
         val anchor = event.anchorPosition
         val refX = anchor?.x ?: speaker?.preferredScreenSideX ?: return null
         val refY = anchor?.y

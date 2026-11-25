@@ -83,6 +83,14 @@ data class CoverageSummary(
     val verifiedIntervalCount: Int = 0,
     val bufferedRanges: List<TimeWindowRange> = emptyList(),
     val failedRanges: List<TimeWindowRange> = emptyList(),
+    val continuousReleasedUpToMs: Long = continuousVerifiedUpToMs,
+    val releasedFraction: Float = verifiedFraction,
+    val captionGapMs: Long = 0L,
+    val unavailableEvidenceMs: Long = 0L,
+    val releasedFallbackMs: Long = 0L,
+    val captionGapCount: Int = 0,
+    val unavailableEvidenceCount: Int = 0,
+    val releasedFallbackCount: Int = 0,
 )
 
 /**
@@ -284,14 +292,13 @@ class TranscriptCoverageLedger(
             }
             val effectiveIncrementRetry = incrementRetry ||
                 (status == CoverageStatus.VERIFIED_DIALOGUE && dialogueCount <= 0)
-            val isVerified = effectiveStatus == CoverageStatus.VERIFIED_DIALOGUE ||
-                effectiveStatus == CoverageStatus.VERIFIED_SILENCE
-            val isSilence = effectiveStatus == CoverageStatus.VERIFIED_SILENCE
+            val isVerified = effectiveStatus.isVerified
+            val isSilence = effectiveStatus.isConfirmedSilence
             applyIntervalMutationLocked(s, e) { existing ->
-                if (!forceOverrideHigherAuthority &&
-                    existing.verified &&
-                    sourcePriority(existing.source) > sourcePriority(source)
-                ) {
+                val protectAuthoritative = !forceOverrideHigherAuthority &&
+                    sourcePriority(existing.source) > sourcePriority(source) &&
+                    (existing.verified || (existing.source == SubtitleSourceKind.UPLOADED_FILE && !isVerified))
+                if (protectAuthoritative) {
                     existing
                 } else {
                     val nextRetries = if (effectiveIncrementRetry) existing.retryAttempts + 1 else existing.retryAttempts
@@ -311,13 +318,22 @@ class TranscriptCoverageLedger(
     }
 
     /**
-     * Marks an authoritative subtitle track (`UPLOADED_FILE` or `EMBEDDED_TRACK`) across [0, durationMs)
-     * using real cue regions as `VERIFIED_DIALOGUE` and remaining track regions as `VERIFIED_SILENCE`.
+     * Marks an imported or embedded subtitle track (`UPLOADED_FILE` or `EMBEDDED_TRACK`) across
+     * `[0, durationMs)`.
+     *
+     * Epistemic rule:
+     * - Cue-covered spans are recorded as `VERIFIED_DIALOGUE` when [cuesIndependentlyVerified] is true
+     *   (or `RELEASED_FALLBACK` for unverified automatic captions).
+     * - Un-cued gaps between cues and the trailing region after the final cue are NEVER assumed to be
+     *   `VERIFIED_SILENCE`; they are recorded as `CAPTION_GAP` (`verified = false`,
+     *   `silenceConfirmed = false`) so playback stays ready via released-playability while the
+     *   epistemic ledger honestly distinguishes missing captions from confirmed silence.
      */
     fun markAuthoritativeTrack(
         durationMs: Long,
         events: List<DialogueEvent>,
         source: SubtitleSourceKind,
+        cuesIndependentlyVerified: Boolean = (source == SubtitleSourceKind.UPLOADED_FILE),
         nowEpochMs: Long = System.currentTimeMillis(),
     ) {
         require(source == SubtitleSourceKind.UPLOADED_FILE || source == SubtitleSourceKind.EMBEDDED_TRACK) {
@@ -330,10 +346,16 @@ class TranscriptCoverageLedger(
             .filter { it.endTimeMs > it.startTimeMs }
             .sortedBy { it.startTimeMs }
 
+        val cueStatus = if (cuesIndependentlyVerified) {
+            CoverageStatus.VERIFIED_DIALOGUE
+        } else {
+            CoverageStatus.RELEASED_FALLBACK
+        }
+
         var cursor = 0L
         var i = 0
         while (i < realSorted.size) {
-            var spanStart = realSorted[i].startTimeMs.coerceIn(0L, effectiveDur)
+            val spanStart = realSorted[i].startTimeMs.coerceIn(0L, effectiveDur)
             var spanEnd = realSorted[i].endTimeMs.coerceIn(spanStart, effectiveDur)
             var count = 1
             while (i + 1 < realSorted.size && realSorted[i + 1].startTimeMs <= spanEnd + 500L) {
@@ -346,10 +368,11 @@ class TranscriptCoverageLedger(
                     CoverageInterval(
                         startMs = cursor,
                         endMs = spanStart,
-                        status = CoverageStatus.VERIFIED_SILENCE,
+                        status = CoverageStatus.CAPTION_GAP,
                         source = source,
-                        verified = true,
-                        silenceConfirmed = true,
+                        verified = false,
+                        silenceConfirmed = false,
+                        lastFailureReason = "No cue in caption track (not confirmed silence)",
                         updatedAtEpochMs = nowEpochMs,
                     )
                 )
@@ -359,11 +382,12 @@ class TranscriptCoverageLedger(
                     CoverageInterval(
                         startMs = maxOf(cursor, spanStart),
                         endMs = spanEnd,
-                        status = CoverageStatus.VERIFIED_DIALOGUE,
+                        status = cueStatus,
                         source = source,
-                        verified = true,
+                        verified = cueStatus.isVerified,
                         dialogueCount = count,
                         silenceConfirmed = false,
+                        lastFailureReason = if (cueStatus.isVerified) "" else "Caption track cues (unverified against audio)",
                         updatedAtEpochMs = nowEpochMs,
                     )
                 )
@@ -376,10 +400,11 @@ class TranscriptCoverageLedger(
                 CoverageInterval(
                     startMs = cursor,
                     endMs = effectiveDur,
-                    status = CoverageStatus.VERIFIED_SILENCE,
+                    status = CoverageStatus.CAPTION_GAP,
                     source = source,
-                    verified = true,
-                    silenceConfirmed = true,
+                    verified = false,
+                    silenceConfirmed = false,
+                    lastFailureReason = "Post-final-cue track tail (not confirmed silence)",
                     updatedAtEpochMs = nowEpochMs,
                 )
             )
@@ -424,6 +449,42 @@ class TranscriptCoverageLedger(
             cursor = maxOf(cursor, iv.endMs)
         }
         cursor
+    }
+
+    fun releasedRanges(): List<TimeWindowRange> = synchronized(lock) {
+        val playable = intervals
+            .filter { it.status.isReleasedPlayable && it.endMs > it.startMs }
+            .map { TimeWindowRange(it.startMs, it.endMs) }
+        LookaheadWindowPlanner.coalesceBufferedRanges(playable, bridgeGapMs = 1L)
+    }
+
+    fun continuousReleasedUpToMs(): Long = synchronized(lock) {
+        var cursor = 0L
+        for (iv in intervals) {
+            if (iv.startMs > cursor) break
+            if (!iv.status.isReleasedPlayable) break
+            cursor = maxOf(cursor, iv.endMs)
+        }
+        cursor
+    }
+
+    /**
+     * Returns contiguous playable/released lead starting at [positionMs].
+     * Kept strictly separate from [continuousVerifiedLeadFrom]: a deliberately released fallback
+     * or caption-track gap may allow smooth playback without claiming `verified == true`.
+     */
+    fun continuousReleasedLeadFrom(positionMs: Long): Long = synchronized(lock) {
+        if (totalDurationMs <= 0L || intervals.isEmpty()) return@synchronized 0L
+        val start = positionMs.coerceIn(0L, totalDurationMs)
+        if (start >= totalDurationMs) return@synchronized 0L
+        var cursor = start
+        for (iv in intervals) {
+            if (iv.endMs <= cursor) continue
+            if (iv.startMs > cursor) break
+            if (!iv.status.isReleasedPlayable) break
+            cursor = maxOf(cursor, iv.endMs)
+        }
+        (cursor - start).coerceAtLeast(0L)
     }
 
     /**
@@ -490,9 +551,15 @@ class TranscriptCoverageLedger(
         var failedMs = 0L
         var pendingMs = 0L
         var legacyMs = 0L
+        var captionGapMs = 0L
+        var unavailableMs = 0L
+        var fallbackMs = 0L
         var failedCount = 0
         var unresolvedCount = 0
         var verifiedCount = 0
+        var captionGapCount = 0
+        var unavailableCount = 0
+        var fallbackCount = 0
 
         for (iv in intervals) {
             val dur = (iv.endMs - iv.startMs).coerceAtLeast(0L)
@@ -522,13 +589,40 @@ class TranscriptCoverageLedger(
                     legacyMs += dur
                     unresolvedCount++
                 }
+                CoverageStatus.CAPTION_GAP -> {
+                    captionGapMs += dur
+                    captionGapCount++
+                    unresolvedCount++
+                }
+                CoverageStatus.SUSPECTED_MISSING_DIALOGUE -> {
+                    failedMs += dur
+                    failedCount++
+                    unresolvedCount++
+                }
+                CoverageStatus.UNAVAILABLE_EVIDENCE -> {
+                    unavailableMs += dur
+                    unavailableCount++
+                    unresolvedCount++
+                }
+                CoverageStatus.RELEASED_FALLBACK -> {
+                    fallbackMs += dur
+                    fallbackCount++
+                    unresolvedCount++
+                }
             }
         }
 
         val totalVerified = verifiedDialogueMs + verifiedSilenceMs
+        val totalReleased = totalVerified + captionGapMs + unavailableMs + fallbackMs
         val contVerified = continuousVerifiedUpToMs()
+        val contReleased = continuousReleasedUpToMs()
         val frac = if (totalDurationMs > 0L) {
             (totalVerified.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+        val relFrac = if (totalDurationMs > 0L) {
+            (totalReleased.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
         } else {
             0f
         }
@@ -550,6 +644,14 @@ class TranscriptCoverageLedger(
             verifiedIntervalCount = verifiedCount,
             bufferedRanges = bufferedRanges(),
             failedRanges = failedRanges(),
+            continuousReleasedUpToMs = contReleased,
+            releasedFraction = relFrac,
+            captionGapMs = captionGapMs,
+            unavailableEvidenceMs = unavailableMs,
+            releasedFallbackMs = fallbackMs,
+            captionGapCount = captionGapCount,
+            unavailableEvidenceCount = unavailableCount,
+            releasedFallbackCount = fallbackCount,
         )
     }
 
@@ -600,6 +702,9 @@ class TranscriptCoverageLedger(
         val candidates = intervals.filter { iv ->
             !iv.verified &&
                 iv.status != CoverageStatus.IN_PROGRESS &&
+                iv.status != CoverageStatus.UNAVAILABLE_EVIDENCE &&
+                iv.status != CoverageStatus.RELEASED_FALLBACK &&
+                !(iv.status == CoverageStatus.CAPTION_GAP && iv.source == SubtitleSourceKind.UPLOADED_FILE) &&
                 iv.endMs > iv.startMs &&
                 (iv.status != CoverageStatus.FAILED || iv.retryAttempts < maxRetryAttempts)
         }
@@ -629,17 +734,15 @@ class TranscriptCoverageLedger(
         } else {
             chosen.startMs
         }
-        val sliceEnd = if (chosen.status == CoverageStatus.FAILED || chosen.status == CoverageStatus.PARTIAL_RECOVERY) {
-            minOf(chosen.endMs, sliceStart + maxChunkMs)
-        } else {
-            minOf(chosen.endMs, sliceStart + maxChunkMs)
-        }
+        val sliceEnd = minOf(chosen.endMs, sliceStart + maxChunkMs)
         chosen.copy(startMs = sliceStart, endMs = sliceEnd.coerceAtLeast(sliceStart))
     }
 
     private fun retryWeight(iv: CoverageInterval): Int = when (iv.status) {
         CoverageStatus.PENDING -> 0
+        CoverageStatus.SUSPECTED_MISSING_DIALOGUE -> 1
         CoverageStatus.LEGACY_UNVERIFIED -> 1
+        CoverageStatus.CAPTION_GAP -> 2
         CoverageStatus.PARTIAL_RECOVERY -> 2
         CoverageStatus.FAILED -> 3 + iv.retryAttempts
         else -> 10
@@ -843,7 +946,12 @@ class TranscriptCoverageLedger(
             ) {
                 val ledger = TranscriptCoverageLedger()
                 if (realEvents.isNotEmpty()) {
-                    ledger.markAuthoritativeTrack(effectiveDur, realEvents, cached.subtitleSource, cached.cachedAtEpochMs)
+                    ledger.markAuthoritativeTrack(
+                        durationMs = effectiveDur,
+                        events = realEvents,
+                        source = cached.subtitleSource,
+                        nowEpochMs = cached.cachedAtEpochMs,
+                    )
                 } else {
                     ledger.reset(
                         effectiveDur,

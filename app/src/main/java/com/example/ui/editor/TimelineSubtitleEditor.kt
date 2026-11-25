@@ -98,6 +98,8 @@ import com.example.domain.analysis.TranscriptDiagnostics
 import com.example.domain.layout.VisualStabilityDiagnosticsSnapshot
 import com.example.domain.media.MediaCapabilities
 import com.example.domain.media.MediaSourceAdapterRegistry
+import com.example.domain.pipeline.ReleasedPlaybackSnapshot
+import com.example.domain.pipeline.YouTubeCapabilityReport
 import com.example.domain.playback.PlaybackReadinessSnapshot
 import com.example.domain.sentinel.ChapterInspectionStatus
 import com.example.domain.sentinel.SentinelInspectorSnapshot
@@ -175,6 +177,8 @@ fun TimelineSubtitleEditor(
     visualStabilitySnapshot: VisualStabilityDiagnosticsSnapshot = VisualStabilityDiagnosticsSnapshot(),
     readinessSnapshot: PlaybackReadinessSnapshot = PlaybackReadinessSnapshot(),
     sentinelSnapshot: SentinelInspectorSnapshot = SentinelInspectorSnapshot(),
+    releaseSnapshot: ReleasedPlaybackSnapshot = ReleasedPlaybackSnapshot(),
+    youtubeCapabilities: YouTubeCapabilityReport = YouTubeCapabilityReport(),
     quotaSaverMode: QuotaSaverMode = QuotaSaverMode.PRO_ACCURACY,
     onSelectQuotaMode: (QuotaSaverMode) -> Unit = {},
     onRetryAiTranscription: () -> Unit = {},
@@ -570,6 +574,8 @@ fun TimelineSubtitleEditor(
                     visualStabilitySnapshot = visualStabilitySnapshot,
                     readinessSnapshot = readinessSnapshot,
                     sentinelSnapshot = sentinelSnapshot,
+                    releaseSnapshot = releaseSnapshot,
+                    youtubeCapabilities = youtubeCapabilities,
                     quotaSaverMode = quotaSaverMode,
                     onSelectQuotaMode = onSelectQuotaMode,
                     onRetryAi = onRetryAiTranscription,
@@ -1741,6 +1747,8 @@ private fun StudioDiagnosticsTab(
     visualStabilitySnapshot: VisualStabilityDiagnosticsSnapshot = VisualStabilityDiagnosticsSnapshot(),
     readinessSnapshot: PlaybackReadinessSnapshot = PlaybackReadinessSnapshot(),
     sentinelSnapshot: SentinelInspectorSnapshot = SentinelInspectorSnapshot(),
+    releaseSnapshot: ReleasedPlaybackSnapshot = ReleasedPlaybackSnapshot(),
+    youtubeCapabilities: YouTubeCapabilityReport = YouTubeCapabilityReport(),
     quotaSaverMode: QuotaSaverMode,
     onSelectQuotaMode: (QuotaSaverMode) -> Unit,
     onRetryAi: () -> Unit,
@@ -1754,7 +1762,50 @@ private fun StudioDiagnosticsTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
         modifier = modifier.testTag("studio_diagnostics_list"),
     ) {
-        // 1. Visual Stability Diagnostics (DialogueLens 2.0)
+        // 0. Two-Scout Release Gate & Reference Provenance (Prepare -> Review -> Release)
+        item(key = "two_scout_release_gate_card") {
+            Surface(
+                color = CinemaSurface,
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, LensMint.copy(alpha = 0.40f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("two_scout_release_diagnostics_card"),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = "Two-Scout Release Gate",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = "Rev #${releaseSnapshot.releaseRevision} · ${releaseSnapshot.releasedIntervals.size} released · ${releaseSnapshot.repairedIntervalCount} repaired · ${releaseSnapshot.fallbackReleaseCount} fallback",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LensMint,
+                    )
+                    DiagnosticMetricRow("Pending drafts", "${releaseSnapshot.pendingDraftCount}")
+                    DiagnosticMetricRow("Released intervals", "${releaseSnapshot.releasedIntervals.size} (${releaseSnapshot.repairedIntervalCount} repaired)")
+                    DiagnosticMetricRow("Fallback releases", "${releaseSnapshot.fallbackReleaseCount}")
+                    DiagnosticMetricRow("Stale writes rejected", "${releaseSnapshot.staleCallbacksRejected}")
+                    DiagnosticMetricRow("Visible repairs", "${releaseSnapshot.visibleCorrectionCount}")
+                    DiagnosticMetricRow(
+                        "Reference track",
+                        releaseSnapshot.referenceTrackSummary,
+                    )
+                    if (project.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT) {
+                        DiagnosticMetricRow(
+                            "YouTube limits",
+                            "IFrame player only · raw audio: ${if (youtubeCapabilities.hasRawAudioAccess) "Yes" else "No"} · future frames: ${if (youtubeCapabilities.hasFutureFrameAccess) "Yes" else "No"} · captions: ${youtubeCapabilities.captionProvenance}",
+                        )
+                    }
+                }
+            }
+        }
+
+        // 1. Visual Stability Diagnostics (Engine + Actual Rendered Frames)
         item(key = "visual_stability_diag_card") {
             Surface(
                 color = CinemaSurface,
@@ -1786,13 +1837,15 @@ private fun StudioDiagnosticsTab(
                         }
                     }
                     Text(
-                        text = "${visualStabilitySnapshot.totalRelocations} relocations · ${visualStabilitySnapshot.suppressedAbaOscillations} bounces blocked · ${visualStabilitySnapshot.tailVisibilityToggles} tail flips",
+                        text = "${visualStabilitySnapshot.totalRelocations} relocations · ${visualStabilitySnapshot.suppressedAbaOscillations} bounces blocked · ${visualStabilitySnapshot.renderedOscillations} rendered bounces",
                         style = MaterialTheme.typography.bodySmall,
                         color = SoftJade,
                     )
                     DiagnosticMetricRow("Layout evaluations", "${visualStabilitySnapshot.layoutEvaluations}")
                     DiagnosticMetricRow("Committed relocations", "${visualStabilitySnapshot.totalRelocations}")
                     DiagnosticMetricRow("A-B-A bounces blocked", "${visualStabilitySnapshot.suppressedAbaOscillations}")
+                    DiagnosticMetricRow("Rendered frames", "${visualStabilitySnapshot.renderedFrameSamples} (${visualStabilitySnapshot.renderedLargeJumps} jumps · ${visualStabilitySnapshot.renderedOscillations} bounces)")
+                    DiagnosticMetricRow("Entry anim replays", "${visualStabilitySnapshot.entryAnimationReplays}")
                     DiagnosticMetricRow("Tail state toggles", "${visualStabilitySnapshot.tailVisibilityToggles}")
                     DiagnosticMetricRow("Tracking dropouts", "${visualStabilitySnapshot.trackingDropouts}")
                     DiagnosticMetricRow("Scene epochs", "${visualStabilitySnapshot.sceneEpochChanges}")
@@ -1827,8 +1880,12 @@ private fun StudioDiagnosticsTab(
                     )
                     DiagnosticMetricRow("Playback speed", "${diag.playbackSpeed}x")
                     DiagnosticMetricRow(
-                        "Verified lead",
-                        "${readinessSnapshot.contiguousVerifiedLeadMs / 1000L}s (target ${readinessSnapshot.requiredLeadMs / 1000L}s / healthy ${diag.healthyLeadTargetMs / 1000L}s)",
+                        "Released / Verified lead",
+                        "${readinessSnapshot.contiguousReleasedLeadMs / 1000L}s released · ${readinessSnapshot.contiguousVerifiedLeadMs / 1000L}s verified (target ${readinessSnapshot.requiredLeadMs / 1000L}s)",
+                    )
+                    DiagnosticMetricRow(
+                        "Measured latency",
+                        "${diag.measuredProcessingLatencyMs}ms",
                     )
                     DiagnosticMetricRow(
                         "Seek gen / ack",
@@ -1836,6 +1893,9 @@ private fun StudioDiagnosticsTab(
                     )
                     DiagnosticMetricRow("Buffering episodes", "${diag.bufferingEpisodeCount}")
                     DiagnosticMetricRow("Auto-resumes", "${diag.autoResumeCount}")
+                    if (readinessSnapshot.isUsingUnverifiedFallback) {
+                        DiagnosticMetricRow("Fallback status", "Using unverified fallback ahead")
+                    }
                     if (readinessSnapshot.isWatchNowBypassActive) {
                         DiagnosticMetricRow("Watch Now bypass", "Active for current segment")
                     }

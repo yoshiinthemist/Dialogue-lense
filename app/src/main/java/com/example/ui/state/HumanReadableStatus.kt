@@ -5,6 +5,7 @@ import com.example.data.model.HealBeaconStatus
 import com.example.data.model.SubtitleSourceKind
 import com.example.data.model.VideoSourceKind
 import com.example.domain.analysis.CoverageSummary
+import com.example.domain.pipeline.ReleasedPlaybackSnapshot
 import com.example.domain.playback.PlaybackReadinessSnapshot
 import com.example.domain.playback.PlaybackReadinessState
 
@@ -25,7 +26,7 @@ data class HumanReadableReadiness(
 
 /**
  * Translates structured playback readiness, coverage ledger state, and Heal Beacon activity into
- * calm, plain-language viewer states for the Watch and Library interfaces (Section 52).
+ * calm, plain-language viewer states for the Watch and Library interfaces.
  * Technical diagnostics remain accessible exclusively inside Studio -> Diagnostics.
  */
 object HumanReadableStatus {
@@ -36,6 +37,7 @@ object HumanReadableStatus {
         coverageSummary: CoverageSummary?,
         isOfflineReady: Boolean = false,
         readinessSnapshot: PlaybackReadinessSnapshot? = null,
+        releaseSnapshot: ReleasedPlaybackSnapshot? = null,
     ): HumanReadableReadiness {
         if (project == null) {
             return HumanReadableReadiness(
@@ -52,14 +54,14 @@ object HumanReadableStatus {
                 PlaybackReadinessState.BUFFERING_FOR_SEEK,
                 PlaybackReadinessState.BUFFERING_MID_PLAYBACK -> {
                     val label = if (readinessSnapshot.state == PlaybackReadinessState.BUFFERING_FOR_SEEK) {
-                        "Preparing this section"
+                        "Preparing captions"
                     } else {
-                        "Preparing dialogue"
+                        "Preparing captions"
                     }
                     val detail = if (readinessSnapshot.willAutoResumeWhenReady) {
-                        "Playback will resume automatically once dialogue is ready."
+                        "Playback will resume automatically once captions are ready."
                     } else {
-                        "Preparing verified dialogue for this section."
+                        "Preparing upcoming dialogue for this section."
                     }
                     return HumanReadableReadiness(
                         label = label,
@@ -70,8 +72,8 @@ object HumanReadableStatus {
                 }
                 PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE -> {
                     return HumanReadableReadiness(
-                        label = "Some dialogue is unavailable",
-                        detail = "Playing while dialogue continues preparing for this section.",
+                        label = "Using fallback captions here",
+                        detail = "Playing while upcoming dialogue continues preparing.",
                         tone = ReadinessTone.WARNING,
                         isInProgress = true,
                     )
@@ -123,14 +125,14 @@ object HumanReadableStatus {
             val hasDialogue = project.dialogueEvents.isNotEmpty()
             return if (hasDialogue) {
                 HumanReadableReadiness(
-                    label = "Analyzing ahead",
-                    detail = "Upcoming dialogue is preparing smoothly as you watch.",
+                    label = "Checking upcoming dialogue",
+                    detail = "Upcoming lines are being checked smoothly as you watch.",
                     tone = ReadinessTone.ACTIVE,
                     isInProgress = true,
                 )
             } else {
                 HumanReadableReadiness(
-                    label = "Preparing dialogue",
+                    label = "Preparing captions",
                     detail = "Listening and matching speakers for this video.",
                     tone = ReadinessTone.ACTIVE,
                     isInProgress = true,
@@ -143,7 +145,17 @@ object HumanReadableStatus {
         if (hasFailedSegments) {
             return HumanReadableReadiness(
                 label = "Some dialogue is unavailable",
-                detail = "A section could not be analyzed yet. You can retry or mark moments in Studio.",
+                detail = "A section could not be prepared yet. You can retry or attach captions in Studio.",
+                tone = ReadinessTone.WARNING,
+            )
+        }
+
+        if (readinessSnapshot?.isUsingUnverifiedFallback == true &&
+            (releaseSnapshot?.fallbackReleaseCount ?: 0) > 0
+        ) {
+            return HumanReadableReadiness(
+                label = "Using fallback captions here",
+                detail = "Showing preliminary captions while checking upcoming dialogue.",
                 tone = ReadinessTone.WARNING,
             )
         }
@@ -152,8 +164,8 @@ object HumanReadableStatus {
             coverageSummary.verifiedSilenceMs > 0L && coverageSummary.unresolvedGapCount == 0
         ) {
             return HumanReadableReadiness(
-                label = "Ready to watch",
-                detail = "No spoken dialogue detected in the analyzed portion.",
+                label = "Ready",
+                detail = "No spoken dialogue detected in the checked portion.",
                 tone = ReadinessTone.READY,
             )
         }
@@ -166,15 +178,15 @@ object HumanReadableStatus {
 
         if (!isComplete && project.dialogueEvents.isNotEmpty()) {
             return HumanReadableReadiness(
-                label = "Analyzing ahead",
-                detail = "Dialogue is ready here and continues preparing as you watch.",
+                label = "Checking upcoming dialogue",
+                detail = "Captions are ready here and continue preparing ahead.",
                 tone = ReadinessTone.ACTIVE,
             )
         }
 
         if (project.dialogueEvents.isEmpty()) {
             return HumanReadableReadiness(
-                label = "Preparing dialogue",
+                label = "Preparing captions",
                 detail = "Start playback or open Studio to import captions.",
                 tone = ReadinessTone.ACTIVE,
             )
@@ -187,13 +199,13 @@ object HumanReadableStatus {
         return if (offlineCapable) {
             HumanReadableReadiness(
                 label = "Ready offline",
-                detail = "Dialogue is saved with this video.",
+                detail = "Captions are saved with this video.",
                 tone = ReadinessTone.OFFLINE,
             )
         } else {
             HumanReadableReadiness(
-                label = "Ready to watch",
-                detail = "Dialogue and speakers are synced.",
+                label = "Ready",
+                detail = "Captions and speakers are synced.",
                 tone = ReadinessTone.READY,
             )
         }

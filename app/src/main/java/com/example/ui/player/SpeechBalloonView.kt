@@ -137,9 +137,12 @@ fun SpeechBalloonView(
     onClick: () -> Unit,
     onDragCommit: (NormalizedPoint) -> Unit,
     forceTaillessFixedZone: Boolean = false,
+    onRenderedFrameReported: ((cueKey: String, leftPx: Float, topPx: Float, widthPx: Float, heightPx: Float) -> Unit)? = null,
+    onEntryAnimationStarted: ((cueKey: String) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val event = placed.event
+    val stableKey = event.stableCueKey.ifBlank { event.id }
     val isUnknownAtRoot = placed.isUnknownSpeaker || isBubbleSpeakerUnknown(event, placed.speaker)
     val isNonSpeakerAtRoot = isBubbleNonSpeakerSpecific(event, style)
     val rawSpeakerAccent = when {
@@ -166,12 +169,21 @@ fun SpeechBalloonView(
         event.dialogueType == DialogueType.SOUND_DESCRIPTION ||
         event.dialogueType == DialogueType.INTERNAL_MONOLOGUE
 
-    var measuredSize by remember(event.id) { mutableStateOf(IntSize.Zero) }
+    var measuredSize by remember(stableKey) { mutableStateOf(IntSize.Zero) }
+    var lastReportedNormSize by remember(stableKey) { mutableStateOf<Pair<Float, Float>?>(null) }
 
-    // Wait until first pixel measurement finishes before fading in so balloons never hop on Frame 1 -> Frame 2
-    val enterAlpha = remember(event.id) { Animatable(if (style.reducedMotion) 1f else 0f) }
-    LaunchedEffect(event.id, measuredSize != IntSize.Zero, style.reducedMotion) {
-        if (measuredSize == IntSize.Zero && !style.reducedMotion) return@LaunchedEffect
+    // Wait until first pixel measurement finishes before revealing so bubbles never hop Frame 1 -> Frame 2.
+    // Keyed strictly on persistent stableKey so rolling caption updates & controlled repairs never replay entry!
+    val enterAlpha = remember(stableKey) { Animatable(0f) }
+    var entryCompleted by remember(stableKey) { mutableStateOf(false) }
+    LaunchedEffect(stableKey, measuredSize != IntSize.Zero, style.reducedMotion) {
+        if (measuredSize == IntSize.Zero) return@LaunchedEffect
+        if (entryCompleted) {
+            if (enterAlpha.value < 1f) enterAlpha.snapTo(1f)
+            return@LaunchedEffect
+        }
+        entryCompleted = true
+        onEntryAnimationStarted?.invoke(stableKey)
         if (style.reducedMotion) {
             enterAlpha.snapTo(1f)
         } else {
@@ -179,8 +191,8 @@ fun SpeechBalloonView(
         }
     }
 
-    var dragOffsetXPx by remember(event.id, placed.rect.centerX) { mutableFloatStateOf(0f) }
-    var dragOffsetYPx by remember(event.id, placed.rect.centerY) { mutableFloatStateOf(0f) }
+    var dragOffsetXPx by remember(stableKey, placed.rect.centerX) { mutableFloatStateOf(0f) }
+    var dragOffsetYPx by remember(stableKey, placed.rect.centerY) { mutableFloatStateOf(0f) }
 
     val density = LocalDensity.current.density
     val stageWidthDp = (containerWidthPx / density).coerceAtLeast(180f)
@@ -214,40 +226,15 @@ fun SpeechBalloonView(
     val desiredCenterX = placed.rect.centerX * containerWidthPx + dragOffsetXPx
     val desiredCenterY = placed.rect.centerY * containerHeightPx + dragOffsetYPx
 
-    val baseLeftPx = (desiredCenterX - actualW * 0.5f).coerceIn(safeMarginX, maxLeftPx)
-    val baseTopPx = (desiredCenterY - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
-
-    // DialogueLens 2.0 Single-Authority Positioning: trust BalloonLayoutEngine's committed rect;
-    // only run emergency pixel escape if an actual severe face or sibling overlap occurs (and skip in Fixed Zones mode).
-    val (bubbleLeftPx, bubbleTopPx) = if (
-        !forceTaillessFixedZone &&
-        measuredSize != IntSize.Zero &&
-        (faceExclusionRects.isNotEmpty() || occupiedBubbleRects.isNotEmpty()) &&
-        event.placementMode != PlacementMode.MANUAL_OVERRIDE
-    ) {
-        resolveFaceSafePixelPosition(
-            baseLeftPx = baseLeftPx,
-            baseTopPx = baseTopPx,
-            actualW = actualW,
-            actualH = actualH,
-            safeMarginX = safeMarginX,
-            safeMarginY = safeMarginY,
-            maxLeftPx = maxLeftPx,
-            maxTopPx = maxTopPx,
-            containerWidthPx = containerWidthPx,
-            containerHeightPx = containerHeightPx,
-            faceExclusionRects = faceExclusionRects,
-            occupiedBubbleRects = occupiedBubbleRects,
-            density = density,
-            allowBelowFace = !style.lipReadingSafeZone || (event.faceTrackId == null && event.anchorPosition != null),
-        )
-    } else {
-        baseLeftPx to baseTopPx
-    }
+    // Single-Authority Positioning: BalloonLayoutEngine is the sole owner of placement & hysteresis.
+    // SpeechBalloonView strictly clamps the committed rect inside safe viewport bounds without
+    // running a competing ad-hoc repositioner that could fight BalloonLayoutEngine and cause flicker.
+    val bubbleLeftPx = (desiredCenterX - actualW * 0.5f).coerceIn(safeMarginX, maxLeftPx)
+    val bubbleTopPx = (desiredCenterY - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
 
     // Smooth critically-damped body motion: snaps cleanly on first measured frame, then glides
     // with zero overshoot or tweaking on subsequent gentle-drift updates.
-    var hasInitializedBodyOffset by remember(event.id) { mutableStateOf(false) }
+    var hasInitializedBodyOffset by remember(stableKey) { mutableStateOf(false) }
     val isDraggingNow = dragOffsetXPx != 0f || dragOffsetYPx != 0f
     val targetBodyOffset = Offset(bubbleLeftPx, bubbleTopPx)
     val animatedBodyOffset by animateOffsetAsState(
@@ -267,7 +254,7 @@ fun SpeechBalloonView(
         },
         label = "balloon_body_gentle_drift",
     )
-    LaunchedEffect(event.id, measuredSize != IntSize.Zero) {
+    LaunchedEffect(stableKey, measuredSize != IntSize.Zero) {
         if (measuredSize != IntSize.Zero) {
             hasInitializedBodyOffset = true
         }
@@ -278,28 +265,33 @@ fun SpeechBalloonView(
     val actualCenterX = renderedLeftPx + actualW * 0.5f
     val actualCenterY = renderedTopPx + actualH * 0.5f
 
-    // Report pixel bounds for sibling avoidance without re-triggering normalized size feedback
-    LaunchedEffect(event.id, measuredSize, bubbleLeftPx, bubbleTopPx) {
+    // Report ACTUAL rendered pixel bounds for sibling awareness, LiveStageFaceTracker overlay masking,
+    // and real rendered-position VisualStabilityDiagnostics telemetry.
+    LaunchedEffect(stableKey, measuredSize, renderedLeftPx, renderedTopPx) {
         if (measuredSize != IntSize.Zero) {
             onPixelBoundsResolved(
                 Rect(
-                    left = bubbleLeftPx,
-                    top = bubbleTopPx,
-                    right = bubbleLeftPx + actualW,
-                    bottom = bubbleTopPx + actualH,
+                    left = renderedLeftPx,
+                    top = renderedTopPx,
+                    right = renderedLeftPx + actualW,
+                    bottom = renderedTopPx + actualH,
                 )
             )
+            onRenderedFrameReported?.invoke(stableKey, renderedLeftPx, renderedTopPx, actualW, actualH)
         }
     }
 
-    // Report normalized dimensions ONLY when actual measured pixel size or container size changes
-    // (breaks the position <-> resize oscillation feedback loop).
-    LaunchedEffect(event.id, measuredSize, containerWidthPx, containerHeightPx) {
+    // Report normalized dimensions ONLY when actual measured pixel size shifts beyond deadband
+    // (breaks measurement <-> movement feedback loops).
+    LaunchedEffect(stableKey, measuredSize, containerWidthPx, containerHeightPx) {
         if (measuredSize != IntSize.Zero && containerWidthPx > 0f && containerHeightPx > 0f) {
-            onMeasuredNormalizedSize(
-                (actualW / containerWidthPx).coerceIn(0.06f, 0.88f),
-                (actualH / containerHeightPx).coerceIn(0.04f, 0.48f),
-            )
+            val normW = (actualW / containerWidthPx).coerceIn(0.06f, 0.88f)
+            val normH = (actualH / containerHeightPx).coerceIn(0.04f, 0.48f)
+            val prev = lastReportedNormSize
+            if (prev == null || abs(prev.first - normW) >= 0.025f || abs(prev.second - normH) >= 0.025f) {
+                lastReportedNormSize = normW to normH
+                onMeasuredNormalizedSize(normW, normH)
+            }
         }
     }
 

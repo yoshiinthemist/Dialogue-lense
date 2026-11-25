@@ -210,6 +210,9 @@ fun VideoPlayerStage(
     onLiveFrameSnapshot: ((Long, LiveStageFrameSnapshot) -> Unit)? = null,
     seekGeneration: Long = 0L,
     onMeasuredBubbleSize: (String, Float, Float) -> Unit = { _, _, _ -> },
+    onRenderedBalloonFrame: (cueKey: String, leftPx: Float, topPx: Float, widthPx: Float, heightPx: Float, containerW: Float, containerH: Float) -> Unit = { _, _, _, _, _, _, _ -> },
+    onBalloonEntryStarted: (cueKey: String) -> Unit = {},
+    onViewportOrFontScaleChanged: (widthPx: Int, heightPx: Int, fontScale: Float) -> Unit = { _, _, _ -> },
     readinessSnapshot: PlaybackReadinessSnapshot? = null,
     onRetryBuffering: () -> Unit = onRetryYouTubeAiTranscript,
     onDismissQuickPicker: () -> Unit = {},
@@ -273,8 +276,13 @@ fun VideoPlayerStage(
         val latestOnLiveFaces by rememberUpdatedState(onLiveFacesDetected)
         val latestOnLiveSnapshot by rememberUpdatedState(onLiveFrameSnapshot)
         val latestSeekGeneration by rememberUpdatedState(seekGeneration)
+        val renderedOverlayNormRects = remember { mutableStateMapOf<String, NormalizedRect>() }
         val latestActiveBalloonRects by rememberUpdatedState(
-            placedBalloons.map { it.rect.expand(0.02f, 0.02f) }
+            if (renderedOverlayNormRects.isNotEmpty()) {
+                renderedOverlayNormRects.values.map { it.expand(0.02f, 0.02f) }
+            } else {
+                placedBalloons.map { it.rect.expand(0.02f, 0.02f) }
+            }
         )
 
         LaunchedEffect(project.id) {
@@ -358,6 +366,19 @@ fun VideoPlayerStage(
         ) {
             val widthPx = with(density) { maxWidth.toPx() }
             val heightPx = with(density) { maxHeight.toPx() }
+            val fontScale = density.fontScale
+            var hasSeenInitialViewport by remember { mutableStateOf(false) }
+            LaunchedEffect(widthPx.roundToInt(), heightPx.roundToInt(), fontScale) {
+                val w = widthPx.roundToInt()
+                val h = heightPx.roundToInt()
+                if (w >= 48 && h >= 48) {
+                    if (hasSeenInitialViewport) {
+                        onViewportOrFontScaleChanged(w, h, fontScale)
+                    } else {
+                        hasSeenInitialViewport = true
+                    }
+                }
+            }
 
             // 1. Video Layer (Media3 ExoPlayer for MP4, official embedded YouTube IFrame, or Demo Film Stage)
             when (project.videoSource.kind) {
@@ -857,9 +878,15 @@ fun VideoPlayerStage(
             }
             LaunchedEffect(activeNonSfxIds, activeSfxIds) {
                 val staleBubbles = measuredBubbleBounds.keys.filter { it !in activeNonSfxIds }
-                staleBubbles.forEach { measuredBubbleBounds.remove(it) }
+                staleBubbles.forEach {
+                    measuredBubbleBounds.remove(it)
+                    renderedOverlayNormRects.remove(it)
+                }
                 val staleSfx = measuredSfxBounds.keys.filter { it !in activeSfxIds }
-                staleSfx.forEach { measuredSfxBounds.remove(it) }
+                staleSfx.forEach {
+                    measuredSfxBounds.remove(it)
+                    renderedOverlayNormRects.remove("sfx:$it")
+                }
             }
 
             val isFixedZonesMode = displayMode == CaptionDisplayMode.FIXED_ZONES
@@ -867,7 +894,8 @@ fun VideoPlayerStage(
                 val nonSfxBalloons = placedBalloons
                     .filter { it.event.dialogueType != DialogueType.SOUND_DESCRIPTION }
                 nonSfxBalloons.forEachIndexed { idx, placed ->
-                    key("${project.id}:${placed.event.id}") {
+                    val persistentKey = placed.event.stableCueKey.ifBlank { placed.event.id }
+                    key("${project.id}:$persistentKey") {
                         val priorBubbleRects = nonSfxBalloons
                             .take(idx)
                             .mapNotNull { measuredBubbleBounds[it.event.id] }
@@ -883,10 +911,22 @@ fun VideoPlayerStage(
                             occupiedBubbleRects = priorBubbleRects,
                             onPixelBoundsResolved = { rect ->
                                 measuredBubbleBounds[placed.event.id] = rect
+                                if (widthPx > 1f && heightPx > 1f) {
+                                    renderedOverlayNormRects[placed.event.id] = NormalizedRect(
+                                        left = (rect.left / widthPx).coerceIn(0f, 1f),
+                                        top = (rect.top / heightPx).coerceIn(0f, 1f),
+                                        right = (rect.right / widthPx).coerceIn(0f, 1f),
+                                        bottom = (rect.bottom / heightPx).coerceIn(0f, 1f),
+                                    )
+                                }
                             },
                             onMeasuredNormalizedSize = { normW, normH ->
                                 onMeasuredBubbleSize(placed.event.id, normW, normH)
                             },
+                            onRenderedFrameReported = { cueKey, leftPx, topPx, wPx, hPx ->
+                                onRenderedBalloonFrame(cueKey, leftPx, topPx, wPx, hPx, widthPx, heightPx)
+                            },
+                            onEntryAnimationStarted = onBalloonEntryStarted,
                             onClick = { onTapBalloon(placed.event.id) },
                             onDragCommit = { newCenter -> onDragBalloonAnchor(placed.event.id, newCenter) },
                             forceTaillessFixedZone = isFixedZonesMode,
@@ -900,7 +940,7 @@ fun VideoPlayerStage(
                 val bubbleObstacles = activeNonSfxIds.mapNotNull { measuredBubbleBounds[it] }
                 val sfxList = placedBalloons.filter { it.event.dialogueType == DialogueType.SOUND_DESCRIPTION }
                 sfxList.forEachIndexed { idx, sfxPlaced ->
-                    key("${project.id}:sfx:${sfxPlaced.event.id}") {
+                    key("${project.id}:sfx:${sfxPlaced.event.stableCueKey.ifBlank { sfxPlaced.event.id }}") {
                         val priorSfxObstacles = sfxList.take(idx).mapNotNull { measuredSfxBounds[it.event.id] }
                         SpatialSfxNoteView(
                             placed = sfxPlaced,
@@ -912,6 +952,14 @@ fun VideoPlayerStage(
                             occupiedBubbleRects = bubbleObstacles + priorSfxObstacles,
                             onPixelBoundsResolved = { rect ->
                                 measuredSfxBounds[sfxPlaced.event.id] = rect
+                                if (widthPx > 1f && heightPx > 1f) {
+                                    renderedOverlayNormRects["sfx:${sfxPlaced.event.id}"] = NormalizedRect(
+                                        left = (rect.left / widthPx).coerceIn(0f, 1f),
+                                        top = (rect.top / heightPx).coerceIn(0f, 1f),
+                                        right = (rect.right / widthPx).coerceIn(0f, 1f),
+                                        bottom = (rect.bottom / heightPx).coerceIn(0f, 1f),
+                                    )
+                                }
                             },
                             onTap = { onTapBalloon(sfxPlaced.event.id) },
                         )

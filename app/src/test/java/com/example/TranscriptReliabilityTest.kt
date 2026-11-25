@@ -659,7 +659,12 @@ class TranscriptReliabilityTest {
             events = uploadedEvents,
             source = SubtitleSourceKind.UPLOADED_FILE,
         )
-        assertTrue(ledger.isFullyVerified())
+        // Cue span is verified dialogue; un-cued spans are honestly CAPTION_GAP (never fake silence),
+        // while playable released coverage spans the full track.
+        assertEquals(CoverageStatus.VERIFIED_DIALOGUE, ledger.coverageStatusAt(12_000L))
+        assertEquals(CoverageStatus.CAPTION_GAP, ledger.coverageStatusAt(30_000L))
+        assertEquals(60_000L, ledger.continuousReleasedUpToMs())
+        assertTrue(ledger.summary().captionGapCount >= 1)
 
         // Lower-authority AI failure must NOT downgrade authoritative UPLOADED_FILE intervals
         ledger.recordOutcome(
@@ -671,7 +676,9 @@ class TranscriptReliabilityTest {
             incrementRetry = true,
         )
 
-        assertTrue(ledger.isFullyVerified())
+        assertEquals(CoverageStatus.VERIFIED_DIALOGUE, ledger.coverageStatusAt(12_000L))
+        assertEquals(CoverageStatus.CAPTION_GAP, ledger.coverageStatusAt(30_000L))
+        assertEquals(60_000L, ledger.continuousReleasedUpToMs())
         assertEquals(0, ledger.summary().failedIntervalCount)
         assertTrue(ledger.intervalsSnapshot().all { it.source == SubtitleSourceKind.UPLOADED_FILE })
     }

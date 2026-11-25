@@ -302,6 +302,7 @@ data class DialogueEvent(
     val culturalNote: String = "",
     val preferredDeadSpaceZone: DeadSpaceZone = DeadSpaceZone.AUTO,
     val avoidBoxes: List<NormalizedRect> = emptyList(),
+    val stableCueKey: String = "",
 ) {
     val confidenceTier: ConfidenceTier
         get() = confidenceTierFor(speakerConfidence)
@@ -496,6 +497,36 @@ fun isBubbleNonSpeakerSpecific(event: DialogueEvent, style: BalloonStyleSettings
     return !style.speakerSpecificColors
 }
 
+enum class CaptionOriginKind(val label: String) {
+    AUTHORED("Authored"),
+    AUTOMATIC_ASR("Automatic ASR"),
+    USER_IMPORTED("User Imported"),
+    UNKNOWN("Unknown Origin"),
+}
+
+@JsonClass(generateAdapter = true)
+data class ReferenceCaptionCue(
+    val cueId: String,
+    val startMs: Long,
+    val endMs: Long,
+    val text: String,
+    val languageCode: String = "",
+)
+
+@JsonClass(generateAdapter = true)
+data class ReferenceCaptionTrack(
+    val mediaId: String,
+    val trackId: String,
+    val languageCode: String,
+    val translationSourceLang: String? = null,
+    val originKind: CaptionOriginKind = CaptionOriginKind.UNKNOWN,
+    val isAutoTranslated: Boolean = false,
+    val sourceRevision: Long = 1L,
+    val fetchedAtEpochMs: Long = System.currentTimeMillis(),
+    val provenanceLabel: String = "",
+    val cues: List<ReferenceCaptionCue> = emptyList(),
+)
+
 enum class CoverageStatus {
     VERIFIED_DIALOGUE,
     VERIFIED_SILENCE,
@@ -504,6 +535,23 @@ enum class CoverageStatus {
     IN_PROGRESS,
     FAILED,
     LEGACY_UNVERIFIED,
+    CAPTION_GAP,
+    SUSPECTED_MISSING_DIALOGUE,
+    UNAVAILABLE_EVIDENCE,
+    RELEASED_FALLBACK;
+
+    val isVerified: Boolean
+        get() = this == VERIFIED_DIALOGUE || this == VERIFIED_SILENCE
+
+    val isReleasedPlayable: Boolean
+        get() = this == VERIFIED_DIALOGUE ||
+            this == VERIFIED_SILENCE ||
+            this == CAPTION_GAP ||
+            this == UNAVAILABLE_EVIDENCE ||
+            this == RELEASED_FALLBACK
+
+    val isConfirmedSilence: Boolean
+        get() = this == VERIFIED_SILENCE
 }
 
 @JsonClass(generateAdapter = true)
@@ -512,11 +560,11 @@ data class CoverageInterval(
     val endMs: Long,
     val status: CoverageStatus,
     val source: SubtitleSourceKind = SubtitleSourceKind.AI_DRAFT,
-    val verified: Boolean = status == CoverageStatus.VERIFIED_DIALOGUE || status == CoverageStatus.VERIFIED_SILENCE,
+    val verified: Boolean = status.isVerified,
     val retryAttempts: Int = 0,
     val lastFailureReason: String = "",
     val dialogueCount: Int = 0,
-    val silenceConfirmed: Boolean = status == CoverageStatus.VERIFIED_SILENCE,
+    val silenceConfirmed: Boolean = status.isConfirmedSilence,
     val updatedAtEpochMs: Long = 0L,
 )
 
