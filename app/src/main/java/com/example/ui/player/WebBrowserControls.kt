@@ -379,7 +379,7 @@ fun ScoutBrowserInspectorModal(
     onCapturedCaptions: (String) -> Unit,
     onScoutDirectMediaUrl: (String) -> Unit,
     onScoutSniffedMediaStream: (SniffedWebMediaStream) -> Unit = {},
-    onScoutAudioSlice: (Long, String, String) -> Unit,
+    onScoutAudioSlice: (Long, Long, String, String) -> Unit,
     onScoutNavChanged: (WebNavigationState) -> Unit,
     onScoutBack: () -> Unit,
     onScoutForward: () -> Unit,

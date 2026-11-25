@@ -56,7 +56,8 @@ object SubtitleParser {
                 minutes = match.groupValues[6].toLongOrNull() ?: 0L,
                 seconds = match.groupValues[7].toLongOrNull() ?: 0L,
                 millis = match.groupValues[8].toLongOrNull() ?: 0L,
-            ).coerceAtLeast(startMs + 400L)
+            )
+            if (endMs <= startMs) continue
 
             val rawBody = lines.drop(timeLineIndex + 1).joinToString(" ")
             val cleaned = cleanTags(rawBody)
@@ -106,8 +107,8 @@ object SubtitleParser {
                 val textIdx = formatFields.indexOf("text").takeIf { it >= 0 } ?: (parts.lastIndex)
 
                 val startMs = parseAssTimestamp(parts.getOrNull(startIdx).orEmpty()) ?: continue
-                val endMs = (parseAssTimestamp(parts.getOrNull(endIdx).orEmpty()) ?: (startMs + 1500L))
-                    .coerceAtLeast(startMs + 400L)
+                val endMs = parseAssTimestamp(parts.getOrNull(endIdx).orEmpty()) ?: continue
+                if (endMs <= startMs) continue
                 val style = parts.getOrNull(styleIdx).orEmpty()
                 val rawText = parts.getOrNull(textIdx).orEmpty()
                     .replace("\\N", " ")
@@ -206,6 +207,10 @@ object SubtitleParser {
         return cues
     }
 
+    /** Imported captions and translated edits keep the source timestamps, including intentional overlaps. */
+    fun inSourceTimeOrder(events: List<DialogueEvent>): List<DialogueEvent> =
+        events.sortedBy { it.startTimeMs }
+
     /**
      * Ensures readable minimum dwell time (>= 1050ms unless constrained by next cue)
      * so rapid micro-cues don't flicker too quickly to read.
@@ -215,7 +220,7 @@ object SubtitleParser {
         val sorted = events.sortedBy { it.startTimeMs }
         return sorted.mapIndexed { idx, evt ->
             val nextStart = sorted.getOrNull(idx + 1)?.startTimeMs ?: Long.MAX_VALUE
-            val maxAllowedEnd = (nextStart - 60L).coerceAtLeast(evt.startTimeMs + 450L)
+            val maxAllowedEnd = (nextStart - 60L).coerceAtLeast(evt.startTimeMs)
             val desiredMinEnd = evt.startTimeMs + 1050L
             val adjustedEnd = maxOf(evt.endTimeMs, minOf(desiredMinEnd, maxAllowedEnd))
             evt.copy(endTimeMs = adjustedEnd)

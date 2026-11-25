@@ -2,11 +2,9 @@ package com.example.ui.player
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.runtime.key
 import androidx.compose.animation.core.animateOffsetAsState
 import androidx.compose.animation.core.snap
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -38,10 +36,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -83,7 +80,6 @@ import com.example.data.model.ConfidenceTier
 import com.example.data.model.DialogueType
 import com.example.data.model.NormalizedPoint
 import com.example.data.model.NormalizedRect
-import com.example.data.model.PlacementMode
 import com.example.data.model.SpeakerLabelMode
 import com.example.data.model.TranslationMode
 import com.example.data.model.isBubbleNonSpeakerSpecific
@@ -131,9 +127,8 @@ fun SpeechBalloonView(
     isSelected: Boolean,
     containerWidthPx: Float,
     containerHeightPx: Float,
-    faceExclusionRects: List<NormalizedRect> = emptyList(),
-    occupiedBubbleRects: List<Rect> = emptyList(),
-    onPixelBoundsResolved: (Rect) -> Unit = {},
+    committedRect: NormalizedRect?,
+    onMeasure: (IntSize) -> Unit,
     onClick: () -> Unit,
     onDragCommit: (NormalizedPoint) -> Unit,
     modifier: Modifier = Modifier,
@@ -164,12 +159,11 @@ fun SpeechBalloonView(
         event.dialogueType == DialogueType.SOUND_DESCRIPTION ||
         event.dialogueType == DialogueType.INTERNAL_MONOLOGUE
 
-    var measuredSize by remember(event.id) { mutableStateOf(IntSize.Zero) }
 
     // Wait until first pixel measurement finishes before fading in so balloons never hop on Frame 1 -> Frame 2
     val enterAlpha = remember(event.id) { Animatable(if (style.reducedMotion) 1f else 0f) }
-    LaunchedEffect(event.id, measuredSize != IntSize.Zero, style.reducedMotion) {
-        if (measuredSize == IntSize.Zero && !style.reducedMotion) return@LaunchedEffect
+    LaunchedEffect(event.id, committedRect != null, style.reducedMotion) {
+        if (committedRect == null && !style.reducedMotion) return@LaunchedEffect
         if (style.reducedMotion) {
             enterAlpha.snapTo(1f)
         } else {
@@ -177,8 +171,8 @@ fun SpeechBalloonView(
         }
     }
 
-    var dragOffsetXPx by remember(event.id, placed.rect.centerX) { mutableFloatStateOf(0f) }
-    var dragOffsetYPx by remember(event.id, placed.rect.centerY) { mutableFloatStateOf(0f) }
+    var dragOffsetXPx by remember(event.id) { mutableFloatStateOf(0f) }
+    var dragOffsetYPx by remember(event.id) { mutableFloatStateOf(0f) }
 
     val density = LocalDensity.current.density
     val stageWidthDp = (containerWidthPx / density).coerceAtLeast(180f)
@@ -202,68 +196,13 @@ fun SpeechBalloonView(
         .coerceAtMost((stageWidthDp - 16f).coerceAtLeast(140f))
         .dp
 
-    val actualW = if (measuredSize.width > 0) measuredSize.width.toFloat() else (placed.rect.width * containerWidthPx)
-    val actualH = if (measuredSize.height > 0) measuredSize.height.toFloat() else (placed.rect.height * containerHeightPx)
-
-    val safeMarginX = 10f * density
-    val safeMarginY = 8f * density
-    val maxLeftPx = (containerWidthPx - actualW - safeMarginX).coerceAtLeast(safeMarginX)
-    val maxTopPx = (containerHeightPx - actualH - safeMarginY).coerceAtLeast(safeMarginY)
-    val desiredCenterX = placed.rect.centerX * containerWidthPx + dragOffsetXPx
-    val desiredCenterY = placed.rect.centerY * containerHeightPx + dragOffsetYPx
-
-    val baseLeftPx = (desiredCenterX - actualW * 0.5f).coerceIn(safeMarginX, maxLeftPx)
-    val baseTopPx = (desiredCenterY - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
-
-    // Remember the actual rendered position for the same cue and scene.
-    val lastSafePixelPosition = remember(event.id, placed.layoutSceneKey, measuredSize, containerWidthPx, containerHeightPx, style.stablePositioning, style.reducedMotion) {
-        arrayOfNulls<Pair<Float, Float>>(1)
-    }
-
-    // Real-pixel face & sibling-bubble repulsion guarantee: scan open 2D space freely so wrapped lines never clip faces or neighbors
-    val (bubbleLeftPx, bubbleTopPx) = if (
-        measuredSize != IntSize.Zero &&
-        event.placementMode != PlacementMode.MANUAL_OVERRIDE
-    ) {
-        resolveFaceSafePixelPosition(
-            baseLeftPx = baseLeftPx,
-            baseTopPx = baseTopPx,
-            actualW = actualW,
-            actualH = actualH,
-            safeMarginX = safeMarginX,
-            safeMarginY = safeMarginY,
-            maxLeftPx = maxLeftPx,
-            maxTopPx = maxTopPx,
-            containerWidthPx = containerWidthPx,
-            containerHeightPx = containerHeightPx,
-            faceExclusionRects = faceExclusionRects,
-            occupiedBubbleRects = occupiedBubbleRects,
-            density = density,
-            allowBelowFace = !style.lipReadingSafeZone || (event.faceTrackId == null && event.anchorPosition != null),
-            previousPosition = if (!isEditMode) lastSafePixelPosition[0] else null,
-        )
-    } else {
-        baseLeftPx to baseTopPx
-    }
-
-    SideEffect {
-        if (measuredSize != IntSize.Zero) lastSafePixelPosition[0] = bubbleLeftPx to bubbleTopPx
-    }
-    val actualCenterX = bubbleLeftPx + actualW * 0.5f
-    val actualCenterY = bubbleTopPx + actualH * 0.5f
-
-    LaunchedEffect(event.id, measuredSize, bubbleLeftPx, bubbleTopPx) {
-        if (measuredSize != IntSize.Zero) {
-            onPixelBoundsResolved(
-                Rect(
-                    left = bubbleLeftPx,
-                    top = bubbleTopPx,
-                    right = bubbleLeftPx + actualW,
-                    bottom = bubbleTopPx + actualH,
-                )
-            )
-        }
-    }
+    val body = committedRect ?: placed.rect
+    val bubbleLeftPx = body.left * containerWidthPx + dragOffsetXPx
+    val bubbleTopPx = body.top * containerHeightPx + dragOffsetYPx
+    val actualCenterX = body.centerX * containerWidthPx + dragOffsetXPx
+    val actualCenterY = body.centerY * containerHeightPx + dragOffsetYPx
+    val baseCenter by rememberUpdatedState(NormalizedPoint(body.centerX, body.centerY))
+    val commitDrag by rememberUpdatedState(onDragCommit)
 
     val showPointerTail = style.showTail &&
         !isSpecialNonSpoken &&
@@ -275,51 +214,18 @@ fun SpeechBalloonView(
     val targetYPx = (placed.tailTarget?.y ?: placed.rect.centerY) * containerHeightPx
     val rawGoalOffset = Offset(targetXPx, targetYPx)
 
-    // Velocity-preserving spring tracking (never cancels in-flight springs on 160ms live face updates)
-    val interpolatedTipWorld by animateOffsetAsState(
-        targetValue = rawGoalOffset,
-        animationSpec = if (!showPointerTail || style.reducedMotion) {
-            snap()
-        } else {
-            spring(
-                dampingRatio = 0.74f,
-                stiffness = Spring.StiffnessMediumLow,
-            )
-        },
-        label = "tail_tip_chase",
-    )
-
-    val rawAimAngleRad = if (showPointerTail) {
-        atan2(
-            (interpolatedTipWorld.y - actualCenterY).toDouble(),
-            (interpolatedTipWorld.x - actualCenterX).toDouble(),
-        ).toFloat()
-    } else {
-        Float.NaN
+    // A new camera angle starts directly at its own target. Only the tail tracks the face.
+    val interpolatedTipWorld by key(placed.layoutSceneKey, showPointerTail) {
+        animateOffsetAsState(
+            targetValue = rawGoalOffset,
+            animationSpec = if (!showPointerTail || style.reducedMotion) snap() else tween(durationMillis = 100),
+            label = "tail_tip",
+        )
     }
-
-    // Continuous unwrapped angular target so tails glide seamlessly across +/-PI without 360-degree spins
-    var unwrappedAimAngle by remember(event.id) {
-        mutableFloatStateOf(if (rawAimAngleRad.isNaN()) 0f else rawAimAngleRad)
-    }
-    if (!rawAimAngleRad.isNaN()) {
-        val step = shortestAngularDeltaRad(unwrappedAimAngle, rawAimAngleRad)
-        if (abs(step) > 0.002f) {
-            unwrappedAimAngle += step
-        }
-    }
-    val smoothAimAngleRad by animateFloatAsState(
-        targetValue = unwrappedAimAngle,
-        animationSpec = if (!showPointerTail || style.reducedMotion) {
-            snap()
-        } else {
-            spring(
-                dampingRatio = 0.78f,
-                stiffness = Spring.StiffnessMedium,
-            )
-        },
-        label = "tail_angle_glide",
-    )
+    val smoothAimAngleRad = if (showPointerTail) atan2(
+        (interpolatedTipWorld.y - actualCenterY).toDouble(),
+        (interpolatedTipWorld.x - actualCenterX).toDouble(),
+    ).toFloat() else Float.NaN
 
     val localTarget = if (showPointerTail) {
         Offset(x = interpolatedTipWorld.x - bubbleLeftPx, y = interpolatedTipWorld.y - bubbleTopPx)
@@ -334,13 +240,13 @@ fun SpeechBalloonView(
                 y = bubbleTopPx.roundToInt(),
             )
         }
-        .graphicsLayer { alpha = if (measuredSize == IntSize.Zero) 0f else enterAlpha.value }
+        .graphicsLayer { alpha = if (committedRect == null) 0f else enterAlpha.value }
         .wrapContentSize(unbounded = false)
         .widthIn(max = maxBubbleWidthDp)
-        .onSizeChanged { measuredSize = it }
+        .onSizeChanged(onMeasure)
         .then(
             if (isEditMode) {
-                Modifier.pointerInput(event.id) {
+                Modifier.pointerInput(event.id, containerWidthPx, containerHeightPx) {
                     detectDragGestures(
                         onDrag = { change, dragAmount ->
                             change.consume()
@@ -348,11 +254,11 @@ fun SpeechBalloonView(
                             dragOffsetYPx += dragAmount.y
                         },
                         onDragEnd = {
-                            val newCx = (actualCenterX / containerWidthPx).coerceIn(0.10f, 0.90f)
-                            val newCy = (actualCenterY / containerHeightPx).coerceIn(0.10f, 0.88f)
+                            val newCx = (baseCenter.x + dragOffsetXPx / containerWidthPx).coerceIn(0.10f, 0.90f)
+                            val newCy = (baseCenter.y + dragOffsetYPx / containerHeightPx).coerceIn(0.10f, 0.88f)
                             dragOffsetXPx = 0f
                             dragOffsetYPx = 0f
-                            onDragCommit(NormalizedPoint(newCx, newCy))
+                            commitDrag(NormalizedPoint(newCx, newCy))
                         },
                         onDragCancel = {
                             dragOffsetXPx = 0f
@@ -1556,122 +1462,6 @@ private fun balanceSubtitleLines(text: String, maxLines: Int, charsPerLine: Int)
     return words.take(bestSplitIdx).joinToString(" ") + "\n" + words.drop(bestSplitIdx).joinToString(" ")
 }
 
-private fun resolveFaceSafePixelPosition(
-    baseLeftPx: Float,
-    baseTopPx: Float,
-    actualW: Float,
-    actualH: Float,
-    safeMarginX: Float,
-    safeMarginY: Float,
-    maxLeftPx: Float,
-    maxTopPx: Float,
-    containerWidthPx: Float,
-    containerHeightPx: Float,
-    faceExclusionRects: List<NormalizedRect>,
-    occupiedBubbleRects: List<Rect> = emptyList(),
-    density: Float,
-    allowBelowFace: Boolean = true,
-    previousPosition: Pair<Float, Float>? = null,
-): Pair<Float, Float> {
-    val facePixels = faceExclusionRects.map { f ->
-        Rect(
-            left = f.left * containerWidthPx,
-            top = f.top * containerHeightPx,
-            right = f.right * containerWidthPx,
-            bottom = f.bottom * containerHeightPx,
-        )
-    }
-    val bubblePadPx = 6f * density
-    val siblingPixels = occupiedBubbleRects.map { b ->
-        Rect(
-            left = b.left - bubblePadPx,
-            top = b.top - bubblePadPx,
-            right = b.right + bubblePadPx,
-            bottom = b.bottom + bubblePadPx,
-        )
-    }
-
-    fun sumOverlap(rects: List<Rect>, l: Float, t: Float): Float {
-        val r = l + actualW
-        val b = t + actualH
-        var total = 0f
-        for (item in rects) {
-            val ix = (minOf(r, item.right) - maxOf(l, item.left)).coerceAtLeast(0f)
-            val iy = (minOf(b, item.bottom) - maxOf(t, item.top)).coerceAtLeast(0f)
-            total += ix * iy
-        }
-        return total
-    }
-
-    if (previousPosition != null) {
-        val (previousLeft, previousTop) = previousPosition
-        if (previousLeft in safeMarginX..maxLeftPx && previousTop in safeMarginY..maxTopPx &&
-            sumOverlap(facePixels, previousLeft, previousTop) <= 1f &&
-            sumOverlap(siblingPixels, previousLeft, previousTop) <= 1f
-        ) return previousPosition
-    }
-
-    if (sumOverlap(facePixels, baseLeftPx, baseTopPx) <= 1f &&
-        sumOverlap(siblingPixels, baseLeftPx, baseTopPx) <= 1f
-    ) {
-        return baseLeftPx to baseTopPx
-    }
-
-    val gap = 6f * density
-    val candidates = buildList {
-        add(baseLeftPx to baseTopPx)
-        if (facePixels.isNotEmpty()) {
-            val minFaceTop = facePixels.minOf { it.top }
-            val maxFaceBottom = facePixels.maxOf { it.bottom }
-            val minFaceLeft = facePixels.minOf { it.left }
-            val maxFaceRight = facePixels.maxOf { it.right }
-            add(baseLeftPx to minFaceTop - actualH - gap)
-            if (allowBelowFace) {
-                add(baseLeftPx to maxFaceBottom + gap)
-            }
-            add(minFaceLeft - actualW - gap to baseTopPx)
-            add(maxFaceRight + gap to baseTopPx)
-            for (face in facePixels) {
-                add((face.center.x - actualW * 0.5f) to (face.top - actualH - gap))
-                if (allowBelowFace) {
-                    add((face.center.x - actualW * 0.5f) to (face.bottom + gap))
-                }
-                add((face.left - actualW - gap) to (face.center.y - actualH * 0.5f))
-                add((face.right + gap) to (face.center.y - actualH * 0.5f))
-            }
-        }
-        for (sib in siblingPixels) {
-            add((sib.center.x - actualW * 0.5f) to (sib.top - actualH - gap))
-            add((sib.center.x - actualW * 0.5f) to (sib.bottom + gap))
-            add((sib.left - actualW - gap) to sib.top)
-            add((sib.right + gap) to sib.top)
-        }
-        // Full 2D screen-wide roaming grid so bubbles glide cleanly into ANY open dead space on screen
-        for (fx in listOf(0.08f, 0.25f, 0.42f, 0.58f, 0.75f, 0.92f)) {
-            for (fy in listOf(0.09f, 0.26f, 0.46f, 0.66f, 0.85f)) {
-                add((containerWidthPx * fx - actualW * 0.5f) to (containerHeightPx * fy - actualH * 0.5f))
-            }
-        }
-    }.map { (cx, cy) ->
-        cx.coerceIn(safeMarginX, maxLeftPx) to cy.coerceIn(safeMarginY, maxTopPx)
-    }
-
-    val areaScale = (containerWidthPx * containerHeightPx).coerceAtLeast(1f)
-    val widthNorm = containerWidthPx.coerceAtLeast(1f)
-    val heightNorm = containerHeightPx.coerceAtLeast(1f)
-    return candidates.minByOrNull { (cx, cy) ->
-        val faceNorm = sumOverlap(facePixels, cx, cy) / areaScale
-        val siblingNorm = sumOverlap(siblingPixels, cx, cy) / areaScale
-        val distNorm = hypot(
-            ((cx - baseLeftPx) / widthNorm).toDouble(),
-            ((cy - baseTopPx) / heightNorm).toDouble(),
-        ).toFloat()
-        val facePenalty = (if (faceNorm > 0f) 500f else 0f) + faceNorm * 14_000f
-        val siblingPenalty = (if (siblingNorm > 0f) 420f else 0f) + siblingNorm * 10_000f
-        facePenalty + siblingPenalty + distNorm * 1.8f
-    } ?: (baseLeftPx to baseTopPx)
-}
-
 @Composable
 fun ClassicSubtitleBar(
     placedBalloons: List<PlacedBalloon>,
@@ -1779,9 +1569,8 @@ fun SpatialSfxNoteView(
     style: BalloonStyleSettings,
     containerWidthPx: Float,
     containerHeightPx: Float,
-    faceExclusionRects: List<NormalizedRect>,
-    occupiedBubbleRects: List<Rect>,
-    onPixelBoundsResolved: (Rect) -> Unit,
+    committedRect: NormalizedRect?,
+    onMeasure: (IntSize) -> Unit,
     onTap: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1799,10 +1588,9 @@ fun SpatialSfxNoteView(
         }
     }
 
-    var measuredSize by remember(event.id) { mutableStateOf(IntSize.Zero) }
     val enterAlpha = remember(event.id) { Animatable(if (style.reducedMotion) 1f else 0f) }
-    LaunchedEffect(event.id, measuredSize != IntSize.Zero, style.reducedMotion) {
-        if (measuredSize == IntSize.Zero && !style.reducedMotion) return@LaunchedEffect
+    LaunchedEffect(event.id, committedRect != null, style.reducedMotion) {
+        if (committedRect == null && !style.reducedMotion) return@LaunchedEffect
         if (style.reducedMotion) {
             enterAlpha.snapTo(1f)
         } else {
@@ -1813,55 +1601,16 @@ fun SpatialSfxNoteView(
     val density = LocalDensity.current.density
     val stageWidthDp = (containerWidthPx / density).coerceAtLeast(180f)
     val maxWidthDp = (stageWidthDp * 0.82f).coerceIn(180f, 360f).dp
-    val actualW = if (measuredSize.width > 0) measuredSize.width.toFloat() else (placed.rect.width * containerWidthPx)
-    val actualH = if (measuredSize.height > 0) measuredSize.height.toFloat() else (placed.rect.height * containerHeightPx)
-
-    val safeMarginX = 12f * density
-    val safeMarginY = 8f * density
-    val maxLeftPx = (containerWidthPx - actualW - safeMarginX).coerceAtLeast(safeMarginX)
-    val maxTopPx = (containerHeightPx - actualH - safeMarginY).coerceAtLeast(safeMarginY)
-    val baseLeftPx = (placed.rect.centerX * containerWidthPx - actualW * 0.5f).coerceIn(safeMarginX, maxLeftPx)
-    val baseTopPx = (placed.rect.centerY * containerHeightPx - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
-
-    val (sfxLeftPx, sfxTopPx) = if (measuredSize != IntSize.Zero) {
-        resolveSfxSafePixelPosition(
-            baseLeftPx = baseLeftPx,
-            baseTopPx = baseTopPx,
-            actualW = actualW,
-            actualH = actualH,
-            safeMarginX = safeMarginX,
-            safeMarginY = safeMarginY,
-            maxLeftPx = maxLeftPx,
-            maxTopPx = maxTopPx,
-            containerWidthPx = containerWidthPx,
-            containerHeightPx = containerHeightPx,
-            faceExclusionRects = faceExclusionRects,
-            occupiedBubbleRects = occupiedBubbleRects,
-            density = density,
-        )
-    } else {
-        baseLeftPx to baseTopPx
-    }
-
-    LaunchedEffect(event.id, measuredSize, sfxLeftPx, sfxTopPx) {
-        if (measuredSize != IntSize.Zero) {
-            onPixelBoundsResolved(
-                Rect(
-                    left = sfxLeftPx,
-                    top = sfxTopPx,
-                    right = sfxLeftPx + actualW,
-                    bottom = sfxTopPx + actualH,
-                )
-            )
-        }
-    }
+    val body = committedRect ?: placed.rect
+    val sfxLeftPx = body.left * containerWidthPx
+    val sfxTopPx = body.top * containerHeightPx
 
     Box(
         modifier = modifier
             .offset { IntOffset(sfxLeftPx.roundToInt(), sfxTopPx.roundToInt()) }
-            .graphicsLayer { alpha = if (measuredSize == IntSize.Zero) 0f else enterAlpha.value }
+            .graphicsLayer { alpha = if (committedRect == null) 0f else enterAlpha.value }
             .widthIn(max = maxWidthDp)
-            .onSizeChanged { measuredSize = it }
+            .onSizeChanged(onMeasure)
             .clip(RoundedCornerShape(12.dp))
             .background(
                 if (style.highContrastMode) {
@@ -1902,109 +1651,4 @@ fun SpatialSfxNoteView(
             maxLines = Int.MAX_VALUE,
         )
     }
-}
-
-private fun resolveSfxSafePixelPosition(
-    baseLeftPx: Float,
-    baseTopPx: Float,
-    actualW: Float,
-    actualH: Float,
-    safeMarginX: Float,
-    safeMarginY: Float,
-    maxLeftPx: Float,
-    maxTopPx: Float,
-    containerWidthPx: Float,
-    containerHeightPx: Float,
-    faceExclusionRects: List<NormalizedRect>,
-    occupiedBubbleRects: List<Rect>,
-    density: Float,
-): Pair<Float, Float> {
-    val facePixels = faceExclusionRects.map { f ->
-        Rect(
-            left = f.left * containerWidthPx,
-            top = f.top * containerHeightPx,
-            right = f.right * containerWidthPx,
-            bottom = f.bottom * containerHeightPx,
-        )
-    }
-    val padPx = 8f * density
-    val paddedBubbles = occupiedBubbleRects.map { b ->
-        Rect(
-            left = b.left - padPx,
-            top = b.top - padPx,
-            right = b.right + padPx,
-            bottom = b.bottom + padPx,
-        )
-    }
-
-    fun sumOverlap(rectList: List<Rect>, l: Float, t: Float): Float {
-        val r = l + actualW
-        val b = t + actualH
-        var total = 0f
-        for (item in rectList) {
-            val ix = (minOf(r, item.right) - maxOf(l, item.left)).coerceAtLeast(0f)
-            val iy = (minOf(b, item.bottom) - maxOf(t, item.top)).coerceAtLeast(0f)
-            total += ix * iy
-        }
-        return total
-    }
-
-    if (sumOverlap(facePixels, baseLeftPx, baseTopPx) <= 1f &&
-        sumOverlap(paddedBubbles, baseLeftPx, baseTopPx) <= 1f
-    ) {
-        return baseLeftPx to baseTopPx
-    }
-
-    val centerX = (containerWidthPx - actualW) * 0.5f
-    val bottomY = maxTopPx
-    val midY = (containerHeightPx - actualH) * 0.5f
-    val upperY = (safeMarginY + (containerHeightPx - actualH) * 0.16f)
-    val lowerY = (maxTopPx - (containerHeightPx - actualH) * 0.16f)
-
-    val candidates = buildList {
-        add(baseLeftPx to baseTopPx)
-        // Bottom strip
-        add(centerX to bottomY)
-        add(safeMarginX to bottomY)
-        add(maxLeftPx to bottomY)
-        add((centerX * 0.5f) to bottomY)
-        add((centerX + (maxLeftPx - centerX) * 0.5f) to bottomY)
-        // Top strip
-        add(centerX to safeMarginY)
-        add(safeMarginX to safeMarginY)
-        add(maxLeftPx to safeMarginY)
-        add(centerX to upperY)
-        // Side gutters
-        add(safeMarginX to midY)
-        add(maxLeftPx to midY)
-        add(safeMarginX to upperY)
-        add(maxLeftPx to upperY)
-        add(safeMarginX to lowerY)
-        add(maxLeftPx to lowerY)
-        // Above/below/beside each blocking bubble
-        for (bubble in paddedBubbles) {
-            add((bubble.center.x - actualW * 0.5f) to (bubble.top - actualH - 4f * density))
-            add((bubble.center.x - actualW * 0.5f) to (bubble.bottom + 4f * density))
-            add((bubble.left - actualW - 4f * density) to bubble.center.y - actualH * 0.5f)
-            add((bubble.right + 4f * density) to bubble.center.y - actualH * 0.5f)
-        }
-        // Coarse interior scan grid
-        for (fx in listOf(0.15f, 0.38f, 0.50f, 0.62f, 0.85f)) {
-            for (fy in listOf(0.18f, 0.42f, 0.66f, 0.88f)) {
-                add((containerWidthPx * fx - actualW * 0.5f) to (containerHeightPx * fy - actualH * 0.5f))
-            }
-        }
-    }.map { (cx, cy) ->
-        cx.coerceIn(safeMarginX, maxLeftPx) to cy.coerceIn(safeMarginY, maxTopPx)
-    }
-
-    val areaScale = (containerWidthPx * containerHeightPx).coerceAtLeast(1f)
-    return candidates.minByOrNull { (cx, cy) ->
-        val faceOverlapNorm = sumOverlap(facePixels, cx, cy) / areaScale
-        val bubbleOverlapNorm = sumOverlap(paddedBubbles, cx, cy) / areaScale
-        val distToBottomNorm = hypot(((cx - centerX) / containerWidthPx).toDouble(), ((cy - bottomY) / containerHeightPx).toDouble()).toFloat()
-        val facePenalty = (if (faceOverlapNorm > 0f) 500f else 0f) + faceOverlapNorm * 12_000f
-        val bubblePenalty = (if (bubbleOverlapNorm > 0f) 420f else 0f) + bubbleOverlapNorm * 10_000f
-        facePenalty + bubblePenalty + distToBottomNorm * 1.4f
-    } ?: (baseLeftPx to baseTopPx)
 }

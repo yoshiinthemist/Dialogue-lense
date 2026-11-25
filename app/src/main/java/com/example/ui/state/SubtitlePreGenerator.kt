@@ -207,13 +207,13 @@ class SubtitlePreGenerator(
         val restoredIntervals = if (cached != null) {
             TranscriptCoverageLedger.restoreOrMigrate(
                 cached = cached,
-                resolvedDurationMs = maxOf(cached.durationMs, cached.scoutedUpToMs, 60_000L),
+                resolvedDurationMs = cached.durationMs,
             )
         } else {
             emptyList()
         }
         if (cached != null && LookaheadWindowPlanner.hasRealSubtitles(cached.dialogueEvents)) {
-            val cachedDur = maxOf(cached.durationMs, cached.scoutedUpToMs, 60_000L)
+            val cachedDur = maxOf(cached.durationMs, cached.dialogueEvents.maxOfOrNull { it.endTimeMs } ?: 0L)
             val cacheLedger = TranscriptCoverageLedger(initialDurationMs = cachedDur, initialIntervals = restoredIntervals)
             val cachedProj = DialogueLensProject(
                 id = "yt_prep_${videoId}_${System.currentTimeMillis()}",
@@ -242,6 +242,7 @@ class SubtitlePreGenerator(
                 styleSettings = styleSettings,
                 glossary = glossary,
                 castDiscoverySummary = cached.castDiscoverySummary,
+                coverageIntervals = restoredIntervals,
             )
             val isAuthoritativeTrack = cached.subtitleSource == SubtitleSourceKind.EMBEDDED_TRACK ||
                 cached.subtitleSource == SubtitleSourceKind.UPLOADED_FILE
@@ -637,7 +638,7 @@ class SubtitlePreGenerator(
                         val partialSum = ledger.summary()
                         onProgress(
                             SubtitlePrepState.Ready(
-                                generatedProject = workingProj,
+                                generatedProject = workingProj.copy(coverageIntervals = ledger.intervalsSnapshot()),
                                 sourceLabel = "${activeTier.displayLabel} (Partial)",
                                 cueCount = workingProj.dialogueEvents.size,
                                 speakerCount = workingProj.speakers.size,
@@ -833,7 +834,7 @@ class SubtitlePreGenerator(
                 if (hasRealDialogue) {
                     onProgress(
                         SubtitlePrepState.Ready(
-                            generatedProject = workingProj,
+                            generatedProject = workingProj.copy(coverageIntervals = ledger.intervalsSnapshot()),
                             sourceLabel = if (isFullyVerified) "${activeTier.displayLabel} · Cached" else "${activeTier.displayLabel} · Partial",
                             cueCount = workingProj.dialogueEvents.size,
                             speakerCount = workingProj.speakers.size,
@@ -878,7 +879,7 @@ class SubtitlePreGenerator(
             )
         )
         val metadata = videoAnalyzer.extractMetadata(videoUri)
-        val durationMs = metadata.durationMs.coerceAtLeast(10_000L)
+        val durationMs = metadata.durationMs.coerceAtLeast(0L)
         val embeddedCues = audioAnalyzer.extractEmbeddedSubtitles(videoUri)
 
         if (embeddedCues.isNotEmpty()) {
@@ -972,6 +973,7 @@ class SubtitlePreGenerator(
         var currentSpeakers = defaultSpeakers()
         val shotList = listOf(Shot("shot_1", 0L, durationMs))
 
+        val ledger = TranscriptCoverageLedger(initialDurationMs = durationMs)
         for ((idx, chunk) in chunks.withIndex()) {
             val partialProjSnapshot = if (collectedEvents.isNotEmpty()) {
                 DialogueLensProject(
@@ -997,6 +999,7 @@ class SubtitlePreGenerator(
                     speakers = currentSpeakers,
                     faceTracks = emptyList(),
                     dialogueEvents = SubtitleParser.applyReadingPacingGuardrails(collectedEvents),
+                    coverageIntervals = ledger.intervalsSnapshot(),
                     styleSettings = styleSettings,
                     glossary = glossary,
                 )
@@ -1078,6 +1081,15 @@ class SubtitlePreGenerator(
             }
 
             val audioResult = chunkRes.getOrThrow()
+            val status = when {
+                audioResult.outcome == TranscriptionOutcome.VERIFIED_SILENCE && audioResult.noSpeechConfirmed ->
+                    CoverageStatus.VERIFIED_SILENCE
+                audioResult.outcome == TranscriptionOutcome.DIALOGUE_DETECTED && audioResult.cues.isNotEmpty() ->
+                    CoverageStatus.VERIFIED_DIALOGUE
+                audioResult.cues.isNotEmpty() -> CoverageStatus.PARTIAL_RECOVERY
+                else -> CoverageStatus.FAILED
+            }
+            ledger.recordOutcome(chunk.startMs, chunk.endMs, status, SubtitleSourceKind.AI_DRAFT, audioResult.cues.size)
             audioResult.cues.forEach { c ->
                 val id = SubtitleParser.newEventId()
                 collectedEvents.add(
@@ -1154,6 +1166,7 @@ class SubtitlePreGenerator(
             speakers = currentSpeakers,
             faceTracks = emptyList(),
             dialogueEvents = attributed,
+            coverageIntervals = ledger.intervalsSnapshot(),
             styleSettings = styleSettings,
             glossary = glossary,
         )
@@ -1275,7 +1288,7 @@ class SubtitlePreGenerator(
         }
 
         if (cachedUpdates.isEmpty()) return project
-        val patched = SubtitleParser.applyReadingPacingGuardrails(
+        val patched = SubtitleParser.inSourceTimeOrder(
             project.dialogueEvents.map { evt ->
                 val tr = cachedUpdates[evt.id] ?: return@map evt
                 evt.copy(translatedText = tr)
@@ -1352,7 +1365,7 @@ class SubtitlePreGenerator(
             else -> "CUT"
         }
         val shots = listOf(Shot("shot_1", 0L, durationMs, cutType = cutType))
-        val rawEvents = SubtitleParser.applyReadingPacingGuardrails(
+        val rawEvents = SubtitleParser.inSourceTimeOrder(
             cues.map { cue ->
                 DialogueEvent(
                     id = SubtitleParser.newEventId(),

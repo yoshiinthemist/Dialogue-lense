@@ -268,12 +268,12 @@ fun StartLauncherScreen(
                     }
 
                     Text(
-                        text = "Follow the conversation, not the subtitles.",
+                        text = "Import options",
                         style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                     Text(
-                        text = "Paste a video link, open a local file, or try the interactive demo. Existing captions are used first; AI fills missing dialogue automatically.",
+                        text = "Attach a transcript, choose languages, or prepare subtitles for export.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -316,20 +316,6 @@ fun StartLauncherScreen(
                                 .fillMaxWidth()
                                 .testTag("start_url_input"),
                         )
-
-                        Row(
-                            modifier = Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            FilterChip(
-                                selected = extractedYoutubeId == "3AFJtcP2cp0",
-                                onClick = {
-                                    urlInput = "https://youtu.be/3AFJtcP2cp0?is=Fd7HSQvVvb3qyMVC"
-                                },
-                                label = { Text("Load Test Video", fontSize = 12.sp) },
-                                modifier = Modifier.testTag("start_test_youtube_chip"),
-                            )
-                        }
 
                         if (urlInput.isNotBlank()) {
                             if (isDrmRestricted && resolvedMedia != null) {

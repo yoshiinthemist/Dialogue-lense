@@ -28,10 +28,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileOutputStream
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
+import android.util.AtomicFile
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private val Context.settingsDataStore by preferencesDataStore(name = "dialoguelens_prefs")
 
@@ -181,99 +180,107 @@ class ProjectStore(private val context: Context) {
         }
     }
 
-    private val ioWriteLock = Any()
+    // Acquire before dispatching to IO so a slower older snapshot cannot overtake a newer edit.
+    private val projectWrites = Mutex()
+    private val cacheWrites = Mutex()
 
-    private fun writeTextAtomically(targetFile: File, content: String) {
-        synchronized(ioWriteLock) {
-            val parent = targetFile.parentFile
-            if (parent != null && !parent.exists()) {
-                parent.mkdirs()
+    private fun writeTextAtomically(file: File, content: String) {
+        val atomic = AtomicFile(file)
+        val output = atomic.startWrite()
+        try {
+            output.write(content.toByteArray(Charsets.UTF_8))
+            atomic.finishWrite(output)
+        } catch (error: Throwable) {
+            atomic.failWrite(output)
+            throw error
+        }
+    }
+
+    private fun projectFile(id: String): File {
+        require(isUsableProjectId(id)) { "Invalid project identifier" }
+        return File(projectsDir, "$id.dlens.json")
+    }
+
+    suspend fun saveProject(project: DialogueLensProject) = projectWrites.withLock {
+        withContext(Dispatchers.IO) {
+            writeTextAtomically(projectFile(project.id), projectAdapter.toJson(project))
+        }
+    }
+
+    suspend fun listSavedProjects(): List<DialogueLensProject> = projectWrites.withLock {
+        withContext(Dispatchers.IO) {
+            // AtomicFile on older Android versions may leave only the backup after a power loss.
+            projectsDir.listFiles().orEmpty().map { it.name.removeSuffix(".bak") }
+                .filter { it.endsWith(".dlens.json") }.distinct().mapNotNull { name ->
+                    val file = File(projectsDir, name)
+                    runCatching { deserializeProject(String(AtomicFile(file).readFully(), Charsets.UTF_8)) }
+                        .getOrNull()
+                }.sortedByDescending { maxOf(it.lastWatchedAtEpochMs, it.createdAtEpochMs) }
+        }
+    }
+
+    suspend fun deleteProject(projectId: String) = projectWrites.withLock {
+        withContext(Dispatchers.IO) { AtomicFile(projectFile(projectId)).delete() }
+    }
+
+    suspend fun deleteAllProjects() = projectWrites.withLock {
+        cacheWrites.withLock {
+            withContext(Dispatchers.IO) {
+                projectsDir.listFiles()?.forEach { it.delete() }
+                videoCacheDir.listFiles()?.forEach { it.delete() }
+                Unit
             }
-            val tmpFile = File(parent ?: context.filesDir, "${targetFile.name}.tmp.${System.nanoTime()}")
-            try {
-                FileOutputStream(tmpFile).use { fos ->
-                    fos.write(content.toByteArray(Charsets.UTF_8))
-                    fos.flush()
-                    runCatching { fos.fd.sync() }
-                }
-                try {
-                    Files.move(
-                        tmpFile.toPath(),
-                        targetFile.toPath(),
-                        StandardCopyOption.ATOMIC_MOVE,
-                        StandardCopyOption.REPLACE_EXISTING,
-                    )
-                } catch (_: AtomicMoveNotSupportedException) {
-                    Files.move(
-                        tmpFile.toPath(),
-                        targetFile.toPath(),
-                        StandardCopyOption.REPLACE_EXISTING,
-                    )
-                }
-            } finally {
-                if (tmpFile.exists()) {
-                    runCatching { tmpFile.delete() }
-                }
+        }
+    }
+
+    suspend fun saveCachedTranscript(entry: CachedVideoTranscript) = cacheWrites.withLock {
+        withContext(Dispatchers.IO) {
+            val safeKey = entry.canonicalKey.replace(Regex("[^A-Za-z0-9_-]"), "_").take(80)
+            val hasCoverageProgress = entry.coverageIntervals.any {
+                it.verified || it.status == com.example.data.model.CoverageStatus.FAILED ||
+                    it.status == com.example.data.model.CoverageStatus.PARTIAL_RECOVERY
             }
+            if (safeKey.isBlank() || (entry.dialogueEvents.isEmpty() && !hasCoverageProgress)) return@withContext
+            val file = File(videoCacheDir, "$safeKey.cache.json")
+            runCatching { writeTextAtomically(file, cachedTranscriptAdapter.toJson(entry)) }
         }
     }
 
-    suspend fun saveProject(project: DialogueLensProject) = withContext(Dispatchers.IO) {
-        val file = File(projectsDir, "${project.id}.dlens.json")
-        writeTextAtomically(file, projectAdapter.toJson(project))
-    }
-
-    suspend fun listSavedProjects(): List<DialogueLensProject> = withContext(Dispatchers.IO) {
-        val files = projectsDir.listFiles { f -> f.name.endsWith(".dlens.json") } ?: emptyArray()
-        files.mapNotNull { file ->
-            runCatching { projectAdapter.fromJson(file.readText()) }.getOrNull()
-        }.sortedByDescending { it.createdAtEpochMs }
-    }
-
-    suspend fun deleteProject(projectId: String) = withContext(Dispatchers.IO) {
-        File(projectsDir, "$projectId.dlens.json").delete()
-        Unit
-    }
-
-    suspend fun deleteAllProjects() = withContext(Dispatchers.IO) {
-        projectsDir.listFiles()?.forEach { it.delete() }
-        videoCacheDir.listFiles()?.forEach { it.delete() }
-    }
-
-    suspend fun saveCachedTranscript(entry: CachedVideoTranscript) = withContext(Dispatchers.IO) {
-        val safeKey = entry.canonicalKey.replace(Regex("[^A-Za-z0-9_-]"), "_").take(80)
-        val hasCoverageProgress = entry.coverageIntervals.any {
-            it.verified || it.status == com.example.data.model.CoverageStatus.FAILED ||
-                it.status == com.example.data.model.CoverageStatus.PARTIAL_RECOVERY
+    suspend fun loadCachedTranscript(canonicalKey: String): CachedVideoTranscript? = cacheWrites.withLock {
+        withContext(Dispatchers.IO) {
+            val safeKey = canonicalKey.replace(Regex("[^A-Za-z0-9_-]"), "_").take(80)
+            if (safeKey.isBlank()) return@withContext null
+            val file = File(videoCacheDir, "$safeKey.cache.json")
+            if (!AtomicFile(file).existsCompat()) return@withContext null
+            runCatching { cachedTranscriptAdapter.fromJson(String(AtomicFile(file).readFully(), Charsets.UTF_8))?.takeIf { it.canonicalKey == canonicalKey } }.getOrNull()
         }
-        if (safeKey.isBlank() || (entry.dialogueEvents.isEmpty() && !hasCoverageProgress)) return@withContext
-        val file = File(videoCacheDir, "$safeKey.cache.json")
-        runCatching { writeTextAtomically(file, cachedTranscriptAdapter.toJson(entry)) }
     }
 
-    suspend fun loadCachedTranscript(canonicalKey: String): CachedVideoTranscript? = withContext(Dispatchers.IO) {
-        val safeKey = canonicalKey.replace(Regex("[^A-Za-z0-9_-]"), "_").take(80)
-        if (safeKey.isBlank()) return@withContext null
-        val file = File(videoCacheDir, "$safeKey.cache.json")
-        if (!file.exists()) return@withContext null
-        runCatching { cachedTranscriptAdapter.fromJson(file.readText()) }.getOrNull()
-    }
-
-    suspend fun loadTranslationCache(): Map<String, String> = withContext(Dispatchers.IO) {
-        if (!translationCacheFile.exists()) return@withContext emptyMap()
-        runCatching { translationCacheAdapter.fromJson(translationCacheFile.readText()) }.getOrNull().orEmpty()
-    }
-
-    suspend fun saveTranslationCache(cache: Map<String, String>) = withContext(Dispatchers.IO) {
-        val trimmed = if (cache.size > 1200) {
-            cache.entries.toList().takeLast(1000).associate { it.key to it.value }
-        } else {
-            cache
+    suspend fun loadTranslationCache(): Map<String, String> = cacheWrites.withLock {
+        withContext(Dispatchers.IO) {
+            if (!AtomicFile(translationCacheFile).existsCompat()) return@withContext emptyMap()
+            runCatching { translationCacheAdapter.fromJson(String(AtomicFile(translationCacheFile).readFully(), Charsets.UTF_8)) }.getOrNull().orEmpty()
         }
-        runCatching { writeTextAtomically(translationCacheFile, translationCacheAdapter.toJson(trimmed)) }
     }
+
+    suspend fun saveTranslationCache(cache: Map<String, String>) = cacheWrites.withLock {
+        withContext(Dispatchers.IO) {
+            val trimmed = if (cache.size > 1200) {
+                cache.entries.toList().takeLast(1000).associate { it.key to it.value }
+            } else {
+                cache
+            }
+            runCatching { writeTextAtomically(translationCacheFile, translationCacheAdapter.toJson(trimmed)) }
+        }
+    }
+
+    private fun AtomicFile.existsCompat(): Boolean = baseFile.exists() || File(baseFile.path + ".bak").exists()
 
     companion object {
+        private fun isUsableProjectId(id: String): Boolean =
+            id.isNotBlank() && id.toByteArray(Charsets.UTF_8).size <= 220 &&
+                id != "." && id != ".." && id.none { it == '/' || it == '\\' || it.isISOControl() }
+
         fun canonicalYouTubeCacheKey(videoId: String, targetLanguage: String): String {
             val cleanId = videoId.replace(Regex("[^0-9A-Za-z_-]"), "")
             val langSlug = targetLanguage.trim().lowercase().replace(Regex("[^a-z0-9]"), "").ifBlank { "en" }
@@ -301,7 +308,7 @@ class ProjectStore(private val context: Context) {
     fun serializeProject(project: DialogueLensProject): String = projectAdapter.toJson(project)
 
     fun deserializeProject(json: String): DialogueLensProject? =
-        runCatching { projectAdapter.fromJson(json) }.getOrNull()
+        runCatching { projectAdapter.fromJson(json) }.getOrNull()?.takeIf { isUsableProjectId(it.id) }
 
     suspend fun writeTextToUri(uri: Uri, content: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {

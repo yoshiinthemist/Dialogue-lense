@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.PixelCopy
+import android.view.SurfaceView
 import android.view.View
 import android.view.Window
 import androidx.compose.ui.geometry.Rect as ComposeRect
@@ -19,27 +20,13 @@ import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.face.FaceLandmark
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.math.roundToInt
-
-data class LiveFaceObservation(
-    val trackingId: Int?,
-    val boundingBox: NormalizedRect,
-    val mouthPoint: NormalizedPoint,
-    val headYawDeg: Float,
-    val capturedAtMs: Long,
-)
-
-data class LiveStageFrameSnapshot(
-    val faces: List<LiveFaceObservation>,
-    val visualCutDetected: Boolean,
-    val cutDistance: Float,
-    val frameLumaAverage: Float,
-    val capturedAtMs: Long,
-    val hasLiveVisionSignal: Boolean = true,
-)
 
 /**
  * High-frequency (~6fps) on-device ML Kit face + mouth landmark tracker with lightweight 8x6
@@ -58,7 +45,13 @@ class LiveStageFaceTracker {
         .setMinFaceSize(0.032f)
         .build()
 
-    private val detector by lazy { FaceDetection.getClient(options) }
+    private val detector = lazy { FaceDetection.getClient(options) }
+    private var closed = false
+
+    fun close() {
+        closed = true
+        if (!captureBusy.get() && detector.isInitialized()) detector.value.close()
+    }
     private val mainHandler = Handler(Looper.getMainLooper())
     private val captureBusy = AtomicBoolean(false)
 
@@ -88,9 +81,11 @@ class LiveStageFaceTracker {
         hostView: View,
         stageBoundsInWindow: ComposeRect,
         videoTimeMs: Long,
+        videoSurface: SurfaceView? = null,
+        overlayBounds: List<NormalizedRect> = emptyList(),
     ): LiveStageFrameSnapshot? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
-        if (!hostView.isAttachedToWindow) return null
+        if (closed || !hostView.isAttachedToWindow) return null
         if (stageBoundsInWindow.width < 48f || stageBoundsInWindow.height < 48f) return null
         if (!captureBusy.compareAndSet(false, true)) return null
 
@@ -105,33 +100,56 @@ class LiveStageFaceTracker {
             )
             if (srcRect.width() < 32 || srcRect.height() < 32) return null
 
+            val surfaceBounds = if (videoSurface != null) {
+                if (videoSurface.width <= 0 || videoSurface.height <= 0) return null
+                val location = IntArray(2)
+                videoSurface.getLocationInWindow(location)
+                val left = (location[0] - srcRect.left).toFloat() / srcRect.width()
+                val top = (location[1] - srcRect.top).toFloat() / srcRect.height()
+                NormalizedRect(left, top, left + videoSurface.width.toFloat() / srcRect.width(),
+                    top + videoSurface.height.toFloat() / srcRect.height())
+            } else NormalizedRect(0f, 0f, 1f, 1f)
             val targetWidth = 640
-            val aspect = srcRect.height().toFloat() / srcRect.width().toFloat().coerceAtLeast(1f)
+            val aspect = if (videoSurface == null) srcRect.height().toFloat() / srcRect.width()
+                else videoSurface.height.toFloat() / videoSurface.width
             val targetHeight = (targetWidth * aspect).roundToInt().coerceIn(180, 540)
             val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
             capturedBitmap = bitmap
 
-            val copySuccess = requestWindowPixelCopy(window, srcRect, bitmap)
+            // The producer can still be writing into the destination when a composable leaves.
+            // Keep the bitmap alive through the callback, even if playback was paused meanwhile.
+            val copySuccess = withContext(NonCancellable) {
+                requestPixelCopy(window, srcRect, videoSurface, bitmap)
+            }
             if (!copySuccess) return null
 
-            val lumaGrid = computeLumaGrid(bitmap)
-            val lumaAverage = if (lumaGrid.isNotEmpty()) lumaGrid.average().toFloat() else 0.5f
+            val masks = if (videoSurface != null) emptyList() else overlayBounds
+            val lumaGrid = computeLumaGrid(bitmap, masks)
+            val lumaAverage = lumaGrid.filter { it.isFinite() }.average().toFloat()
+            if (!lumaAverage.isFinite()) return null
 
-            val faces = detectFacesOnBitmap(bitmap)
+            val faces = withContext(NonCancellable) { detectFacesOnBitmap(bitmap) } ?: return null
             val w = bitmap.width.toFloat().coerceAtLeast(1f)
             val h = bitmap.height.toFloat().coerceAtLeast(1f)
             val nowMs = System.currentTimeMillis()
-            val observations = faces.map { face ->
+            val observations = faces.mapNotNull { face ->
                 val normBox = NormalizedRect(
                     left = (face.boundingBox.left / w).coerceIn(0f, 1f),
                     top = (face.boundingBox.top / h).coerceIn(0f, 1f),
                     right = (face.boundingBox.right / w).coerceIn(0f, 1f),
                     bottom = (face.boundingBox.bottom / h).coerceIn(0f, 1f),
                 )
+                if (masks.any { normBox.intersectionArea(it) > 0.5f * normBox.width * normBox.height }) {
+                    return@mapNotNull null
+                }
+                // A fitted SurfaceView may occupy only part of a portrait or ultrawide stage.
+                fun stageX(x: Float) = (surfaceBounds.left + x * surfaceBounds.width).coerceIn(0f, 1f)
+                fun stageY(y: Float) = (surfaceBounds.top + y * surfaceBounds.height).coerceIn(0f, 1f)
+                val mouth = extractLiveMouthPoint(face, w, h, normBox)
                 LiveFaceObservation(
                     trackingId = face.trackingId,
-                    boundingBox = normBox,
-                    mouthPoint = extractLiveMouthPoint(face, w, h, normBox),
+                    boundingBox = NormalizedRect(stageX(normBox.left), stageY(normBox.top), stageX(normBox.right), stageY(normBox.bottom)),
+                    mouthPoint = NormalizedPoint(stageX(mouth.x), stageY(mouth.y)),
                     headYawDeg = face.headEulerAngleY,
                     capturedAtMs = nowMs.coerceAtLeast(videoTimeMs),
                 )
@@ -162,17 +180,23 @@ class LiveStageFaceTracker {
                 cutDistance = lumaDiff,
                 frameLumaAverage = lumaAverage,
                 capturedAtMs = nowMs.coerceAtLeast(videoTimeMs),
-                hasLiveVisionSignal = true,
+                // Occluded faces and detector failures are not evidence of an empty scene.
+                hasLiveVisionSignal = observations.isNotEmpty() || faces.isEmpty() && masks.none {
+                    it.width * it.height > 0.20f
+                },
             )
-        } catch (_: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
             null
         } finally {
             runCatching { capturedBitmap?.recycle() }
             captureBusy.set(false)
+            if (closed && detector.isInitialized()) detector.value.close()
         }
     }
 
-    private fun computeLumaGrid(bitmap: Bitmap): FloatArray {
+    private fun computeLumaGrid(bitmap: Bitmap, masks: List<NormalizedRect>): FloatArray {
         val cols = 8
         val rows = 6
         val grid = FloatArray(cols * rows)
@@ -192,6 +216,10 @@ class LiveStageFaceTracker {
             val y = (startY + r * cellH + cellH / 2).coerceIn(0, h - 1)
             for (c in 0 until cols) {
                 val x = (startX + c * cellW + cellW / 2).coerceIn(0, w - 1)
+                if (masks.any { x / w.toFloat() in it.left..it.right && y / h.toFloat() in it.top..it.bottom }) {
+                    grid[idx++] = Float.NaN
+                    continue
+                }
                 val px = bitmap.getPixel(x, y)
                 val red = (px shr 16) and 0xFF
                 val green = (px shr 8) and 0xFF
@@ -209,10 +237,14 @@ class LiveStageFaceTracker {
         fun computeGridDistance(a: FloatArray, b: FloatArray): Float {
             if (a.isEmpty() || a.size != b.size) return 0f
             var sum = 0f
+            var comparable = 0
             for (i in a.indices) {
-                sum += kotlin.math.abs(a[i] - b[i])
+                if (a[i].isFinite() && b[i].isFinite()) {
+                    sum += kotlin.math.abs(a[i] - b[i])
+                    comparable++
+                }
             }
-            return sum / a.size
+            return if (comparable >= (a.size + 1) / 2) sum / comparable else 0f
         }
 
         fun detectFaceLayoutCut(
@@ -234,9 +266,10 @@ class LiveStageFaceTracker {
         }
     }
 
-    private suspend fun requestWindowPixelCopy(
+    private suspend fun requestPixelCopy(
         window: Window,
         srcRect: Rect,
+        videoSurface: SurfaceView?,
         dest: Bitmap,
     ): Boolean = suspendCancellableCoroutine { cont ->
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
@@ -244,31 +277,28 @@ class LiveStageFaceTracker {
             return@suspendCancellableCoroutine
         }
         try {
-            PixelCopy.request(
-                window,
-                srcRect,
-                dest,
-                { copyResult ->
-                    if (cont.isActive) {
-                        cont.resume(copyResult == PixelCopy.SUCCESS)
-                    }
-                },
-                mainHandler,
-            )
+            val listener = PixelCopy.OnPixelCopyFinishedListener { result ->
+                if (cont.isActive) cont.resume(result == PixelCopy.SUCCESS)
+            }
+            if (videoSurface != null) {
+                PixelCopy.request(videoSurface, dest, listener, mainHandler)
+            } else {
+                PixelCopy.request(window, srcRect, dest, listener, mainHandler)
+            }
         } catch (_: Throwable) {
             if (cont.isActive) cont.resume(false)
         }
     }
 
-    private suspend fun detectFacesOnBitmap(bitmap: Bitmap): List<Face> =
+    private suspend fun detectFacesOnBitmap(bitmap: Bitmap): List<Face>? =
         suspendCancellableCoroutine { cont ->
             val input = InputImage.fromBitmap(bitmap, 0)
-            detector.process(input)
+            detector.value.process(input)
                 .addOnSuccessListener { faces ->
                     if (cont.isActive) cont.resume(faces)
                 }
                 .addOnFailureListener {
-                    if (cont.isActive) cont.resume(emptyList())
+                    if (cont.isActive) cont.resume(null)
                 }
         }
 
@@ -289,7 +319,7 @@ class LiveStageFaceTracker {
         }
         val yawShift = (face.headEulerAngleY / 90f).coerceIn(-0.28f, 0.28f) * normBox.width
         return NormalizedPoint(
-            x = (normBox.centerX + yawShift).coerceIn(normBox.left + 0.01f, normBox.right - 0.01f),
+            x = (normBox.centerX + yawShift).coerceIn(normBox.left, normBox.right),
             y = (normBox.top + normBox.height * 0.72f).coerceIn(normBox.top, normBox.bottom),
         )
     }

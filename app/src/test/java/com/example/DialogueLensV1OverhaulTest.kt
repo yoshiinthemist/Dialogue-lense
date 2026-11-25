@@ -308,7 +308,7 @@ class DialogueLensV1OverhaulTest {
             status = HealBeaconStatus.HEALING,
             scope = HealScope.ADAPTIVE,
         )
-        val withBeacon = baseProject.copy(healBeacons = listOf(beacon))
+        val withBeacon = baseProject.copy(healBeacons = listOf(beacon), subtitleSource = SubtitleSourceKind.AI_DRAFT)
 
         val repairedCue = sampleEvent("repaired", 29_100L, 32_200L, "Crystal clear repaired line", "spk_a")
         val outcome = HealBeaconEngine.applyValidatedLocalizedRepair(
@@ -324,7 +324,7 @@ class DialogueLensV1OverhaulTest {
         assertTrue(updatedEvents.any { it.id == "after" })
         assertTrue("User-locked edit inside Heal window must be preserved", updatedEvents.any { it.id == "locked" })
         assertTrue(updatedEvents.any { it.sourceText == "Crystal clear repaired line" })
-        assertFalse(updatedEvents.any { it.id == "broken" })
+        assertEquals("broken", updatedEvents.single { it.sourceText == "Crystal clear repaired line" }.id)
 
         val updatedBeacon = outcome.updatedProject.healBeacons.first { it.id == "hb_1" }
         assertEquals(HealBeaconStatus.HEALED, updatedBeacon.status)
@@ -363,6 +363,98 @@ class DialogueLensV1OverhaulTest {
     }
 
     @Test
+    fun sparseRepairKeepsUnmentionedCuesAndUndoPreservesANewerEdit() {
+        val first = sampleEvent("a", 20_000, 23_000, "One", "spk_a")
+        val second = sampleEvent("b", 23_500, 26_000, "Two", "spk_b")
+        val beacon = HealBeacon("mark", 23_000, 10_000, 35_000, HealBeaconStatus.HEALING)
+        val base = sampleProject(events = listOf(first, second), beacons = listOf(beacon))
+            .copy(subtitleSource = SubtitleSourceKind.AI_DRAFT)
+        val repaired = HealBeaconEngine.applyValidatedLocalizedRepair(base, beacon.id,
+            listOf(first.copy(id = "fresh", sourceText = "First", translatedText = "First"))).updatedProject
+        assertEquals(listOf("a", "b"), repaired.dialogueEvents.map { it.id })
+        assertEquals(second, repaired.dialogueEvents.last())
+        val edit = repaired.dialogueEvents.first().copy(translatedText = "My later edit")
+        val undone = HealBeaconEngine.undoBeaconRepair(repaired.copy(dialogueEvents = listOf(edit, second)), beacon.id)
+        assertEquals(listOf(edit, second), undone.dialogueEvents)
+        assertEquals(HealBeaconStatus.UNDONE, undone.healBeacons.single().status)
+        assertEquals(undone, HealBeaconEngine.restoreInterruptedBeacons(undone))
+    }
+
+    @Test
+    fun authoritativeTextAndBoundaryStraddlingLinesSurviveModelChanges() {
+        val first = sampleEvent("a", 20_000, 23_000, "Attached line", "spk_a")
+        val acrossEnd = sampleEvent("b", 24_000, 28_000, "On the edge", "spk_b")
+        val beacon = HealBeacon("mark", 23_000, 10_000, 25_000, HealBeaconStatus.HEALING)
+        val base = sampleProject(events = listOf(first, acrossEnd), beacons = listOf(beacon))
+        val proposed = first.copy(id = "other", translatedText = "AI guess")
+        assertEquals(base.dialogueEvents, HealBeaconEngine.applyValidatedLocalizedRepair(base, beacon.id,
+            listOf(proposed, acrossEnd.copy(translatedText = "Changed"))).updatedProject.dialogueEvents)
+        assertEquals(base.dialogueEvents, HealBeaconEngine.applyValidatedLocalizedRepair(base, beacon.id,
+            emptyList(), silenceExplicitlyConfirmed = true).updatedProject.dialogueEvents)
+    }
+
+    @Test
+    fun chapterPatrolInspectsAheadUsingVerifiedEvidenceWithoutAManualMark() {
+        val chapters = listOf(VideoChapter("intro","Intro",0,30_000), VideoChapter("ch2","Interview",30_000,60_000))
+        val cue = sampleEvent("a", 29_000, 33_000, "Hello", "spk_a", anchor = NormalizedPoint(1.4f, 0.5f))
+        val project = sampleProject(chapters = chapters, events = listOf(cue))
+        assertNull(com.example.domain.analysis.ChapterPatrol.nextInspection(project, emptyList(), 0))
+        val span = com.example.data.model.CoverageInterval(0, 60_000, com.example.data.model.CoverageStatus.VERIFIED_DIALOGUE)
+        val result = requireNotNull(com.example.domain.analysis.ChapterPatrol.nextInspection(project, listOf(span), 0))
+        assertEquals(20_000L, result.window.startMs)
+        assertEquals(45_000L, result.window.endMs)
+        assertTrue(result.inspection.finding.contains("pointer"))
+        val inspected = project.copy(chapterInspections = listOf(result.inspection))
+        assertNull(com.example.domain.analysis.ChapterPatrol.nextInspection(inspected, listOf(span), 0))
+    }
+
+    @Test
+    fun rollbackRestoresOnlyEvidenceOwnedByTheRepair() {
+        val ledger = com.example.domain.analysis.TranscriptCoverageLedger()
+        val verified = com.example.data.model.CoverageStatus.VERIFIED_DIALOGUE
+        val pending = com.example.data.model.CoverageStatus.PENDING
+        ledger.reset(30_000)
+        val originals = ledger.recordRepairEvidence(listOf(com.example.data.model.CoverageInterval(10_000, 20_000, verified)), "attempt")
+        ledger.recordOutcome(12_000, 16_000, verified)
+        ledger.undoRepairEvidence(originals, "attempt")
+        assertEquals(pending, ledger.intervalsSnapshot().single { 11_000L in it.startMs until it.endMs }.status)
+        assertEquals(verified, ledger.intervalsSnapshot().single { 14_000L in it.startMs until it.endMs }.status)
+    }
+
+    @Test
+    fun scoutSkipsOnlyTheReservedPartOfAGap() {
+        val ledger = com.example.domain.analysis.TranscriptCoverageLedger()
+        ledger.reset(60_000)
+        assertTrue(ledger.tryReserveRepair("first", 10_000, 20_000))
+        assertFalse(ledger.tryReserveRepair("second", 15_000, 25_000))
+        assertEquals(10_000L, ledger.nextPriorityInterval(0)?.endMs)
+        ledger.releaseRepair("first")
+        assertTrue((ledger.nextPriorityInterval(0)?.endMs ?: 0L) > 10_000)
+    }
+
+    @Test
+    fun newMarkQueuesOnlyTheUncoveredPartOfAnActiveRepair() {
+        val running = HealBeacon("active", 30_000, 20_000, 45_000, HealBeaconStatus.HEALING)
+        val project = sampleProject(beacons = listOf(running))
+        val (updated, added) = HealBeaconEngine.placeOrMergeBeacon(project, 44_000, HealScope.QUICK)
+        assertEquals(running, updated.healBeacons.first { it.id == running.id })
+        assertEquals(45_000L, added.windowStartMs)
+        assertEquals(52_000L, added.windowEndMs)
+    }
+
+    @Test
+    fun silenceAndClockTimeAloneDoNotInventChaptersInAnUnanalyzedVideo() {
+        val cues = (0..3).map { index ->
+            sampleEvent("line$index", index * 50_000L, index * 50_000L + 2_000L, "Hi", "spk_a")
+        }
+        val project = sampleProject(durationMs = 500_000L, events = cues).copy(subtitleSource = SubtitleSourceKind.AI_DRAFT)
+        assertTrue(com.example.domain.analysis.ChapterPatrol.resolveChapters(project, emptyList()).isEmpty())
+        assertTrue(HierarchicalContextEngine.inferEditorialChapters(cues.mapIndexed { i, cue ->
+            cue.copy(startTimeMs = i * 2_000L, endTimeMs = i * 2_000L + 2_000L)
+        }, 500_000L).isEmpty())
+    }
+
+    @Test
     fun interruptedHealingBeaconsRestoreToMarkedOnReload() {
         val project = sampleProject(
             beacons = listOf(
@@ -380,7 +472,7 @@ class DialogueLensV1OverhaulTest {
     // -------------------------------------------------------------------------
 
     @Test
-    fun autoSelfHealConsolidatesDuplicateSpeakersAndSanitizesBadCoordinates() {
+    fun localAnchorRepairPreservesDistinctSpeakersWithMatchingNames() {
         val dup1 = Speaker("spk_a", "Speaker A", customName = "Alice", accentIndex = 0, isLocked = true)
         val dup2 = Speaker("spk_b", "Speaker B", customName = "alice", accentIndex = 1, isIdentityConfirmed = false)
         val badEvent = sampleEvent(
@@ -393,11 +485,8 @@ class DialogueLensV1OverhaulTest {
         )
         val project = sampleProject(speakers = listOf(dup1, dup2), events = listOf(badEvent))
 
-        val consolidated = AutoSelfHealDetector.consolidateDuplicateSpeakers(project)
-        assertEquals(1, consolidated.speakers.size)
-        assertEquals("spk_a", consolidated.dialogueEvents.first().speakerId)
-
-        val sanitizedEvents = AutoSelfHealDetector.sanitizeCorruptedAnchors(consolidated.dialogueEvents)
+        val sanitizedEvents = AutoSelfHealDetector.sanitizeCorruptedAnchors(project.dialogueEvents)
+        assertEquals("spk_b", sanitizedEvents.single().speakerId)
         assertNull("Invalid NaN anchor must be cleared", sanitizedEvents.first().anchorPosition)
     }
 

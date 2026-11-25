@@ -73,6 +73,7 @@ suspend fun awaitWarmAppCheckToken(
         } ?: Result.failure(IllegalStateException("App Check token warm-up timed out"))
     }
 
+    if (AppCheckDiagnostics.providerLabel == "Unavailable") return false
     val first = fetchOnce(forceRefresh)
     if (first.isSuccess) {
         AppCheckDiagnostics.detail = "Token verified"
@@ -90,14 +91,19 @@ suspend fun awaitWarmAppCheckToken(
         return true
     }
 
+    AppCheckDiagnostics.isHealthy = false
+    AppCheckDiagnostics.detail = "Token verification failed"
     Log.w(TAG, "App Check warm-up retry failed: ${second.exceptionOrNull()?.localizedMessage}")
     return false
 }
 
 fun configureAppCheck(context: Context, intent: Intent?) {
     try {
-        if (FirebaseApp.getApps(context).isEmpty()) {
-            FirebaseApp.initializeApp(context)
+        if (FirebaseApp.getApps(context).isEmpty() && FirebaseApp.initializeApp(context) == null) {
+            AppCheckDiagnostics.providerLabel = "Unavailable"
+            AppCheckDiagnostics.detail = "Cloud dialogue is not configured for this build."
+            AppCheckDiagnostics.isHealthy = false
+            return
         }
 
         if (BuildConfig.DEBUG) {
@@ -123,7 +129,7 @@ fun configureAppCheck(context: Context, intent: Intent?) {
                 DebugAppCheckProviderFactory.getInstance()
             )
             AppCheckDiagnostics.providerLabel = "Debug App Check"
-            AppCheckDiagnostics.isHealthy = true
+            AppCheckDiagnostics.isHealthy = false
             Log.d(TAG, "DebugAppCheckProviderFactory installed.")
         } else {
             val resId = context.resources.getIdentifier(
@@ -138,7 +144,7 @@ fun configureAppCheck(context: Context, intent: Intent?) {
                 )
                 AppCheckDiagnostics.providerLabel = "reCAPTCHA Enterprise"
                 AppCheckDiagnostics.detail = "Release provider active"
-                AppCheckDiagnostics.isHealthy = true
+                AppCheckDiagnostics.isHealthy = false
                 Log.d(TAG, "RecaptchaAppCheckProviderFactory installed.")
             } else {
                 // Google Play Store release builds use Play Integrity automatically without needing a manual key.
@@ -147,7 +153,7 @@ fun configureAppCheck(context: Context, intent: Intent?) {
                 )
                 AppCheckDiagnostics.providerLabel = "Play Integrity"
                 AppCheckDiagnostics.detail = "Release provider active"
-                AppCheckDiagnostics.isHealthy = true
+                AppCheckDiagnostics.isHealthy = false
                 Log.d(TAG, "PlayIntegrityAppCheckProviderFactory installed for release build.")
             }
         }

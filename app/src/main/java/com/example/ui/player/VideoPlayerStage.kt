@@ -1,9 +1,11 @@
 package com.example.ui.player
 
+import com.example.domain.analysis.MediaTransport
+import com.example.domain.analysis.ViewerTransportSample
+
 import androidx.annotation.OptIn
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
@@ -60,6 +62,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.key
 import androidx.compose.runtime.LaunchedEffect
@@ -73,13 +77,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import android.view.SurfaceView
+import androidx.compose.ui.unit.IntSize
+import com.example.domain.layout.MeasuredBalloonLayout
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -170,13 +176,14 @@ fun VideoPlayerStage(
     onSwitchToZeroCloudMode: () -> Unit = {},
     displayMode: CaptionDisplayMode,
     placedBalloons: List<PlacedBalloon>,
-    liveFaceExclusionRects: List<NormalizedRect> = emptyList(),
     scoutCompletedWindows: Int = 0,
     scoutTotalWindows: Int = 0,
     onLiveFacesDetected: (Long, List<LiveFaceObservation>) -> Unit = { _, _ -> },
     isEditMode: Boolean,
     selectedEventId: String?,
     onTogglePlayPause: () -> Unit,
+    onStageTap: () -> Unit = onTogglePlayPause,
+    onViewerTransport: ((ViewerTransportSample) -> Unit)? = null,
     onYouTubePlaybackState: (Long, Long, Boolean) -> Unit,
     onYouTubeCaptionTrackStatus: (Int, String) -> Unit = { _, _ -> },
     onYouTubeEmbedFallback: (Int) -> Unit = {},
@@ -194,7 +201,7 @@ fun VideoPlayerStage(
     onScoutWebStreamPlaybackState: (Long, Long, Boolean) -> Unit = { _, _, _ -> },
     onScoutWebStreamDirectMediaUrl: (String) -> Unit = {},
     onWebStreamSniffedMediaStream: (SniffedWebMediaStream) -> Unit = {},
-    onScoutWebStreamAudioSlice: (Long, String, String) -> Unit = { _, _, _ -> },
+    onScoutWebStreamAudioSlice: (Long, Long, String, String) -> Unit = { _, _, _, _ -> },
     onTapBalloon: (String) -> Unit,
     onTapFaceTrack: (String) -> Unit,
     onDragBalloonAnchor: (String, NormalizedPoint) -> Unit,
@@ -207,6 +214,7 @@ fun VideoPlayerStage(
     onQuickEditDialogue: ((String) -> Unit)? = null,
     onQuickHealMoment: (() -> Unit)? = null,
     onLiveFrameSnapshot: ((Long, LiveStageFrameSnapshot) -> Unit)? = null,
+    playbackGeneration: Int = 0,
     onDismissQuickPicker: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -218,37 +226,9 @@ fun VideoPlayerStage(
     val isCinemaSubtle = project.styleSettings.visualStyle == BubbleVisualStyle.CINEMA_SUBTLE &&
         !project.styleSettings.highContrastMode
 
-    val activeShotIndex = project.shots.indexOfFirst { currentTimeMs in it.startMs..it.endMs }
+    val activeShotIndex = project.shots.indexOfLast { currentTimeMs in it.startMs..it.endMs }
         .let { if (it >= 0) it else 0 }
     val activeShot = project.shots.getOrNull(activeShotIndex)
-
-    // Subtle panel/cut transition beat on shot cuts
-    val cellBeat = remember { Animatable(1f) }
-    var prevShotId by remember { mutableStateOf(activeShot?.id) }
-    LaunchedEffect(activeShot?.id, project.styleSettings.reducedMotion, isMangaCell, isCinemaSubtle) {
-        val currId = activeShot?.id
-        if (currId != null && currId != prevShotId) {
-            prevShotId = currId
-            if ((isMangaCell || isCinemaSubtle) && !project.styleSettings.reducedMotion) {
-                cellBeat.snapTo(0f)
-                cellBeat.animateTo(1f, animationSpec = tween(durationMillis = if (isMangaCell) 180 else 130))
-            } else {
-                cellBeat.snapTo(1f)
-            }
-        }
-    }
-
-    val panelScale = if ((isMangaCell || isCinemaSubtle) && !project.styleSettings.reducedMotion) {
-        val amp = if (isMangaCell) 0.014f else 0.006f
-        (1f - amp) + amp * cellBeat.value
-    } else {
-        1f
-    }
-    val cutFlashAlpha = if (isMangaCell && !project.styleSettings.reducedMotion) {
-        (1f - cellBeat.value) * 0.24f
-    } else {
-        0f
-    }
 
     Box(
         modifier = modifier
@@ -257,22 +237,19 @@ fun VideoPlayerStage(
             .padding(if (isMangaCell) 5.dp else 0.dp),
         contentAlignment = Alignment.Center,
     ) {
-        val isWebViewStage = project.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT ||
-            project.videoSource.kind == VideoSourceKind.WEB_STREAM
-
         val density = LocalDensity.current
         val hostView = LocalView.current
-        val liveFaceTracker = remember { LiveStageFaceTracker() }
+        val liveFaceTracker = remember(project.id) { LiveStageFaceTracker() }
+        DisposableEffect(liveFaceTracker) { onDispose { liveFaceTracker.close() } }
+        var localSurface by remember(project.id) { mutableStateOf<SurfaceView?>(null) }
+        var captureMasks by remember(project.id) { mutableStateOf(emptyList<NormalizedRect>()) }
         var stageBoundsInWindow by remember { mutableStateOf(Rect.Zero) }
         val latestTimeMs by rememberUpdatedState(currentTimeMs)
         val latestOnLiveFaces by rememberUpdatedState(onLiveFacesDetected)
         val latestOnLiveSnapshot by rememberUpdatedState(onLiveFrameSnapshot)
 
-        LaunchedEffect(project.id) {
+        LaunchedEffect(project.id, playbackGeneration, isPlaying, displayMode, isCinemaIntroActive, isEditMode, project.videoSource.kind) {
             liveFaceTracker.resetSceneHistory()
-        }
-
-        LaunchedEffect(project.id, isPlaying, displayMode, isCinemaIntroActive, isEditMode, project.videoSource.kind) {
             if (!isPlaying ||
                 displayMode == CaptionDisplayMode.OFF ||
                 isCinemaIntroActive ||
@@ -288,11 +265,13 @@ fun VideoPlayerStage(
                         hostView = hostView,
                         stageBoundsInWindow = stageBoundsInWindow,
                         videoTimeMs = sampleTime,
+                        videoSurface = localSurface,
+                        overlayBounds = captureMasks,
                     )
                     if (snapshot != null) {
                         val snapHandler = latestOnLiveSnapshot
                         if (snapHandler != null) {
-                            snapHandler(sampleTime, snapshot)
+                            snapHandler(sampleTime, snapshot.copy(projectId = project.id, playbackGeneration = playbackGeneration))
                         } else {
                             latestOnLiveFaces(sampleTime, snapshot.faces)
                         }
@@ -310,16 +289,6 @@ fun VideoPlayerStage(
                     stageBoundsInWindow = coords.boundsInWindow()
                 }
                 .then(
-                    if (!isWebViewStage && panelScale != 1f) {
-                        Modifier.graphicsLayer {
-                            scaleX = panelScale
-                            scaleY = panelScale
-                        }
-                    } else {
-                        Modifier
-                    }
-                )
-                .then(
                     when {
                         isMangaCell -> Modifier
                             .border(2.5.dp, MangaPagePaper, RoundedCornerShape(2.dp))
@@ -335,7 +304,7 @@ fun VideoPlayerStage(
                         project.videoSource.kind != VideoSourceKind.YOUTUBE_COMPLIANT &&
                         project.videoSource.kind != VideoSourceKind.WEB_STREAM
                     ) {
-                        Modifier.clickable(onClick = onTogglePlayPause)
+                        Modifier.clickable(onClickLabel = "Show or hide controls", onClick = onStageTap)
                     } else {
                         Modifier
                     }
@@ -353,6 +322,7 @@ fun VideoPlayerStage(
                             PlayerView(ctx).apply {
                                 player = exoPlayer
                                 useController = false
+                                localSurface = videoSurfaceView as? SurfaceView
                                 resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                             }
                         },
@@ -389,6 +359,7 @@ fun VideoPlayerStage(
                         playRequest = streamPlayRequest,
                         seekRequest = youtubeSeekRequest,
                         onPlaybackState = onYouTubePlaybackState,
+                        onViewerTransport = onViewerTransport,
                         // Softly hide YouTube's default track ONLY when DialogueLens bubbles are loaded AND turned ON;
                         // when bubbles are absent or OFF, leave YouTube's native CC completely unblocked.
                         suppressNativeCaptions = hasRealSubtitles && displayMode != CaptionDisplayMode.OFF,
@@ -407,6 +378,7 @@ fun VideoPlayerStage(
                         playRequest = streamPlayRequest,
                         seekRequest = youtubeSeekRequest,
                         onPlaybackState = onWebStreamPlaybackState,
+                        onViewerTransport = onViewerTransport,
                         onCapturedCaptions = onWebStreamCapturedCaptions,
                         isolateVideoInViewport = true,
                         onDirectMediaUrl = onScoutWebStreamDirectMediaUrl,
@@ -463,15 +435,6 @@ fun VideoPlayerStage(
                         )
                     }
                 }
-            }
-
-            // Brief panel-cut paper flash on shot transition
-            if (cutFlashAlpha > 0.01f) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(MangaPagePaper.copy(alpha = cutFlashAlpha))
-                )
             }
 
             // Deaf-First Cinema: Off-Screen Directional Edge Glow (peripheral cue tinted in off-screen speaker's hue)
@@ -788,117 +751,78 @@ fun VideoPlayerStage(
             }
 
             // 3. Independent Decoupled Spatial Balloon Overlay Layer & Obstacle-Aware Spatial SFX Notes
-            val activeShotId = activeShot?.id
-            val lipSafe = project.styleSettings.lipReadingSafeZone
-            val activeFaceExclusions = remember(project.faceTracks, liveFaceExclusionRects, activeShotId, currentTimeMs, lipSafe, placedBalloons) {
-                val trackBoxes = project.faceTracks
-                    .filter { it.shotId == activeShotId }
-                    .mapNotNull { track ->
-                        track.sampleAt(currentTimeMs)?.boundingBox?.let { raw ->
-                            val expanded = raw.expand(0.042f, 0.036f)
-                            if (lipSafe) {
-                                expanded.copy(
-                                    bottom = (raw.bottom + raw.height * 0.45f).coerceAtMost(1f)
-                                )
-                            } else {
-                                expanded
-                            }
-                        }
-                    }
-                val avoidRects = placedBalloons
-                    .flatMap { it.event.avoidBoxes }
-                    .map { it.expand(0.015f, 0.015f) }
-                val baseFaces = when {
-                    liveFaceExclusionRects.isNotEmpty() -> liveFaceExclusionRects + trackBoxes
-                    trackBoxes.isNotEmpty() -> trackBoxes
-                    else -> placedBalloons
-                        .filter { it.event.dialogueType == DialogueType.SPOKEN && it.event.anchorPosition != null }
-                        .map { b ->
-                            val pt = b.event.anchorPosition!!
-                            val cx = pt.x.coerceIn(0.12f, 0.88f)
-                            val cy = pt.y.coerceIn(0.16f, 0.72f)
-                            com.example.data.model.NormalizedRect(
-                                left = (cx - 0.145f).coerceAtLeast(0.01f),
-                                top = (cy - 0.21f).coerceAtLeast(0.01f),
-                                right = (cx + 0.145f).coerceAtMost(0.99f),
-                                bottom = (cy + 0.13f).coerceAtMost(0.95f),
-                            )
-                        }
+            val activeFaceExclusions = remember(placedBalloons) {
+                val observed = placedBalloons.firstOrNull()?.faceExclusions.orEmpty()
+                val authored = placedBalloons.flatMap { it.event.avoidBoxes }
+                val anchored = if (observed.isEmpty()) placedBalloons.mapNotNull { balloon ->
+                    val pt = balloon.event.anchorPosition
+                    if (balloon.tailTarget != null && pt != null &&
+                        balloon.event.placementMode != com.example.data.model.PlacementMode.MANUAL_OVERRIDE) {
+                        NormalizedRect(pt.x, pt.y, pt.x, pt.y).expand(0.14f, 0.14f)
+                    } else null
+                } else emptyList()
+                observed + authored + anchored
+            }
+            val coordinator = remember(project.id, playbackGeneration, widthPx, heightPx) { MeasuredBalloonLayout() }
+            val sizes = remember(project.id) { mutableStateMapOf<String, IntSize>() }
+            val visibleBodies = remember(placedBalloons, displayMode) {
+                placedBalloons.filter {
+                    displayMode == CaptionDisplayMode.BALLOONS ||
+                        (displayMode == CaptionDisplayMode.BOTH && it.event.dialogueType != DialogueType.SOUND_DESCRIPTION)
                 }
-                baseFaces + avoidRects
             }
-            val measuredBubbleBounds = remember { mutableStateMapOf<String, Rect>() }
-            val measuredSfxBounds = remember { mutableStateMapOf<String, Rect>() }
-            val activeNonSfxIds = remember(placedBalloons) {
-                placedBalloons
-                    .filter { it.event.dialogueType != DialogueType.SOUND_DESCRIPTION }
-                    .map { it.event.id }
-                    .toSet()
+            val measured = sizes.toMap()
+            val safeWidth = widthPx.coerceAtLeast(1f)
+            val safeHeight = heightPx.coerceAtLeast(1f)
+            val obstacles = activeFaceExclusions + project.textExclusionZones + activeShot?.focalExclusionZones.orEmpty()
+            val positions = remember(coordinator, visibleBodies, measured, obstacles, density) {
+                coordinator.place(
+                    proposals = visibleBodies,
+                    sizes = measured.mapValues { NormalizedPoint(it.value.width / safeWidth, it.value.height / safeHeight) },
+                    obstacles = obstacles,
+                    marginX = with(density) { 10.dp.toPx() } / safeWidth,
+                    marginY = with(density) { 8.dp.toPx() } / safeHeight,
+                )
             }
-            val activeSfxIds = remember(placedBalloons) {
-                placedBalloons
-                    .filter { it.event.dialogueType == DialogueType.SOUND_DESCRIPTION }
-                    .map { it.event.id }
-                    .toSet()
+            val visibleIds = remember(visibleBodies) { visibleBodies.mapTo(mutableSetOf()) { it.event.id } }
+            LaunchedEffect(visibleIds) { sizes.keys.toList().filterNot(visibleIds::contains).forEach { sizes.remove(it) } }
+            SideEffect {
+                val classic = displayMode == CaptionDisplayMode.CLASSIC || displayMode == CaptionDisplayMode.BOTH
+                captureMasks = positions.values.toList() + if (classic && placedBalloons.isNotEmpty())
+                    listOf(NormalizedRect(0f, 0.72f, 1f, 1f)) else emptyList()
             }
-            LaunchedEffect(activeNonSfxIds, activeSfxIds) {
-                val staleBubbles = measuredBubbleBounds.keys.filter { it !in activeNonSfxIds }
-                staleBubbles.forEach { measuredBubbleBounds.remove(it) }
-                val staleSfx = measuredSfxBounds.keys.filter { it !in activeSfxIds }
-                staleSfx.forEach { measuredSfxBounds.remove(it) }
-            }
-
-            if (displayMode == CaptionDisplayMode.BALLOONS || displayMode == CaptionDisplayMode.BOTH) {
-                val nonSfxBalloons = placedBalloons
-                    .filter { it.event.dialogueType != DialogueType.SOUND_DESCRIPTION }
-                nonSfxBalloons.forEachIndexed { idx, placed ->
-                    val priorBubbleRects = nonSfxBalloons
-                        .take(idx)
-                        .mapNotNull { measuredBubbleBounds[it.event.id] }
-                    key(project.id, placed.event.id) {
-                    SpeechBalloonView(
-                        placed = placed,
-                        translationMode = project.translationMode,
-                        style = project.styleSettings,
-                        isEditMode = isEditMode,
-                        isSelected = placed.event.id == selectedEventId,
-                        containerWidthPx = widthPx,
-                        containerHeightPx = heightPx,
-                        faceExclusionRects = activeFaceExclusions,
-                        occupiedBubbleRects = priorBubbleRects,
-                        onPixelBoundsResolved = { rect ->
-                            measuredBubbleBounds[placed.event.id] = rect
-                        },
-                        onClick = { onTapBalloon(placed.event.id) },
-                        onDragCommit = { newCenter -> onDragBalloonAnchor(placed.event.id, newCenter) },
-                    )
+            visibleBodies.forEach { placed ->
+                val id = placed.event.id
+                key(project.id, id) {
+                    if (placed.event.dialogueType == DialogueType.SOUND_DESCRIPTION) {
+                        SpatialSfxNoteView(
+                            placed = placed,
+                            translationMode = project.translationMode,
+                            style = project.styleSettings,
+                            containerWidthPx = widthPx,
+                            containerHeightPx = heightPx,
+                            committedRect = positions[id],
+                            onMeasure = { sizes[id] = it },
+                            onTap = { onTapBalloon(id) },
+                        )
+                    } else {
+                        SpeechBalloonView(
+                            placed = placed,
+                            translationMode = project.translationMode,
+                            style = project.styleSettings,
+                            isEditMode = isEditMode,
+                            isSelected = id == selectedEventId,
+                            containerWidthPx = widthPx,
+                            containerHeightPx = heightPx,
+                            committedRect = positions[id],
+                            onMeasure = { sizes[id] = it },
+                            onClick = { onTapBalloon(id) },
+                            onDragCommit = { onDragBalloonAnchor(id, it) },
+                        )
                     }
                 }
             }
-
-            // 4. SFX Spatial Notes (in BALLOONS mode: dynamically dodge sketch bubbles & faces) or Classic Subtitle Bar
-            if (displayMode == CaptionDisplayMode.BALLOONS) {
-                val bubbleObstacles = activeNonSfxIds.mapNotNull { measuredBubbleBounds[it] }
-                val sfxList = placedBalloons.filter { it.event.dialogueType == DialogueType.SOUND_DESCRIPTION }
-                sfxList.forEachIndexed { idx, sfxPlaced ->
-                    val priorSfxObstacles = sfxList.take(idx).mapNotNull { measuredSfxBounds[it.event.id] }
-                    key(project.id, sfxPlaced.event.id) {
-                    SpatialSfxNoteView(
-                        placed = sfxPlaced,
-                        translationMode = project.translationMode,
-                        style = project.styleSettings,
-                        containerWidthPx = widthPx,
-                        containerHeightPx = heightPx,
-                        faceExclusionRects = activeFaceExclusions,
-                        occupiedBubbleRects = bubbleObstacles + priorSfxObstacles,
-                        onPixelBoundsResolved = { rect ->
-                            measuredSfxBounds[sfxPlaced.event.id] = rect
-                        },
-                        onTap = { onTapBalloon(sfxPlaced.event.id) },
-                    )
-                    }
-                }
-            } else if (displayMode == CaptionDisplayMode.CLASSIC || displayMode == CaptionDisplayMode.BOTH) {
+            if (displayMode == CaptionDisplayMode.CLASSIC || displayMode == CaptionDisplayMode.BOTH) {
                 ClassicSubtitleBar(
                     placedBalloons = placedBalloons,
                     translationMode = project.translationMode,
@@ -910,7 +834,6 @@ fun VideoPlayerStage(
 
             // 5. Real Lookahead Scout Status & Web Stream Scout Instance
             if (dualInstanceEnabled && project.videoSource.kind != VideoSourceKind.DEMO_SCENARIO) {
-                val leadSec = ((maxOf(scoutTimeMs, scoutedUpToMs) - currentTimeMs).coerceAtLeast(0L) / 1000.0)
                 val showPip = showScoutMonitorPip && !isEditMode
                 Column(
                     modifier = Modifier
@@ -919,188 +842,6 @@ fun VideoPlayerStage(
                     horizontalAlignment = Alignment.Start,
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    if (!isEditMode) {
-                        if (project.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT) {
-                            // LiveScoutTelemetryStrip beneath the video stage shows ongoing Scout status cleanly
-                            // outside the video frame; only render an in-frame card for blocking errors when no
-                            // speech bubbles are on screen so HUD badges never collide with top captions.
-                            when (val cap = scoutCaptionState) {
-                                is ScoutCaptionState.FetchingCaptions,
-                                is ScoutCaptionState.AiTranscribing,
-                                is ScoutCaptionState.Ready,
-                                ScoutCaptionState.Idle -> Unit
-                                is ScoutCaptionState.Error -> {
-                                    if (placedBalloons.isEmpty()) {
-                                    Surface(
-                                        color = CinemaObsidian.copy(alpha = 0.90f),
-                                        shape = RoundedCornerShape(14.dp),
-                                        border = BorderStroke(1.dp, LensAmber.copy(alpha = 0.72f)),
-                                        modifier = Modifier.testTag("scout_error_recovery_card"),
-                                    ) {
-                                        Column(
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                            horizontalAlignment = Alignment.End,
-                                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                                        ) {
-                                            Row(
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Filled.WarningAmber,
-                                                    contentDescription = "Transcript notice",
-                                                    tint = LensAmber,
-                                                    modifier = Modifier.size(13.dp),
-                                                )
-                                                Text(
-                                                    text = cap.message.take(54),
-                                                    style = MaterialTheme.typography.labelSmall.copy(
-                                                        fontSize = 10.sp,
-                                                        fontWeight = FontWeight.Medium,
-                                                    ),
-                                                    color = Color.White,
-                                                    maxLines = 1,
-                                                )
-                                            }
-                                            Row(
-                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                                verticalAlignment = Alignment.CenterVertically,
-                                            ) {
-                                                Surface(
-                                                    color = LensMint.copy(alpha = 0.20f),
-                                                    shape = RoundedCornerShape(10.dp),
-                                                    border = BorderStroke(1.dp, LensMint.copy(alpha = 0.65f)),
-                                                    onClick = onSwitchToZeroCloudMode,
-                                                    modifier = Modifier
-                                                        .minimumInteractiveComponentSize()
-                                                        .testTag("scout_free_local_mode_button"),
-                                                ) {
-                                                    Row(
-                                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                                        verticalAlignment = Alignment.CenterVertically,
-                                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                                    ) {
-                                                        Icon(
-                                                            imageVector = Icons.Filled.CheckCircle,
-                                                            contentDescription = "Switch to free local mode",
-                                                            tint = LensMint,
-                                                            modifier = Modifier.size(12.dp),
-                                                        )
-                                                        Text(
-                                                            text = "Free CC / Local",
-                                                            style = MaterialTheme.typography.labelSmall.copy(
-                                                                fontSize = 10.sp,
-                                                                fontWeight = FontWeight.Bold,
-                                                            ),
-                                                            color = Color.White,
-                                                        )
-                                                    }
-                                                }
-                                                if (cap.canRetryAi) {
-                                                    Surface(
-                                                        color = LensSky.copy(alpha = 0.22f),
-                                                        shape = RoundedCornerShape(10.dp),
-                                                        border = BorderStroke(1.dp, LensSky.copy(alpha = 0.65f)),
-                                                        onClick = onRetryYouTubeAiTranscript,
-                                                        modifier = Modifier
-                                                            .minimumInteractiveComponentSize()
-                                                            .testTag("scout_retry_ai_button"),
-                                                    ) {
-                                                        Row(
-                                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                                            verticalAlignment = Alignment.CenterVertically,
-                                                            horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                                        ) {
-                                                            Icon(
-                                                                imageVector = Icons.Filled.Refresh,
-                                                                contentDescription = "Retry Flash-Lite AI transcription",
-                                                                tint = LensSky,
-                                                                modifier = Modifier.size(12.dp),
-                                                            )
-                                                            Text(
-                                                                text = "Retry Lite",
-                                                                style = MaterialTheme.typography.labelSmall.copy(
-                                                                    fontSize = 10.sp,
-                                                                    fontWeight = FontWeight.Bold,
-                                                                ),
-                                                                color = Color.White,
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                                Surface(
-                                                    color = Color.White.copy(alpha = 0.12f),
-                                                    shape = RoundedCornerShape(10.dp),
-                                                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.32f)),
-                                                    onClick = onOpenAttachCaptions,
-                                                    modifier = Modifier
-                                                        .minimumInteractiveComponentSize()
-                                                        .testTag("scout_attach_srt_button"),
-                                                ) {
-                                                    Row(
-                                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                                        verticalAlignment = Alignment.CenterVertically,
-                                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                                    ) {
-                                                        Icon(
-                                                            imageVector = Icons.Filled.Subtitles,
-                                                            contentDescription = "Attach or paste captions",
-                                                            tint = Color.White,
-                                                            modifier = Modifier.size(12.dp),
-                                                        )
-                                                        Text(
-                                                            text = "Attach SRT",
-                                                            style = MaterialTheme.typography.labelSmall.copy(
-                                                                fontSize = 10.sp,
-                                                                fontWeight = FontWeight.SemiBold,
-                                                            ),
-                                                            color = Color.White,
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    }
-                                }
-                            }
-                        } else {
-                            Surface(
-                                color = CinemaObsidian.copy(alpha = 0.78f),
-                                shape = RoundedCornerShape(14.dp),
-                                border = BorderStroke(1.dp, LensSky.copy(alpha = 0.45f)),
-                                onClick = onToggleScoutMonitorPip,
-                                modifier = Modifier.testTag("scout_instance_badge"),
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.GraphicEq,
-                                        contentDescription = "7-second lookahead scout status",
-                                        tint = LensMint,
-                                        modifier = Modifier.size(12.dp),
-                                    )
-                                    Text(
-                                        text = when (project.videoSource.kind) {
-                                            VideoSourceKind.LOCAL_MP4 ->
-                                                "Scout ${SubtitleParser.formatCompactTime(scoutedUpToMs)}"
-                                            else ->
-                                                "Scout +${String.format(java.util.Locale.US, "%.1f", leadSec)}s"
-                                        },
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            fontSize = 10.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                        ),
-                                        color = Color.White,
-                                    )
-                                }
-                            }
-                        }
-                    }
-
                     // Keep a real active WebView Scout instance mounted for HTML5 Web Cinema streams
                     // (when the interactive Scout Browser Modal is open, that modal attaches the same sessionHolder)
                     if (project.videoSource.kind == VideoSourceKind.WEB_STREAM && !showScoutBrowserModal) {
@@ -1191,154 +932,6 @@ fun VideoPlayerStage(
                                 maxLines = 1,
                             )
                         }
-                    }
-                }
-            }
-
-            // 6. Adaptive Smart Pre-Roll Slate on Viewer while Scout locks onto opening cast & bubbles
-            CinemaIntroOverlay(
-                visible = isCinemaIntroActive,
-                remainingMs = introRemainingMs,
-                totalIntroMs = introTotalDurationMs,
-                scoutStatusText = scoutStatusText,
-                readyLinesCount = project.dialogueEvents.size,
-                openingSpeakersReady = isOpeningSpeakersReady,
-                speakers = project.speakers,
-                bufferedWindows = scoutCompletedWindows,
-                totalWindows = scoutTotalWindows,
-                requiredOpeningWindows = requiredOpeningWindows,
-                onSkipIntro = onSkipIntro,
-                modifier = Modifier.fillMaxSize(),
-            )
-
-            // Sleek Catch-Up Buffering pill when live playback catches up to an active mid-video Scout window
-            if (isScoutCatchUpBuffering && !isCinemaIntroActive && !isEditMode) {
-                Surface(
-                    color = CinemaObsidian.copy(alpha = 0.90f),
-                    shape = RoundedCornerShape(22.dp),
-                    border = BorderStroke(1.2.dp, LensSky.copy(alpha = 0.72f)),
-                    shadowElevation = 8.dp,
-                    modifier = Modifier
-                        .align(Alignment.Center)
-                        .padding(16.dp)
-                        .testTag("scout_catchup_buffer_card"),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = LensSky,
-                            strokeWidth = 2.5.dp,
-                        )
-                        Column(modifier = Modifier.widthIn(max = 190.dp)) {
-                            Text(
-                                text = "Scout catching up",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                                color = Color.White,
-                            )
-                            Text(
-                                text = scoutStatusText.ifBlank { "Buffering upcoming dialogue..." },
-                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                                color = LensMint,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        Surface(
-                            color = LensSky,
-                            shape = RoundedCornerShape(14.dp),
-                            onClick = onDismissCatchUpBuffering,
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("catch_up_watch_anyway_button"),
-                        ) {
-                            Text(
-                                text = "Watch Anyway",
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                color = CinemaObsidian,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Sleek centered Play CTA when paused awaiting the Smart Pre-Roll
-            if (hasPendingPlayIntro &&
-                !isPlaying &&
-                !isCinemaIntroActive &&
-                !isEditMode &&
-                project.videoSource.kind != VideoSourceKind.DEMO_SCENARIO
-            ) {
-                Surface(
-                    color = CinemaObsidian.copy(alpha = 0.86f),
-                    shape = RoundedCornerShape(28.dp),
-                    border = BorderStroke(1.2.dp, LensSky.copy(alpha = 0.72f)),
-                    onClick = onTogglePlayPause,
-                    modifier = Modifier
-                        .align(Alignment.Center)
-                        .padding(16.dp)
-                        .testTag("stage_pending_play_cta"),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.PlayArrow,
-                            contentDescription = "Play video with Smart Pre-Roll",
-                            tint = LensSky,
-                            modifier = Modifier.size(26.dp),
-                        )
-                        Column {
-                            Text(
-                                text = if (isOpeningSpeakersReady) "Play · Bubbles Ready" else "Play · Smart Pre-Roll",
-                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                                color = Color.White,
-                            )
-                            Text(
-                                text = scoutStatusText.ifBlank { "Scout preparing bubbles..." },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = LensMint,
-                                maxLines = 1,
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Subtle play prompt overlay when paused on Demo Scenario
-            if (!isPlaying && !isEditMode && quickPickerEventId == null && project.videoSource.kind == VideoSourceKind.DEMO_SCENARIO) {
-                Surface(
-                    color = CinemaObsidian.copy(alpha = 0.68f),
-                    shape = RoundedCornerShape(24.dp),
-                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.18f)),
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(12.dp)
-                        .clickable(onClick = onTogglePlayPause)
-                        .testTag("stage_play_pill"),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.PlayArrow,
-                            contentDescription = "Play demo scene",
-                            tint = Color.White,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Text(
-                            text = "Play scene",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = Color.White,
-                        )
                     }
                 }
             }

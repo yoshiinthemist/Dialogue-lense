@@ -170,11 +170,8 @@ object YouTubeCaptionFetcher {
             }
         }
         if (rawEntries.size < 2) return emptyList()
-        // If first chapter begins after 15s, prepend an implicit Intro chapter so 0ms is covered cleanly
-        if (rawEntries.first().first > 15_000L) {
-            rawEntries.add(0, 0L to "Introduction")
-        }
-        val effectiveDuration = maxOf(durationMs, rawEntries.last().first + 30_000L)
+        // Preserve only the chapter titles and timestamps actually supplied by the author.
+        val effectiveDuration = durationMs.takeIf { it > 0L } ?: (rawEntries.last().first + 1L)
         return rawEntries.mapIndexed { idx, (startMs, title) ->
             val endMs = if (idx < rawEntries.lastIndex) {
                 rawEntries[idx + 1].first
@@ -185,7 +182,7 @@ object YouTubeCaptionFetcher {
                 id = "chapter_${idx + 1}",
                 title = title,
                 startMs = startMs,
-                endMs = endMs.coerceAtLeast(startMs + 1_000L),
+                endMs = endMs.coerceAtLeast(startMs + 1L),
                 source = ChapterSource.YOUTUBE_DESCRIPTION,
             )
         }

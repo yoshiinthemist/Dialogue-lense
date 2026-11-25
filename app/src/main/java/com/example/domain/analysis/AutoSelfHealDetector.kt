@@ -4,7 +4,6 @@ import com.example.data.model.DialogueEvent
 import com.example.data.model.DialogueLensProject
 import com.example.data.model.HealBeaconStatus
 import com.example.data.model.QuotaSaverMode
-import com.example.data.model.Speaker
 import com.example.domain.layout.PlacedBalloon
 import kotlin.math.abs
 
@@ -26,10 +25,9 @@ data class SelfHealFinding(
 
 /**
  * Bounded, resource-respecting automatic self-healing detector.
- * - Detects structural anomalies (invalid coordinates, temporal overhang, duplicate speakers,
+ * - Detects structural anomalies (invalid coordinates, temporal overhang,
  *   conflicting overlaps, repeated low-confidence positions, or playhead coverage gaps).
- * - Applies safe zero-cloud fixes locally (such as merging duplicate speakers with identical
- *   normalized names or clamping corrupted coordinates).
+ * - Detects repeatable local position and timing defects without changing speaker identities.
  * - Enforces strict guardrails before proposing a background cloud Heal Beacon:
  *   never fires in [QuotaSaverMode.ZERO_CLOUD], respects per-region 60s cooldowns, caps total
  *   automatic cloud repairs per video at [MAX_AUTO_CLOUD_HEALS_PER_VIDEO], and deduplicates
@@ -58,21 +56,6 @@ class AutoSelfHealDetector {
     ): List<SelfHealFinding> {
         resetForProject(project.id)
         val findings = mutableListOf<SelfHealFinding>()
-
-        // 1. Detect duplicate speaker identities (exact normalized name collision) -> safe zero-cloud local fix
-        val groupedByNormName = project.speakers.groupBy {
-            HierarchicalContextEngine.normalizeSpeakerKey(it.displayName)
-        }.filterKeys { it.isNotBlank() }
-        if (groupedByNormName.values.any { it.size > 1 }) {
-            findings.add(
-                SelfHealFinding(
-                    kind = SelfHealSignalKind.DUPLICATE_SPEAKER_IDENTITIES,
-                    timestampMs = playbackMs,
-                    description = "Duplicate speaker entries detected",
-                    canFixLocallyWithoutCloud = true,
-                )
-            )
-        }
 
         // 2. Detect invalid coordinates or temporal overhang on rendered balloons
         for (balloon in placedBalloons) {
@@ -198,66 +181,12 @@ class AutoSelfHealDetector {
         const val TEMPORAL_OVERHANG_TOLERANCE_MS = 450L
 
         /**
-         * Safely merges duplicate speakers that share the exact same normalized name (Layer A
-         * Video Memory hygiene) without invoking any cloud call and while preserving user-locked
-         * speaker confirmations and colors.
-         */
-        fun consolidateDuplicateSpeakers(project: DialogueLensProject): DialogueLensProject {
-            if (project.speakers.size < 2) return project
-            val canonicalByNorm = linkedMapOf<String, Speaker>()
-            val remapIds = mutableMapOf<String, String>()
-
-            for (speaker in project.speakers) {
-                val norm = HierarchicalContextEngine.normalizeSpeakerKey(speaker.displayName)
-                if (norm.isBlank()) {
-                    canonicalByNorm[speaker.id] = speaker
-                    continue
-                }
-                val existing = canonicalByNorm[norm]
-                if (existing == null) {
-                    canonicalByNorm[norm] = speaker
-                } else {
-                    // Prefer confirmed character with preferredScreenSideX
-                    val winner = if (!existing.isConfirmedCharacter && speaker.isConfirmedCharacter) {
-                        speaker.copy(
-                            preferredScreenSideX = speaker.preferredScreenSideX ?: existing.preferredScreenSideX,
-                            accentIndex = existing.accentIndex,
-                        )
-                    } else {
-                        existing.copy(
-                            preferredScreenSideX = existing.preferredScreenSideX ?: speaker.preferredScreenSideX,
-                        )
-                    }
-                    val loserId = if (winner.id == existing.id) speaker.id else existing.id
-                    canonicalByNorm[norm] = winner
-                    remapIds[loserId] = winner.id
-                }
-            }
-
-            if (remapIds.isEmpty()) return project
-
-            val mergedSpeakers = canonicalByNorm.values.toList()
-            val mergedEvents = project.dialogueEvents.map { evt ->
-                val remapped = evt.speakerId?.let { remapIds[it] }
-                if (remapped != null) evt.copy(speakerId = remapped) else evt
-            }
-            val mergedTracks = project.faceTracks.map { track ->
-                val remapped = track.speakerId?.let { remapIds[it] }
-                if (remapped != null) track.copy(speakerId = remapped) else track
-            }
-            return project.copy(
-                speakers = mergedSpeakers,
-                dialogueEvents = mergedEvents,
-                faceTracks = mergedTracks,
-            )
-        }
-
-        /**
          * Clamps any corrupted/out-of-bounds event anchor coordinates cleanly back inside [0.05..0.95]
          * without touching valid events.
          */
         fun sanitizeCorruptedAnchors(events: List<DialogueEvent>): List<DialogueEvent> =
             events.map { evt ->
+                if (evt.lockedByUser) return@map evt
                 val anchor = evt.anchorPosition ?: return@map evt
                 if (anchor.x.isNaN() || anchor.y.isNaN()) {
                     evt.copy(anchorPosition = null)

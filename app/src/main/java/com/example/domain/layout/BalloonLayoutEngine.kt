@@ -47,6 +47,7 @@ data class PlacedBalloon(
     val identityConfidence: Float = 0f,
     val locationConfidence: Float = 0f,
     val layoutSceneKey: String = "",
+    val faceExclusions: List<NormalizedRect> = emptyList(),
 )
 
 class BalloonLayoutEngine {
@@ -59,6 +60,20 @@ class BalloonLayoutEngine {
     private val lastTailWasLiveTracked = mutableMapOf<String, Boolean>()
     private val timelineMatcher = SubtitleTimelineMatcher()
 
+    private var cachedProject: DialogueLensProject? = null
+    private var cachedStyle: BalloonStyleSettings? = null
+    private var cachedFaces: List<LiveFaceObservation>? = null
+    private var cachedEvents: List<DialogueEvent> = emptyList()
+    private var cachedScene = ""
+    private var cachedVisionSignal = false
+    private var cachedEmpty = false
+    private var cachedBucket = -1L
+    private var cachedLayout: List<PlacedBalloon> = emptyList()
+    private var indexedEvents: List<DialogueEvent>? = null
+    private var ordinals: Map<String, Int> = emptyMap()
+    var spatialPassCount = 0L
+        private set
+
     fun clearSmoothing() {
         smoothedPositions.clear()
         smoothedTailTargets.clear()
@@ -67,6 +82,11 @@ class BalloonLayoutEngine {
         recentLiveFacesByShot.clear()
         lastTailWasLiveTracked.clear()
         timelineMatcher.reset()
+        cachedProject = null
+        cachedEvents = emptyList()
+        cachedLayout = emptyList()
+        indexedEvents = null
+        ordinals = emptyMap()
     }
 
     fun computeLayout(
@@ -83,19 +103,59 @@ class BalloonLayoutEngine {
             // Strict temporal validation: never allow stale dialogue to linger past its end boundary
             .filter { evt -> currentMs <= evt.endTimeMs + 160L }
 
-        if (activeEvents.isEmpty()) return emptyList()
+        if (activeEvents.isEmpty()) {
+            if (cachedEvents.isNotEmpty()) {
+                cachedLayout = emptyList()
+                cachedEvents = emptyList()
+                smoothedPositions.clear()
+                smoothedTailTargets.clear()
+                lastTailWasLiveTracked.clear()
+                lastShotIds.clear()
+            }
+            return emptyList()
+        }
 
-        val activeShot = project.shots.firstOrNull { currentMs in it.startMs..it.endMs }
+        val activeShot = project.shots.lastOrNull { currentMs in it.startMs..it.endMs }
         val shotId = activeShot?.id ?: activeEvents.first().shotId
         val effectiveSceneKey = if (sceneEpoch > 0 || !activeChapterId.isNullOrBlank()) {
             "$shotId#ep$sceneEpoch#${activeChapterId.orEmpty()}"
         } else {
             shotId
         }
+        // Cue activation is checked on every presentation tick. Spatial scoring only runs when
+        // its inputs change. Authored continuous face tracks are sampled at up to 10 Hz.
+        val bucket = if (project.faceTracks.isNotEmpty() || hasLiveVisionSignal && liveFaces.isEmpty()) currentMs / 100L else 0L
+        if (project === cachedProject && styleSettings == cachedStyle && liveFaces === cachedFaces &&
+            effectiveSceneKey == cachedScene && activeEvents == cachedEvents && bucket == cachedBucket &&
+            hasLiveVisionSignal == cachedVisionSignal && liveFrameObservedEmpty == cachedEmpty
+        ) return cachedLayout
+        if (cachedProject?.id != project.id || effectiveSceneKey != cachedScene) {
+            previousFaceBoxesByShot.clear()
+            recentLiveFacesByShot.clear()
+            smoothedPositions.clear()
+            smoothedTailTargets.clear()
+            lastTailWasLiveTracked.clear()
+            lastShotIds.clear()
+        } else if (activeEvents != cachedEvents) {
+            val ids = activeEvents.mapTo(mutableSetOf()) { it.id }
+            smoothedPositions.keys.retainAll(ids)
+            smoothedTailTargets.keys.retainAll(ids)
+            lastTailWasLiveTracked.keys.retainAll(ids)
+            lastShotIds.keys.retainAll(ids)
+        }
+        cachedProject = project
+        cachedStyle = styleSettings
+        cachedFaces = liveFaces
+        cachedScene = effectiveSceneKey
+        cachedEvents = activeEvents
+        cachedBucket = bucket
+        cachedVisionSignal = hasLiveVisionSignal
+        cachedEmpty = liveFrameObservedEmpty
+        spatialPassCount++
         val shotLuminance = activeShot?.sceneLuminance ?: 0.25f
 
         // Fuse precomputed face tracks with real-time 6fps ML Kit live viewport observations
-        val precomputedSamples = project.faceTracks
+        val precomputedSamples = if (hasLiveVisionSignal && liveFaces.isEmpty()) emptyList() else project.faceTracks
             .filter { it.shotId == shotId }
             .mapNotNull { track ->
                 track.sampleAt(currentMs)?.let { track.id to it }
@@ -113,8 +173,8 @@ class BalloonLayoutEngine {
         val liveConvertedSamples = if (rawLiveSamples.isNotEmpty()) {
             recentLiveFacesByShot[effectiveSceneKey] = currentMs to rawLiveSamples
             rawLiveSamples
-        } else if (liveFrameObservedEmpty) {
-            // Live vision confirmed an empty / B-roll / title-card frame: do NOT recycle stale faces!
+        } else if (hasLiveVisionSignal || liveFrameObservedEmpty) {
+            // The context coordinator already bounded any hold across a detector dropout.
             recentLiveFacesByShot.remove(effectiveSceneKey)
             emptyList()
         } else {
@@ -195,15 +255,19 @@ class BalloonLayoutEngine {
             maxSpeakerDelta = mlKitDelta,
         )
 
-        val countsBySpeaker = mutableMapOf<String, Int>()
-        val ordinalByEventId = mutableMapOf<String, Int>()
-        project.dialogueEvents.sortedBy { it.startTimeMs }.forEach { evt ->
-            val spkId = evt.speakerId
-            if (spkId != null && evt.dialogueType != DialogueType.SOUND_DESCRIPTION) {
-                val nextCount = (countsBySpeaker[spkId] ?: 0) + 1
-                countsBySpeaker[spkId] = nextCount
-                ordinalByEventId[evt.id] = nextCount
+        if (indexedEvents !== project.dialogueEvents) {
+            val countsBySpeaker = mutableMapOf<String, Int>()
+            ordinals = buildMap {
+                project.dialogueEvents.sortedWith(compareBy<DialogueEvent> { it.startTimeMs }.thenBy { it.id }).forEach { evt ->
+                    val speakerId = evt.speakerId
+                    if (speakerId != null && evt.dialogueType != DialogueType.SOUND_DESCRIPTION) {
+                        val next = (countsBySpeaker[speakerId] ?: 0) + 1
+                        countsBySpeaker[speakerId] = next
+                        put(evt.id, next)
+                    }
+                }
             }
+            indexedEvents = project.dialogueEvents
         }
 
         // Place all dialogue / sketch bubbles BEFORE SFX notes so SFX checks every active bubble
@@ -213,7 +277,7 @@ class BalloonLayoutEngine {
 
         for (event in orderedEvents) {
             val speaker = project.speakers.firstOrNull { it.id == event.speakerId }
-            val lineOrdinal = ordinalByEventId[event.id] ?: 0
+            val lineOrdinal = ordinals[event.id] ?: 0
             val text = event.activeText(project.translationMode)
 
             // Estimate normalized balloon size based on wrapped line length, maxLines, and font scale
@@ -879,7 +943,10 @@ class BalloonLayoutEngine {
             )
         }
 
-        return results.sortedWith(compareBy<PlacedBalloon> { it.event.startTimeMs }.thenBy { it.event.id }).map { it.copy(layoutSceneKey = effectiveSceneKey) }
+        val exclusions = faceExclusionZones + lipCorridorZones
+        cachedLayout = results.sortedWith(compareBy<PlacedBalloon> { it.event.startTimeMs }.thenBy { it.event.id })
+            .map { it.copy(layoutSceneKey = effectiveSceneKey, faceExclusions = exclusions) }
+        return cachedLayout
     }
 
     private fun deriveSpeakerSilhouetteZone(face: NormalizedRect): NormalizedRect {

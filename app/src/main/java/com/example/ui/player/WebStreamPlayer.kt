@@ -1,5 +1,8 @@
 package com.example.ui.player
 
+import com.example.domain.analysis.MediaTransport
+import com.example.domain.analysis.ViewerTransportSample
+
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
@@ -51,7 +54,7 @@ class WebStreamSessionHolder {
     internal var lastHandledSeekSeq: Int = 0
     internal var lastHandledNavSeq: Int = 0
     internal var isolateVideoInViewport: Boolean = true
-    internal var lastSniffedMediaUrl: String = ""
+    @Volatile internal var lastSniffedMediaUrl: String = ""
 
     internal val temporarilyAllowedHosts = mutableMapOf<String, Long>()
     internal var navState: WebNavigationState = WebNavigationState()
@@ -59,19 +62,22 @@ class WebStreamSessionHolder {
     internal var lastBounceAtMs: Long = 0L
     internal var lastEarlyInjectAtMs: Long = 0L
 
+    internal var transportCallback: ((ViewerTransportSample) -> Unit)? = null
     internal var playbackCallback: (Long, Long, Boolean) -> Unit = { _, _, _ -> }
     internal var captionsCallback: (String) -> Unit = {}
     internal var mediaUrlCallback: (String) -> Unit = {}
     internal var sniffedMediaCallback: (SniffedWebMediaStream) -> Unit = {}
-    internal var audioSliceCallback: (Long, String, String) -> Unit = { _, _, _ -> }
+    internal var audioSliceCallback: (Long, Long, String, String) -> Unit = { _, _, _, _ -> }
     internal var metadataCallback: (String, String, String) -> Unit = { _, _, _ -> }
     internal var navStateCallback: (WebNavigationState) -> Unit = {}
 
+    @Synchronized
     fun activeAllowedHostsSnapshot(nowMs: Long = SystemClock.elapsedRealtime()): Set<String> {
         temporarilyAllowedHosts.entries.removeAll { it.value < nowMs }
         return temporarilyAllowedHosts.keys.toSet()
     }
 
+    @Synchronized
     fun allowHostTemporarily(rawHost: String, durationMs: Long = 25_000L) {
         val clean = rawHost.trim().lowercase()
         if (clean.isEmpty()) return
@@ -93,7 +99,7 @@ class WebStreamSessionHolder {
         webView = null
         loadedSeedUrl = null
         bridgeReady = false
-        temporarilyAllowedHosts.clear()
+        synchronized(this) { temporarilyAllowedHosts.clear() }
         navState = WebNavigationState()
     }
 }
@@ -111,13 +117,14 @@ fun WebStreamPlayer(
     playbackSpeed: Float = 1.0f,
     playRequest: Pair<Int, Boolean>? = null,
     seekRequest: Pair<Int, Long>?,
+    onViewerTransport: ((ViewerTransportSample) -> Unit)? = null,
     onPlaybackState: (positionMs: Long, durationMs: Long, isPlaying: Boolean) -> Unit,
     onCapturedCaptions: (cuesJson: String) -> Unit,
     isScoutInstance: Boolean = false,
     isolateVideoInViewport: Boolean = true,
     onDirectMediaUrl: (String) -> Unit = {},
     onSniffedMediaStream: (SniffedWebMediaStream) -> Unit = {},
-    onCapturedAudioSlice: (startMs: Long, base64Audio: String, mimeType: String) -> Unit = { _, _, _ -> },
+    onCapturedAudioSlice: (startMs: Long, endMs: Long, base64Audio: String, mimeType: String) -> Unit = { _, _, _, _ -> },
     onPageMetadata: (title: String, author: String, description: String) -> Unit = { _, _, _ -> },
     navCommand: WebNavCommand? = null,
     onNavigationStateChange: (WebNavigationState) -> Unit = {},
@@ -130,6 +137,7 @@ fun WebStreamPlayer(
 
     val latestSeedUrl by rememberUpdatedState(webUrl)
     holder.isolateVideoInViewport = isolateVideoInViewport
+    holder.transportCallback = onViewerTransport
     holder.playbackCallback = onPlaybackState
     holder.captionsCallback = onCapturedCaptions
     holder.mediaUrlCallback = onDirectMediaUrl
@@ -159,7 +167,7 @@ fun WebStreamPlayer(
         val req = playRequest ?: return@LaunchedEffect
         if (!holder.bridgeReady || req.first == holder.lastHandledPlaySeq) return@LaunchedEffect
         holder.lastHandledPlaySeq = req.first
-        val js = if (req.second) "window.dlWebPlay && window.dlWebPlay();" else "window.dlWebPause && window.dlWebPause();"
+        val js = if (req.second) "window.__dlPlaySequence = ${req.first}; window.dlWebPlay && window.dlWebPlay();" else "window.__dlPlaySequence = ${req.first}; window.dlWebPause && window.dlWebPause();"
         holder.webView?.evaluateJavascript(js, null)
     }
 
@@ -179,7 +187,7 @@ fun WebStreamPlayer(
         if (!holder.bridgeReady || req.first == holder.lastHandledSeekSeq) return@LaunchedEffect
         holder.lastHandledSeekSeq = req.first
         val seconds = req.second / 1000.0
-        holder.webView?.evaluateJavascript("window.dlWebSeek && window.dlWebSeek($seconds);", null)
+        holder.webView?.evaluateJavascript("window.__dlSeekSequence = ${req.first}; window.dlWebSeek && window.dlWebSeek($seconds);", null)
     }
 
     LaunchedEffect(navCommand) {
@@ -301,6 +309,8 @@ private fun createGuardedWebView(
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
+        settings.allowFileAccess = false
+        settings.allowContentAccess = false
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         settings.mediaPlaybackRequiresUserGesture = false
@@ -313,6 +323,8 @@ private fun createGuardedWebView(
         settings.userAgentString =
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
+        val browserUserAgent = settings.userAgentString.orEmpty()
+
         fun updateNavState(transform: (WebNavigationState) -> WebNavigationState) {
             val next = transform(holder.navState)
             if (next != holder.navState) {
@@ -323,13 +335,24 @@ private fun createGuardedWebView(
 
         val bridge = object {
             @JavascriptInterface
-            fun onProgress(posMs: Long, durMs: Long, playing: Boolean) {
-                mainHandler.post { holder.playbackCallback(posMs, durMs, playing) }
+            fun onProgress(posMs: Long, durMs: Long, code: Int, seekSeq: Int, playSeq: Int) {
+                val transport = when (code) {
+                    1 -> MediaTransport.PLAYING
+                    2 -> MediaTransport.PAUSED
+                    3 -> MediaTransport.BUFFERING
+                    4 -> MediaTransport.ENDED
+                    else -> MediaTransport.UNAVAILABLE
+                }
+                mainHandler.post {
+                    val callback = holder.transportCallback
+                    if (callback != null) callback(ViewerTransportSample(posMs, durMs, transport, seekSeq, playSeq))
+                    else holder.playbackCallback(posMs, durMs, transport == MediaTransport.PLAYING)
+                }
             }
 
             @JavascriptInterface
             fun onCapturedTracks(cuesJson: String) {
-                mainHandler.post { holder.captionsCallback(cuesJson) }
+                if (cuesJson.length <= 4_000_000) mainHandler.post { holder.captionsCallback(cuesJson) }
             }
 
             @JavascriptInterface
@@ -347,13 +370,11 @@ private fun createGuardedWebView(
                                 val u = java.net.URI(pageUrl)
                                 if (u.scheme != null && u.host != null) "${u.scheme}://${u.host}" else ""
                             }.getOrDefault("")
-                            val cookie = runCatching { CookieManager.getInstance().getCookie(clean) }.getOrNull().orEmpty()
                             holder.sniffedMediaCallback(
                                 SniffedWebMediaStream(
                                     url = clean,
                                     referer = pageUrl,
-                                    cookieHeader = cookie,
-                                    userAgent = settings.userAgentString.orEmpty(),
+                                    userAgent = browserUserAgent,
                                     origin = origin,
                                     isHlsPlaylist = WebNavigationGuard.isHlsPlaylistUrl(clean),
                                 )
@@ -364,9 +385,9 @@ private fun createGuardedWebView(
             }
 
             @JavascriptInterface
-            fun onCapturedAudioChunk(startMs: Long, base64Audio: String, mimeType: String) {
+            fun onCapturedAudioChunk(startMs: Long, endMs: Long, base64Audio: String, mimeType: String) {
                 if (base64Audio.isNotBlank()) {
-                    mainHandler.post { holder.audioSliceCallback(startMs, base64Audio, mimeType) }
+                    mainHandler.post { holder.audioSliceCallback(startMs, endMs, base64Audio, mimeType) }
                 }
             }
 
@@ -574,7 +595,7 @@ private fun createGuardedWebView(
                             }.getOrDefault("")
                         }
                         val reqUa = reqHeaders["User-Agent"]?.takeIf { it.isNotBlank() }
-                            ?: settings.userAgentString.orEmpty()
+                            ?: browserUserAgent
                         val cookie = runCatching { CookieManager.getInstance().getCookie(targetUrl) }.getOrNull().orEmpty()
                         val sniffed = SniffedWebMediaStream(
                             url = targetUrl,
@@ -635,6 +656,9 @@ private fun createGuardedWebView(
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                holder.bridgeReady = false
+                holder.lastHandledPlaySeq = 0
+                holder.lastHandledSeekSeq = 0
                 val cleanUrl = url.orEmpty()
                 val host = WebNavigationGuard.extractHost(cleanUrl)
                 val allowed = holder.activeAllowedHostsSnapshot()
@@ -1158,10 +1182,17 @@ private fun buildWebStreamHookScript(
 
       var sliceStartMs = Math.round((video.currentTime || 0) * 1000);
       var rec = new MediaRecorder(audioOnly, { mimeType: mime });
+      var interrupted = false;
+      ['seeking', 'ratechange', 'pause', 'waiting', 'emptied'].forEach(function(name) {
+        video.addEventListener(name, function() { interrupted = true; });
+      });
       rec.ondataavailable = function(ev) {
-        if (ev.data && ev.data.size > 1800 && window.DialogueLensWeb) {
-          var capturedStart = sliceStartMs;
-          sliceStartMs = Math.round((video.currentTime || 0) * 1000);
+        var capturedStart = sliceStartMs;
+        var capturedEnd = Math.round((video.currentTime || 0) * 1000);
+        sliceStartMs = capturedEnd;
+        var usable = !interrupted && video.playbackRate === 1 && capturedEnd > capturedStart;
+        interrupted = false;
+        if (usable && ev.data && ev.data.size > 1800 && window.DialogueLensWeb) {
           var reader = new FileReader();
           reader.onloadend = function() {
             var res = reader.result || '';
@@ -1169,7 +1200,7 @@ private fun buildWebStreamHookScript(
             if (comma > 0) {
               var b64 = res.substring(comma + 1);
               try {
-                window.DialogueLensWeb.onCapturedAudioChunk(capturedStart, b64, mime.split(';')[0]);
+                window.DialogueLensWeb.onCapturedAudioChunk(capturedStart, capturedEnd, b64, mime.split(';')[0]);
               } catch (err) {}
             }
           };
@@ -1237,9 +1268,9 @@ private fun buildWebStreamHookScript(
     }
     var curMs = Math.round((v.currentTime || 0) * 1000);
     var durMs = (isFinite(v.duration) && v.duration > 0) ? Math.round(v.duration * 1000) : 0;
-    var playing = (!v.paused && !v.ended) || (Date.now() < window.__dlPlayGraceUntil && !v.ended);
+    var code = v.ended ? 4 : (v.seeking || v.readyState < 2 || (!v.paused && v.readyState < 3)) ? 3 : v.paused ? 2 : 1;
     try {
-      window.DialogueLensWeb.onProgress(curMs, durMs, playing);
+      window.DialogueLensWeb.onProgress(curMs, durMs, code, window.__dlSeekSequence || 0, window.__dlPlaySequence || 0);
     } catch (err) {}
     harvestTextTracks(v);
     reportDirectSrc(v);

@@ -10,25 +10,27 @@ import kotlin.math.roundToLong
  * Prevents 30Hz/220ms polling staircases and eliminates cumulative frame-drift at 1x–2x speeds.
  */
 class PlaybackClockAnchor {
-    private var anchorPosMs: Long = 0L
-    private var anchorNanoTime: Long = System.nanoTime()
-    private var playbackSpeed: Float = 1.0f
-    private var isPlaying: Boolean = false
-    private var lastReportedExoPosMs: Long = -1L
-    private var lastExoAdvanceNano: Long = System.nanoTime()
+    private var anchorPosMs = 0L
+    private var anchorNs = 0L
+    private var lastReportMs = 0L
+    private var lastAdvanceNs = 0L
+    private var lastPresentedMs = 0L
+    private var playbackSpeed = 1f
+    private var isPlaying = false
 
     fun reset(
         positionMs: Long = 0L,
-        speed: Float = 1.0f,
+        speed: Float = 1f,
         playing: Boolean = false,
         nowNs: Long = System.nanoTime(),
     ) {
         anchorPosMs = positionMs.coerceAtLeast(0L)
-        anchorNanoTime = nowNs
-        playbackSpeed = speed.coerceIn(0.25f, 4.0f)
+        lastPresentedMs = anchorPosMs
+        lastReportMs = anchorPosMs
+        anchorNs = nowNs
+        lastAdvanceNs = nowNs
+        playbackSpeed = speed.coerceIn(0.25f, 4f)
         isPlaying = playing
-        lastReportedExoPosMs = anchorPosMs
-        lastExoAdvanceNano = nowNs
     }
 
     fun updatePlaybackState(
@@ -36,19 +38,8 @@ class PlaybackClockAnchor {
         speed: Float,
         playing: Boolean,
         nowNs: Long = System.nanoTime(),
-    ) {
-        anchorPosMs = positionMs.coerceAtLeast(0L)
-        anchorNanoTime = nowNs
-        playbackSpeed = speed.coerceIn(0.25f, 4.0f)
-        isPlaying = playing
-        lastReportedExoPosMs = anchorPosMs
-        lastExoAdvanceNano = nowNs
-    }
+    ) = reset(positionMs, speed, playing, nowNs)
 
-    /**
-     * Samples Media3 ExoPlayer position directly at 60fps (16ms), interpolating sub-frame movement
-     * only over short audio-buffer plateaus (< 48ms) and snapping immediately on any real ExoPlayer step or seek.
-     */
     fun sampleLocalExoPosition(
         exoPosMs: Long,
         speed: Float,
@@ -56,68 +47,59 @@ class PlaybackClockAnchor {
         maxDurationMs: Long = Long.MAX_VALUE,
         nowNs: Long = System.nanoTime(),
     ): Long {
-        val safeExo = exoPosMs.coerceIn(0L, maxDurationMs.coerceAtLeast(0L))
-        val safeSpeed = speed.coerceIn(0.25f, 4.0f)
-
-        if (!playing) {
-            updatePlaybackState(safeExo, safeSpeed, false, nowNs)
-            return safeExo
+        val report = exoPosMs.coerceIn(0L, maxDurationMs.coerceAtLeast(0L))
+        val rate = speed.coerceIn(0.25f, 4f)
+        if (!playing || !isPlaying || rate != playbackSpeed || abs(report - lastReportMs) > 1_000L) {
+            reset(report, rate, playing, nowNs)
+        } else if (report > lastReportMs) {
+            anchorPosMs = report
+            lastReportMs = report
+            lastAdvanceNs = nowNs
+            anchorNs = nowNs
         }
-
-        if (safeExo != lastReportedExoPosMs) {
-            lastReportedExoPosMs = safeExo
-            lastExoAdvanceNano = nowNs
-            anchorPosMs = safeExo
-            anchorNanoTime = nowNs
-            playbackSpeed = safeSpeed
-            isPlaying = true
-            return safeExo
-        }
-
-        // If ExoPlayer is actively playing and reported the exact same integer ms on a 16ms frame boundary,
-        // extrapolate gently (capped at 48ms) until the next audio-clock tick arrives.
-        val plateauMs = ((nowNs - lastExoAdvanceNano) / 1_000_000.0 * safeSpeed)
-            .roundToLong()
-            .coerceIn(0L, 48L)
-        return (safeExo + plateauMs).coerceIn(0L, maxDurationMs.coerceAtLeast(0L))
+        return present(minOf(anchorPosMs + elapsedMediaMs(nowNs, anchorNs), lastReportMs + 48L), maxDurationMs)
     }
 
-    /**
-     * Reconciles a remote WebView / YouTube player heartbeat (`positionMs`) against the predicted
-     * 60fps monotonic clock so web streams stay frame-accurate without jitter or backwards skipping.
-     */
     fun reconcileRemoteSample(
         reportedPosMs: Long,
         speed: Float,
         playing: Boolean,
         nowNs: Long = System.nanoTime(),
     ) {
-        val safePos = reportedPosMs.coerceAtLeast(0L)
-        val safeSpeed = speed.coerceIn(0.25f, 4.0f)
-        val predicted = sampleInterpolatedMs(nowNs = nowNs)
-        val delta = safePos - predicted
-
-        if (!playing || !isPlaying || abs(delta) > 220L || safePos < anchorPosMs - 40L) {
-            anchorPosMs = safePos
-            anchorNanoTime = nowNs
-        } else {
-            // Smooth micro-correction absorbs ~50-120ms IPC latency without causing subtitle skips
-            anchorPosMs = (predicted + (delta * 0.55).roundToLong()).coerceAtLeast(0L)
-            anchorNanoTime = nowNs
+        val report = reportedPosMs.coerceAtLeast(0L)
+        val rate = speed.coerceIn(0.25f, 4f)
+        if (!playing || !isPlaying || rate != playbackSpeed || report < lastReportMs - 1_000L) {
+            reset(report, rate, playing, nowNs)
+            return
         }
-        playbackSpeed = safeSpeed
-        isPlaying = playing
+        // Equal samples are common while the embedded player stalls. Only media advancement
+        // extends our prediction horizon. Ignore late small backward reports.
+        if (report <= lastReportMs) return
+        val prediction = sampleInterpolatedMs(nowNs = nowNs)
+        val drift = report - prediction
+        anchorPosMs = if (abs(drift) > 220L) report else prediction + (drift * 0.55).roundToLong()
+        lastReportMs = report
+        lastAdvanceNs = nowNs
+        anchorNs = nowNs
     }
 
     fun sampleInterpolatedMs(
         maxDurationMs: Long = Long.MAX_VALUE,
         nowNs: Long = System.nanoTime(),
     ): Long {
-        val upper = maxDurationMs.coerceAtLeast(0L)
-        if (!isPlaying) return anchorPosMs.coerceIn(0L, upper)
-        val elapsedMs = ((nowNs - anchorNanoTime).coerceAtLeast(0L) / 1_000_000.0 * playbackSpeed).roundToLong()
-        return (anchorPosMs + elapsedMs).coerceIn(0L, upper)
+        val boundedNs = minOf(nowNs, lastAdvanceNs + 250_000_000L)
+        val elapsed = if (isPlaying) elapsedMediaMs(boundedNs, anchorNs) else 0L
+        return present(anchorPosMs + elapsed, maxDurationMs)
     }
+
+    private fun elapsedMediaMs(timeNs: Long, startNs: Long): Long =
+        ((timeNs - startNs).coerceAtLeast(0L) / 1_000_000.0 * playbackSpeed).roundToLong()
+
+    private fun present(candidate: Long, maxDurationMs: Long): Long {
+        lastPresentedMs = maxOf(lastPresentedMs, candidate).coerceIn(0L, maxDurationMs.coerceAtLeast(0L))
+        return lastPresentedMs
+    }
+
 }
 
 /**
@@ -179,13 +161,13 @@ class SubtitleTimelineMatcher(
 
         if (cursorIdx >= sortedEvents.size) return emptyList()
 
-        // First check exact strict range [startTimeMs .. endTimeMs]
+        // Media cue intervals are half-open. At a shared boundary only the incoming line is active.
         val exact = mutableListOf<DialogueEvent>()
         var idx = (cursorIdx - 2).coerceAtLeast(0)
         while (idx < sortedEvents.size) {
             val evt = sortedEvents[idx]
             if (evt.startTimeMs > currentMs + frameToleranceMs) break
-            if (currentMs in evt.startTimeMs..evt.endTimeMs) {
+            if (currentMs >= evt.startTimeMs && currentMs < evt.endTimeMs) {
                 exact.add(evt)
             }
             idx++

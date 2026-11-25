@@ -759,17 +759,8 @@ fun ProjectAndPrivacySheet(
     }
 }
 
-internal fun extractYouTubeId(url: String): String? {
-    val trimmed = url.trim()
-    if (trimmed.isEmpty()) return null
-    val patterns = listOf(
-        Regex("""(?:v=|/)([0-9A-Za-z_-]{11})(?:[?&/#]|$)"""),
-        Regex("""youtu\.be/([0-9A-Za-z_-]{11})"""),
-        Regex("""shorts/([0-9A-Za-z_-]{11})"""),
-        Regex("""live/([0-9A-Za-z_-]{11})"""),
-    )
-    return patterns.firstNotNullOfOrNull { it.find(trimmed)?.groupValues?.getOrNull(1) }
-}
+internal fun extractYouTubeId(url: String): String? =
+    com.example.domain.media.YouTubeMediaAdapter().extractVideoId(url)
 
 internal fun normalizeWebStreamUrl(raw: String): String? {
     val trimmed = raw.trim()

@@ -63,6 +63,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -115,6 +116,7 @@ import com.example.ui.theme.UnknownSpeakerGray
 import kotlin.math.roundToInt
 
 enum class InspectorTab {
+    OVERVIEW,
     TIMELINE,
     CAST,
     REPAIRS,
@@ -169,14 +171,15 @@ fun TimelineSubtitleEditor(
     onSelectQuotaMode: (QuotaSaverMode) -> Unit = {},
     onRetryAiTranscription: () -> Unit = {},
     onAttachSubtitleFile: () -> Unit = {},
+    verifiedLeadMs: Long = 0L,
+    playbackDurationMs: Long? = null,
+    coverage: com.example.domain.analysis.CoverageSummary = com.example.domain.analysis.CoverageSummary(),
+    layoutPasses: Long = 0L,
     modifier: Modifier = Modifier,
 ) {
-    var activeTab by remember { mutableStateOf(initialTab) }
-    LaunchedEffect(initialTab) {
-        activeTab = initialTab
-    }
+    var activeTab by rememberSaveable(initialTab) { mutableStateOf(initialTab) }
     var onlyUncertain by remember { mutableStateOf(false) }
-    var showToolsDrawer by remember { mutableStateOf(true) }
+    var showToolsDrawer by rememberSaveable { mutableStateOf(false) }
     var renamingSpeaker by remember { mutableStateOf<Speaker?>(null) }
     var showAddDialog by remember { mutableStateOf(false) }
     var showGlossaryDialog by remember { mutableStateOf(false) }
@@ -210,6 +213,8 @@ fun TimelineSubtitleEditor(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    FilterChip(selected = activeTab == InspectorTab.OVERVIEW, onClick = { activeTab = InspectorTab.OVERVIEW },
+                        label = { Text("Overview") }, modifier = Modifier.testTag("inspector_tab_overview"))
                     FilterChip(
                         selected = activeTab == InspectorTab.TIMELINE,
                         onClick = { activeTab = InspectorTab.TIMELINE },
@@ -518,6 +523,8 @@ fun TimelineSubtitleEditor(
         }
 
         when (activeTab) {
+            InspectorTab.OVERVIEW -> StudioOverview(project, currentTimeMs, playbackDurationMs, verifiedLeadMs,
+                coverage, layoutPasses, onTab = { activeTab = it })
             InspectorTab.CAST -> {
                 RunningSpeakerGlossaryTab(
                     project = project,
@@ -1497,8 +1504,8 @@ private fun StudioHealBeaconsTab(
                 key = { _, b -> b.id },
             ) { _, beacon ->
                 val accent = healBeaconColor(beacon.status)
-                val canUndo = beacon.status == HealBeaconStatus.HEALED &&
-                    (beacon.preHealSnapshotEvents.isNotEmpty() || beacon.replacedEventIds.isNotEmpty())
+                val canUndo = beacon.status !in setOf(HealBeaconStatus.HEALING, HealBeaconStatus.UNDONE) &&
+                    (beacon.preHealSnapshotEvents.isNotEmpty() || beacon.replacedEventIds.isNotEmpty() || beacon.preRepairCoverage.isNotEmpty())
                 Card(
                     colors = CardDefaults.cardColors(containerColor = CinemaSurface),
                     shape = RoundedCornerShape(14.dp),
@@ -1615,7 +1622,16 @@ private fun StudioChaptersTab(
             }
         } else {
             itemsIndexed(project.chapters, key = { _, ch -> ch.id }) { idx, chapter ->
-                val isCurrent = currentTimeMs in chapter.startMs..chapter.endMs
+                val isCurrent = currentTimeMs >= chapter.startMs && currentTimeMs < chapter.endMs
+                val inspection = project.chapterInspections.lastOrNull { it.chapterId == chapter.id && it.boundaryMs == chapter.startMs }
+                val repair = inspection?.beaconId?.let { id -> project.healBeacons.firstOrNull { it.id == id } }
+                val patrolStatus = when {
+                    chapter.startMs == 0L -> "Opening"
+                    inspection == null -> "Awaiting inspection"
+                    repair != null -> "Repair · ${healBeaconStatusLabel(repair.status)}"
+                    inspection.finding.isNotBlank() -> "Needs review · ${inspection.finding}"
+                    else -> "Inspected · no defect found"
+                }
                 val sourceLabel = when (chapter.source) {
                     ChapterSource.YOUTUBE_DESCRIPTION -> "Video chapter"
                     ChapterSource.YOUTUBE_METADATA -> "Video chapter"
@@ -1651,13 +1667,13 @@ private fun StudioChaptersTab(
                                 overflow = TextOverflow.Ellipsis,
                             )
                             Text(
-                                text = "${formatBeaconTimestamp(chapter.startMs)}–${formatBeaconTimestamp(chapter.endMs)} · $sourceLabel",
+                                text = "${formatBeaconTimestamp(chapter.startMs)}–${formatBeaconTimestamp(chapter.endMs)} · $sourceLabel · $patrolStatus",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = if (isCurrent) LensSky else MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                         OutlinedButton(
-                            onClick = { onChapterHeal(chapter.startMs + 1000L) },
+                            onClick = { onChapterHeal(chapter.startMs) },
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                         ) {
                             Icon(Icons.Filled.AutoFixHigh, contentDescription = null, modifier = Modifier.size(14.dp))

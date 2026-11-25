@@ -73,6 +73,7 @@ import com.example.ui.theme.ConfidenceMediumColor
 import com.example.ui.theme.InkMuted
 import com.example.ui.theme.InkPrimary
 import com.example.ui.theme.InkSecondary
+import com.example.ui.theme.LensAmethyst
 import com.example.ui.theme.LensSky
 
 /**
@@ -88,8 +89,8 @@ fun HealThisMomentPill(
     Surface(
         onClick = onClick,
         shape = RoundedCornerShape(999.dp),
-        color = LensSky.copy(alpha = 0.16f),
-        border = BorderStroke(1.dp, LensSky.copy(alpha = 0.55f)),
+        color = LensAmethyst.copy(alpha = 0.16f),
+        border = BorderStroke(1.dp, LensAmethyst.copy(alpha = 0.55f)),
         modifier = modifier
             .heightIn(min = 48.dp)
             .testTag("heal_this_moment_button")
@@ -106,7 +107,7 @@ fun HealThisMomentPill(
             Icon(
                 imageVector = Icons.Rounded.AutoFixHigh,
                 contentDescription = null,
-                tint = LensSky,
+                tint = LensAmethyst,
                 modifier = Modifier.size(18.dp),
             )
             Text(
@@ -196,6 +197,7 @@ fun ReadinessStatusPill(
 }
 
 fun healBeaconColor(status: HealBeaconStatus): Color = when (status) {
+    HealBeaconStatus.UNDONE -> LensSky
     HealBeaconStatus.MARKED -> LensSky
     HealBeaconStatus.HEALING -> LensSky
     HealBeaconStatus.HEALED -> ConfidenceHighColor
@@ -203,6 +205,7 @@ fun healBeaconColor(status: HealBeaconStatus): Color = when (status) {
 }
 
 fun healBeaconStatusLabel(status: HealBeaconStatus): String = when (status) {
+    HealBeaconStatus.UNDONE -> "Undone"
     HealBeaconStatus.MARKED -> "Marked"
     HealBeaconStatus.HEALING -> "Healing"
     HealBeaconStatus.HEALED -> "Healed"
@@ -245,8 +248,8 @@ fun HealBeaconDetailSheet(
 ) {
     var selectedScope by remember(beacon.id, beacon.scope) { mutableStateOf(beacon.scope) }
     val statusColor = healBeaconColor(beacon.status)
-    val canUndo = beacon.status == HealBeaconStatus.HEALED &&
-        (beacon.preHealSnapshotEvents.isNotEmpty() || beacon.replacedEventIds.isNotEmpty())
+    val canUndo = beacon.status !in setOf(HealBeaconStatus.HEALING, HealBeaconStatus.UNDONE) &&
+        (beacon.preHealSnapshotEvents.isNotEmpty() || beacon.replacedEventIds.isNotEmpty() || beacon.preRepairCoverage.isNotEmpty())
 
     ModalBottomSheet(
         onDismissRequest = onDismissSheet,
@@ -294,6 +297,7 @@ fun HealBeaconDetailSheet(
                                     tint = statusColor,
                                     modifier = Modifier.size(20.dp),
                                 )
+                                HealBeaconStatus.UNDONE -> Icon(Icons.AutoMirrored.Rounded.Undo, contentDescription = "Undone")
                                 HealBeaconStatus.MARKED -> Icon(
                                     Icons.Rounded.Schedule,
                                     contentDescription = null,

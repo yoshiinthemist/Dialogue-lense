@@ -4,26 +4,27 @@ import androidx.compose.ui.graphics.Color
 import com.example.data.model.SpeakerColorOrder
 
 // Cinema-first Obsidian studio palette — restrained so the video remains the hero
-val CinemaObsidian = Color(0xFF0A0E17)
-val CinemaSurface = Color(0xFF121826)
-val CinemaElevated = Color(0xFF1A2233)
-val CinemaSurfaceHigh = Color(0xFF222D42)
-val CinemaBorder = Color(0xFF2B3750)
+val CinemaObsidian = Color(0xFF101419)
+val CinemaSurface = Color(0xFF20272E)
+val CinemaElevated = Color(0xFF2A323B)
+val CinemaSurfaceHigh = Color(0xFF34404A)
+val CinemaBorder = Color(0xFF596773)
 
-val InkPrimary = Color(0xFFF1F5F9)
-val InkSecondary = Color(0xFF94A3B8)
-val InkMuted = Color(0xFF64748B)
+val InkPrimary = Color(0xFFF3F1EA)
+val InkSecondary = Color(0xFFBCC6CC)
+val InkMuted = Color(0xFF929FA9)
 
-val LensSky = Color(0xFF38BDF8)
-val LensSkyContainer = Color(0xFF0C4A6E)
-val LensAmber = Color(0xFFF59E0B)
+val LensSky = Color(0xFFBCE5CE)
+val LensSkyContainer = Color(0xFF264C3E)
+val LensAmber = Color(0xFFD5A36A)
 val LensAmberContainer = Color(0xFF451A03)
-val LensMint = Color(0xFF34D399)
+val LensMint = Color(0xFFBCE5CE)
+val LensAmethyst = Color(0xFFCDB4F1)
 val LensRose = Color(0xFFFB7185)
 
 // Confidence tiers
 val ConfidenceHighColor = Color(0xFF22C55E)
-val ConfidenceMediumColor = Color(0xFFF59E0B)
+val ConfidenceMediumColor = Color(0xFFD5A36A)
 val ConfidenceLowColor = Color(0xFFEF4444)
 
 // Speaker palette: Primary (Red, Blue, Yellow) -> Secondary (Green, Orange, Purple) -> Distinct unused (Cyan, Magenta, Lime, Teal)

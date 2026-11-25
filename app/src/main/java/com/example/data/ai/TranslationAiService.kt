@@ -18,7 +18,8 @@ import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
 import com.squareup.moshi.Moshi
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.IOException
 import org.json.JSONObject
 import kotlin.math.roundToInt
 
@@ -97,6 +98,10 @@ data class AiAudioTranscriptionResult(
     val invalidCueCount: Int = 0,
     val diagnosticNote: String = "",
 )
+
+/** Only our request deadline becomes a recoverable error. Cancelling the calling session still propagates. */
+internal suspend fun <T : Any> withModelDeadline(timeoutMs: Long, request: suspend () -> T): T =
+    withTimeoutOrNull(timeoutMs) { request() } ?: throw IOException("The dialogue service timed out.")
 
 class TranslationAiService {
 
@@ -499,7 +504,7 @@ class TranslationAiService {
     suspend fun pingFlashLiteHealth(): Result<Long> {
         val startedMs = android.os.SystemClock.elapsedRealtime()
         return try {
-            withTimeout(10_000L) {
+            withModelDeadline(10_000L) {
                 liteHeartbeatPingModel.generateContent("OK")
             }
             val elapsed = (android.os.SystemClock.elapsedRealtime() - startedMs).coerceAtLeast(1L)
@@ -531,8 +536,7 @@ class TranslationAiService {
             return Result.failure(IllegalArgumentException("Invalid YouTube video ID."))
         }
         return try {
-            val isSameLanguage = sourceLanguage.equals("Auto-Detect", ignoreCase = true) ||
-                sourceLanguage.equals(targetLanguage, ignoreCase = true)
+            val isSameLanguage = sourceLanguage.equals(targetLanguage, ignoreCase = true)
             val rosterBlock = if (knownSpeakers.isNotEmpty()) {
                 buildString {
                     appendLine("Current Running Speaker Glossary (STRICTLY reuse the same slot letter for returning speakers; NEVER reuse an occupied slot for a different person!):")
@@ -598,7 +602,7 @@ class TranslationAiService {
             }
 
             val activeYtModel = if (preferLiteModel) liteYoutubeVideoModel else youtubeVideoModel
-            val response = withTimeout(75_000L) {
+            val response = withModelDeadline(75_000L) {
                 activeYtModel.generateContent(requestContent)
             }
             val rawJson = response.text
@@ -662,11 +666,15 @@ class TranslationAiService {
                     }
                     text(researchPrompt)
                 }
-                val searchRes = runCatching {
-                    withTimeout(18_000L) {
+                val searchRes = try {
+                    withModelDeadline(18_000L) {
                         searchGroundedCastModel.generateContent(researchContent)
                     }
-                }.getOrNull()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
                 if (searchRes != null) {
                     groundedNotes = searchRes.text.orEmpty().trim()
                     val gm = searchRes.candidates.firstOrNull()?.groundingMetadata
@@ -711,7 +719,7 @@ class TranslationAiService {
                 }
                 text(extractionPrompt)
             }
-            val rosterResponse = withTimeout(18_000L) {
+            val rosterResponse = withModelDeadline(18_000L) {
                 castRosterModel.generateContent(extractionContent)
             }
             val rawJson = rosterResponse.text
@@ -832,7 +840,7 @@ class TranslationAiService {
             }
 
             val activeAudioModel = if (preferLiteModel) liteAudioAsrModel else audioAsrModel
-            val response = withTimeout(60_000L) {
+            val response = withModelDeadline(60_000L) {
                 activeAudioModel.generateContent(promptContent)
             }
             val rawJson = response.text
@@ -909,7 +917,7 @@ class TranslationAiService {
             }
 
             val activeTranslationModel = if (preferLiteModel) liteModel else model
-            val response = withTimeout(20_000L) {
+            val response = withModelDeadline(20_000L) {
                 activeTranslationModel.generateContent(payload)
             }
             val rawJson = response.text
@@ -996,7 +1004,7 @@ class TranslationAiService {
             }
 
             val activeContextModel = if (preferLiteModel) liteContextAttributionModel else contextAttributionModel
-            val response = withTimeout(20_000L) {
+            val response = withModelDeadline(20_000L) {
                 activeContextModel.generateContent(multimodalContent)
             }
             val rawJson = response.text

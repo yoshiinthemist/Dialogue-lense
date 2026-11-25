@@ -123,7 +123,8 @@ object LookaheadWindowPlanner {
         rollingWindowSec: Int = ROLLING_SCOUT_WINDOW_SEC,
         maxWindows: Int = 180,
     ): List<Pair<Int, Int>> {
-        val safeDur = durationSec.coerceAtLeast(30)
+        if (durationSec <= 0) return emptyList()
+        val safeDur = durationSec
         return buildList {
             add(0 to minOf(safeDur, openingWindowSec))
             var start = openingWindowSec

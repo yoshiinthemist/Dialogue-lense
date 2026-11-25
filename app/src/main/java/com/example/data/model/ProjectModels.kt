@@ -354,6 +354,7 @@ enum class HealBeaconStatus {
     HEALING,
     HEALED,
     NEEDS_ATTENTION,
+    UNDONE,
 }
 
 enum class HealScope {
@@ -378,6 +379,19 @@ data class HealBeacon(
     val preHealSnapshotEvents: List<DialogueEvent> = emptyList(),
     val replacedEventIds: List<String> = emptyList(),
     val autoTriggered: Boolean = false,
+    val postHealSnapshotEvents: List<DialogueEvent> = emptyList(),
+    val revision: Long = 0,
+    val preRepairCoverage: List<CoverageInterval> = emptyList(),
+    val coverageRepairToken: String? = null,
+)
+
+@JsonClass(generateAdapter = true)
+data class ChapterInspection(
+    val chapterId: String,
+    val boundaryMs: Long,
+    val checkedAtEpochMs: Long,
+    val finding: String = "",
+    val beaconId: String? = null,
 )
 
 @JsonClass(generateAdapter = true)
@@ -430,6 +444,8 @@ data class DialogueLensProject(
     val lastPlaybackPositionMs: Long = 0L,
     val lastWatchedAtEpochMs: Long = 0L,
     val coveragePercent: Int = 0,
+    val coverageIntervals: List<CoverageInterval> = emptyList(),
+    val chapterInspections: List<ChapterInspection> = emptyList(),
 )
 
 /**
@@ -498,6 +514,7 @@ data class CoverageInterval(
     val lastFailureReason: String = "",
     val dialogueCount: Int = 0,
     val silenceConfirmed: Boolean = status == CoverageStatus.VERIFIED_SILENCE,
+    val repairToken: String? = null,
     val updatedAtEpochMs: Long = 0L,
 )
 

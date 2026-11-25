@@ -101,6 +101,18 @@ class TranscriptCoverageLedger(
     initialIntervals: List<CoverageInterval> = emptyList(),
 ) {
     private val lock = Any()
+    private val repairReservations = mutableMapOf<String, Pair<Long, Long>>()
+
+    fun tryReserveRepair(key: String, startMs: Long, endMs: Long): Boolean = synchronized(lock) {
+        if (endMs <= startMs || repairReservations.values.any { (s, e) -> s < endMs && e > startMs } ||
+            intervals.any { it.status == CoverageStatus.IN_PROGRESS && it.startMs < endMs && it.endMs > startMs }) {
+            return@synchronized false
+        }
+        repairReservations[key] = startMs to endMs
+        true
+    }
+
+    fun releaseRepair(key: String) { synchronized(lock) { repairReservations.remove(key) } }
     private var totalDurationMs: Long = initialDurationMs.coerceAtLeast(0L)
     private val intervals = mutableListOf<CoverageInterval>()
 
@@ -251,6 +263,32 @@ class TranscriptCoverageLedger(
         }
     }
 
+    /** Only newly verified evidence belongs to this repair. Later Scout evidence supersedes its token. */
+    fun recordRepairEvidence(evidence: List<CoverageInterval>, token: String): List<CoverageInterval> = synchronized(lock) {
+        val originals = mutableListOf<CoverageInterval>()
+        for (span in evidence) {
+            if (!span.verified || span.startMs < 0 || span.endMs <= span.startMs) continue
+            ensureDurationAtLeastLocked(span.endMs)
+            applyIntervalMutationLocked(span.startMs, span.endMs) { previous ->
+                if (previous.verified || previous.status == CoverageStatus.IN_PROGRESS) previous else {
+                    originals.add(previous)
+                    span.copy(startMs = previous.startMs, endMs = previous.endMs, repairToken = token)
+                }
+            }
+        }
+        originals
+    }
+
+    fun undoRepairEvidence(originals: List<CoverageInterval>, token: String) {
+        synchronized(lock) {
+            for (original in originals) {
+                applyIntervalMutationLocked(original.startMs, original.endMs) { current ->
+                    if (current.repairToken == token) original.copy(startMs = current.startMs, endMs = current.endMs) else current
+                }
+            }
+        }
+    }
+
     fun recordOutcome(
         startMs: Long,
         endMs: Long,
@@ -275,13 +313,14 @@ class TranscriptCoverageLedger(
             applyIntervalMutationLocked(s, e) { existing ->
                 if (!forceOverrideHigherAuthority &&
                     existing.verified &&
-                    sourcePriority(existing.source) > sourcePriority(source)
+                    (!isVerified || sourcePriority(existing.source) > sourcePriority(source))
                 ) {
                     existing
                 } else {
                     val nextRetries = if (incrementRetry) existing.retryAttempts + 1 else existing.retryAttempts
                     existing.copy(
                         status = status,
+                        repairToken = null,
                         source = source,
                         verified = isVerified,
                         retryAttempts = nextRetries,
@@ -381,7 +420,7 @@ class TranscriptCoverageLedger(
         val verified = intervals
             .filter { it.verified && it.endMs > it.startMs }
             .map { TimeWindowRange(it.startMs, it.endMs) }
-        LookaheadWindowPlanner.coalesceBufferedRanges(verified, bridgeGapMs = 1L)
+        LookaheadWindowPlanner.coalesceBufferedRanges(verified, bridgeGapMs = 0L)
     }
 
     fun failedRanges(): List<TimeWindowRange> = synchronized(lock) {
@@ -391,7 +430,7 @@ class TranscriptCoverageLedger(
                     it.endMs > it.startMs
             }
             .map { TimeWindowRange(it.startMs, it.endMs) }
-        LookaheadWindowPlanner.coalesceBufferedRanges(failed, bridgeGapMs = 1L)
+        LookaheadWindowPlanner.coalesceBufferedRanges(failed, bridgeGapMs = 0L)
     }
 
     fun furthestAnalyzedMs(): Long = synchronized(lock) {
@@ -399,6 +438,18 @@ class TranscriptCoverageLedger(
             .filter { it.status != CoverageStatus.PENDING && it.status != CoverageStatus.IN_PROGRESS }
             .maxOfOrNull { it.endMs }
             ?: 0L
+    }
+
+    /** Continuous verified speech or confirmed silence forward from the actual playhead. */
+    fun verifiedLeadMs(positionMs: Long): Long = synchronized(lock) {
+        val position = positionMs.coerceAtLeast(0L)
+        var cursor = position
+        for (interval in intervals) {
+            if (interval.endMs <= cursor) continue
+            if (interval.startMs > cursor || !interval.verified) break
+            cursor = interval.endMs
+        }
+        cursor - position
     }
 
     fun continuousVerifiedUpToMs(): Long = synchronized(lock) {
@@ -532,7 +583,21 @@ class TranscriptCoverageLedger(
     ): CoverageInterval? = synchronized(lock) {
         if (totalDurationMs <= 0L) return@synchronized null
         val safePlayhead = playheadMs.coerceIn(0L, totalDurationMs)
-        val candidates = intervals.filter { iv ->
+        // Keep the remaining unreserved part of each gap available to Scout.
+        val available = if (repairReservations.isEmpty()) intervals else intervals.flatMap { interval ->
+            var slices = listOf(interval)
+            for ((start, end) in repairReservations.values) {
+                slices = slices.flatMap { slice ->
+                    if (slice.endMs <= start || slice.startMs >= end) listOf(slice)
+                    else listOfNotNull(
+                        slice.copy(endMs = start).takeIf { slice.startMs < start },
+                        slice.copy(startMs = end).takeIf { slice.endMs > end },
+                    )
+                }
+            }
+            slices
+        }
+        val candidates = available.filter { iv ->
             !iv.verified &&
                 iv.status != CoverageStatus.IN_PROGRESS &&
                 iv.endMs > iv.startMs &&
@@ -708,6 +773,7 @@ class TranscriptCoverageLedger(
                 prev.verified == iv.verified &&
                 prev.retryAttempts == iv.retryAttempts &&
                 prev.lastFailureReason == iv.lastFailureReason &&
+                prev.repairToken == iv.repairToken &&
                 prev.silenceConfirmed == iv.silenceConfirmed
             ) {
                 coalesced[coalesced.lastIndex] = prev.copy(
