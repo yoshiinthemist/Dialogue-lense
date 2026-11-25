@@ -272,7 +272,8 @@ class TranscriptCoverageLedger(
     fun recordRepairEvidence(evidence: List<CoverageInterval>, token: String): List<CoverageInterval> = synchronized(lock) {
         val originals = mutableListOf<CoverageInterval>()
         for (span in evidence) {
-            if (!span.verified || span.startMs < 0 || span.endMs <= span.startMs) continue
+            if (!span.verified || span.startMs < 0 || span.endMs <= span.startMs ||
+                (span.status == CoverageStatus.VERIFIED_DIALOGUE && span.dialogueCount <= 0)) continue
             ensureDurationAtLeastLocked(span.endMs)
             if (sourcePriority(span.source) > sourcePriority(activeSource)) activeSource = span.source
             applyIntervalMutationLocked(span.startMs, span.endMs) { previous ->
@@ -314,8 +315,11 @@ class TranscriptCoverageLedger(
             if (sourcePriority(source) >= sourcePriority(activeSource)) {
                 activeSource = source
             }
-            val isVerified = status == CoverageStatus.VERIFIED_DIALOGUE || status == CoverageStatus.VERIFIED_SILENCE
-            val isSilence = status == CoverageStatus.VERIFIED_SILENCE
+            val emptyDialogue = status == CoverageStatus.VERIFIED_DIALOGUE && dialogueCount <= 0
+            val nextStatus = if (emptyDialogue) CoverageStatus.FAILED else status
+            val reason = if (emptyDialogue) failureReason.ifBlank { "EMPTY_VERIFIED_DIALOGUE_REJECTED" } else failureReason
+            val isVerified = nextStatus == CoverageStatus.VERIFIED_DIALOGUE || nextStatus == CoverageStatus.VERIFIED_SILENCE
+            val isSilence = nextStatus == CoverageStatus.VERIFIED_SILENCE
             applyIntervalMutationLocked(s, e) { existing ->
                 if (!forceOverrideHigherAuthority &&
                     existing.verified &&
@@ -323,14 +327,14 @@ class TranscriptCoverageLedger(
                 ) {
                     existing
                 } else {
-                    val nextRetries = if (incrementRetry) existing.retryAttempts + 1 else existing.retryAttempts
+                    val nextRetries = if (incrementRetry || emptyDialogue) existing.retryAttempts + 1 else existing.retryAttempts
                     existing.copy(
-                        status = status,
+                        status = nextStatus,
                         repairToken = null,
                         source = source,
                         verified = isVerified,
                         retryAttempts = nextRetries,
-                        lastFailureReason = if (isVerified) "" else failureReason.ifBlank { existing.lastFailureReason },
+                        lastFailureReason = if (isVerified) "" else reason.ifBlank { existing.lastFailureReason },
                         dialogueCount = if (isSilence) 0 else dialogueCount.coerceAtLeast(0),
                         silenceConfirmed = isSilence,
                         updatedAtEpochMs = nowEpochMs,
@@ -453,6 +457,25 @@ class TranscriptCoverageLedger(
         val index = verifiedRanges.binarySearchBy(position) { it.startMs }
         val range = verifiedRanges.getOrNull(if (index >= 0) index else -index - 2)
         if (range == null) 0L else (range.endMs - position).coerceAtLeast(0L)
+    }
+
+    fun continuousVerifiedLeadFrom(positionMs: Long): Long = verifiedLeadMs(positionMs)
+
+    fun coverageStatusAt(positionMs: Long): CoverageStatus? = synchronized(lock) {
+        if (positionMs !in 0L until totalDurationMs) return@synchronized null
+        val index = intervals.binarySearchBy(positionMs) { it.startMs }
+        intervals.getOrNull(if (index >= 0) index else -index - 2)?.status
+    }
+
+    fun hasFailedIntervalAt(positionMs: Long): Boolean = when (coverageStatusAt(positionMs)) {
+        CoverageStatus.FAILED, CoverageStatus.PARTIAL_RECOVERY -> true
+        else -> false
+    }
+
+    fun firstUnverifiedGapFrom(positionMs: Long, horizonMs: Long): CoverageInterval? = synchronized(lock) {
+        val start = positionMs.coerceIn(0L, totalDurationMs)
+        val end = start + horizonMs.coerceIn(0L, totalDurationMs - start)
+        intervals.firstOrNull { !it.verified && it.endMs > start && it.startMs < end }
     }
 
     fun continuousVerifiedUpToMs(): Long = verifiedLeadMs(0L)

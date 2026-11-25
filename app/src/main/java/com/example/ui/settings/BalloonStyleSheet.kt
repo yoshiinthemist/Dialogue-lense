@@ -33,6 +33,16 @@ import com.example.data.model.BubbleVisualStyle
 import com.example.data.model.SpeakerLabelMode
 import kotlin.math.roundToInt
 
+internal fun BalloonStyleSettings.withVisualPreset(preset: BubbleVisualStyle): BalloonStyleSettings {
+    return when {
+        preset == BubbleVisualStyle.READING_COMFORT -> copy(visualStyle = preset, reducedMotion = true,
+            stablePositioning = true, highContrastMode = true, showTail = false, showConfidenceIndicators = false,
+            showSpeakerLabels = true, labelMode = SpeakerLabelMode.ALWAYS, fontScale = fontScale.coerceAtLeast(1.1f))
+        visualStyle == BubbleVisualStyle.READING_COMFORT -> copy(visualStyle = preset, highContrastMode = false)
+        else -> copy(visualStyle = preset)
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BalloonStyleSheet(
@@ -66,27 +76,14 @@ fun BalloonStyleSheet(
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                val readingComfort = settings.stablePositioning && settings.reducedMotion && !settings.showTail && settings.highContrastMode
                 BubbleVisualStyle.entries.forEach { preset ->
                     FilterChip(
-                        selected = !readingComfort && settings.visualStyle == preset,
-                        onClick = {
-                            onUpdate(if (readingComfort) settings.copy(visualStyle = preset, highContrastMode = false)
-                                else settings.copy(visualStyle = preset))
-                        },
-                        label = { Text(when (preset) {
-                            BubbleVisualStyle.CINEMA_SUBTLE -> "Cinema"
-                            BubbleVisualStyle.MANGA_INK -> "Manga"
-                            BubbleVisualStyle.STREAMING_CLEAN -> "Minimal"
-                        }) },
+                        selected = settings.visualStyle == preset,
+                        onClick = { onUpdate(settings.withVisualPreset(preset)) },
+                        label = { Text(preset.label) },
                         modifier = Modifier.testTag("preset_${preset.name.lowercase()}"),
                     )
                 }
-                FilterChip(selected = readingComfort, onClick = {
-                    onUpdate(settings.copy(stablePositioning = true, reducedMotion = true, highContrastMode = true,
-                        showTail = false, fontScale = settings.fontScale.coerceAtLeast(1.1f), showConfidenceIndicators = false,
-                        showSpeakerLabels = true, labelMode = SpeakerLabelMode.ALWAYS))
-                }, label = { Text("Reading Comfort") }, modifier = Modifier.testTag("preset_reading_comfort"))
             }
 
             val sample = remember {

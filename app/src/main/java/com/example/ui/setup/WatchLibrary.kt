@@ -47,6 +47,9 @@ internal fun WatchHome(
     projects: List<DialogueLensProject>,
     viewModel: DialogueLensViewModel,
     onSelectExisting: () -> Unit,
+    onQuickTour: () -> Unit,
+    hasCompletedOnboarding: Boolean,
+    cloudDialogueConfigured: Boolean,
     onAdvancedImport: () -> Unit,
     onLibrary: () -> Unit,
 ) {
@@ -102,9 +105,9 @@ internal fun WatchHome(
                 Text("What do you want to watch?", style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
             }
-            if (!viewModel.uiState.value.cloudDialogueConfigured) {
+            if (!cloudDialogueConfigured) {
                 item {
-                    Text("This build uses native or attached subtitles. For a video without captions, attach an SRT or VTT file in Import settings.",
+                    Text("This build uses native or attached subtitles. For a video without captions, attach an SRT or VTT file in Import options.",
                         style = MaterialTheme.typography.bodyMedium)
                 }
             }
@@ -144,6 +147,9 @@ internal fun WatchHome(
             item {
                 Row(Modifier.horizontalScroll(rememberScrollState())) {
                     TextButton(onClick = onAdvancedImport) { Text("Import options") }
+                    TextButton(onClick = onQuickTour, modifier = Modifier.testTag("open_quick_tour")) {
+                        Text(if (hasCompletedOnboarding) "Replay tour" else "Quick tour")
+                    }
                     TextButton(onClick = { onSelectExisting(); viewModel.loadDemoScenario() }) { Text("Try the demo") }
                 }
             }

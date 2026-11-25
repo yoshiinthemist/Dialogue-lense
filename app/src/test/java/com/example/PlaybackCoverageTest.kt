@@ -20,7 +20,7 @@ class PlaybackCoverageTest {
     }
 
     @Test fun failedOrPartialWorkCannotReplaceVerifiedEvidenceAndDoesNotBridgeGaps() {
-        ledger.recordOutcome(0, 5_000, CoverageStatus.VERIFIED_DIALOGUE, SubtitleSourceKind.AI_DRAFT)
+        ledger.recordOutcome(0, 5_000, CoverageStatus.VERIFIED_DIALOGUE, SubtitleSourceKind.AI_DRAFT, dialogueCount = 1)
         ledger.recordOutcome(0, 8_000, CoverageStatus.FAILED, SubtitleSourceKind.AI_DRAFT)
         ledger.recordOutcome(8_000, 15_000, CoverageStatus.PARTIAL_RECOVERY)
         ledger.recordOutcome(15_000, 30_000, CoverageStatus.VERIFIED_SILENCE)

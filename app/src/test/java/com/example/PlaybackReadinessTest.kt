@@ -2,7 +2,7 @@ package com.example
 
 import com.example.domain.analysis.MediaTransport
 import com.example.domain.analysis.PlaybackPhase
-import com.example.domain.analysis.PlaybackReadinessController
+import com.example.domain.playback.PlaybackReadinessController
 import org.junit.Assert.*
 import org.junit.Test
 

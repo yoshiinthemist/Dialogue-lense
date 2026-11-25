@@ -110,6 +110,7 @@ fun PlayerControlsBar(
     onHealThisMoment: () -> Unit = {},
     onInspectHealBeacon: (String) -> Unit = {},
     activeChapterTitle: String? = null,
+    isIntentionallyPausedByUser: Boolean = !isPlaying,
     modifier: Modifier = Modifier,
 ) {
     val duration = project.videoSource.durationMs.coerceAtLeast(1000L)
@@ -521,8 +522,8 @@ fun PlayerControlsBar(
                 }
             }
 
-            // 2b. Contextual Heal Beacon action — appears calmly whenever paused ("Pause. Mark. Heal. Continue.")
-            if (!isPlaying && !isEditMode) {
+            // 2b. Contextual Heal Beacon action — appears strictly during intentional user pause ("Pause. Mark. Heal. Continue.")
+            if (isIntentionallyPausedByUser && !isPlaying && !isEditMode) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.Center,

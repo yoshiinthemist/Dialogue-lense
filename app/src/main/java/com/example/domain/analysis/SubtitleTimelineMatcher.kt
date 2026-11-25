@@ -4,6 +4,16 @@ import com.example.data.model.DialogueEvent
 import kotlin.math.abs
 import kotlin.math.roundToLong
 
+data class PlaybackClockDiagnostics(
+    val authoritativeMediaMs: Long = 0L,
+    val presentationClockMs: Long = 0L,
+    val lastCorrectionDeltaMs: Long = 0L,
+    val suppressedBackwardJitters: Int = 0,
+    val stallExtrapolationClamps: Int = 0,
+    val hardDiscontinuityResets: Int = 0,
+    val isMediaStalled: Boolean = false,
+)
+
 /**
  * High-precision monotonic playback clock synchronized against Media3 ExoPlayer position and
  * playback rate (for local media) or JS bridge position heartbeats (for embedded YouTube / Web streams).
@@ -18,6 +28,18 @@ class PlaybackClockAnchor {
     private var playbackSpeed = 1f
     private var isPlaying = false
 
+    private var authoritativeMediaMs = 0L
+    private var lastCorrectionDeltaMs = 0L
+    private var suppressedBackwardJitters = 0
+    private var stallExtrapolationClamps = 0
+    private var hardDiscontinuityResets = 0
+    private var isMediaStalled = false
+
+    fun diagnostics() = PlaybackClockDiagnostics(
+        authoritativeMediaMs, lastPresentedMs, lastCorrectionDeltaMs, suppressedBackwardJitters,
+        stallExtrapolationClamps, hardDiscontinuityResets, isMediaStalled,
+    )
+
     fun reset(
         positionMs: Long = 0L,
         speed: Float = 1f,
@@ -25,6 +47,9 @@ class PlaybackClockAnchor {
         nowNs: Long = System.nanoTime(),
     ) {
         anchorPosMs = positionMs.coerceAtLeast(0L)
+        authoritativeMediaMs = anchorPosMs
+        lastCorrectionDeltaMs = 0L
+        isMediaStalled = false
         lastPresentedMs = anchorPosMs
         lastReportMs = anchorPosMs
         anchorNs = nowNs
@@ -49,7 +74,12 @@ class PlaybackClockAnchor {
     ): Long {
         val report = exoPosMs.coerceIn(0L, maxDurationMs.coerceAtLeast(0L))
         val rate = speed.coerceIn(0.25f, 4f)
-        if (!playing || !isPlaying || rate != playbackSpeed || abs(report - lastReportMs) > 1_000L) {
+        val discontinuity = abs(report - lastReportMs) > BACKWARD_DISCONTINUITY_THRESHOLD_MS
+        if (discontinuity && playing && isPlaying) hardDiscontinuityResets++
+        if (report < authoritativeMediaMs && !discontinuity && playing) suppressedBackwardJitters++
+        authoritativeMediaMs = report
+        lastCorrectionDeltaMs = report - lastPresentedMs
+        if (!playing || !isPlaying || rate != playbackSpeed || discontinuity) {
             reset(report, rate, playing, nowNs)
         } else if (report > lastReportMs) {
             anchorPosMs = report
@@ -57,6 +87,7 @@ class PlaybackClockAnchor {
             lastAdvanceNs = nowNs
             anchorNs = nowNs
         }
+        isMediaStalled = playing && elapsedMediaMs(nowNs, lastAdvanceNs) > 48L
         return present(minOf(anchorPosMs + elapsedMediaMs(nowNs, anchorNs), lastReportMs + 48L), maxDurationMs)
     }
 
@@ -68,15 +99,22 @@ class PlaybackClockAnchor {
     ) {
         val report = reportedPosMs.coerceAtLeast(0L)
         val rate = speed.coerceIn(0.25f, 4f)
-        if (!playing || !isPlaying || rate != playbackSpeed || report < lastReportMs - 1_000L) {
+        val discontinuity = report < lastReportMs - BACKWARD_DISCONTINUITY_THRESHOLD_MS ||
+            report > lastPresentedMs + FORWARD_DISCONTINUITY_THRESHOLD_MS
+        if (discontinuity && playing && isPlaying) hardDiscontinuityResets++
+        if (!playing || !isPlaying || rate != playbackSpeed || discontinuity) {
             reset(report, rate, playing, nowNs)
             return
         }
         // Equal samples are common while the embedded player stalls. Only media advancement
         // extends our prediction horizon. Ignore late small backward reports.
-        if (report <= lastReportMs) return
         val prediction = sampleInterpolatedMs(nowNs = nowNs)
         val drift = report - prediction
+        lastCorrectionDeltaMs = drift
+        if (report != authoritativeMediaMs && drift < 0) suppressedBackwardJitters++
+        authoritativeMediaMs = report
+        if (report <= lastReportMs) return
+        isMediaStalled = false
         anchorPosMs = if (abs(drift) > 220L) report else prediction + (drift * 0.55).roundToLong()
         lastReportMs = report
         lastAdvanceNs = nowNs
@@ -87,7 +125,12 @@ class PlaybackClockAnchor {
         maxDurationMs: Long = Long.MAX_VALUE,
         nowNs: Long = System.nanoTime(),
     ): Long {
-        val boundedNs = minOf(nowNs, lastAdvanceNs + 250_000_000L)
+        val deadlineNs = lastAdvanceNs + MAX_REMOTE_EXTRAPOLATION_MS * 1_000_000L
+        if (isPlaying && nowNs > deadlineNs && !isMediaStalled) {
+            isMediaStalled = true
+            stallExtrapolationClamps++
+        }
+        val boundedNs = minOf(nowNs, deadlineNs)
         val elapsed = if (isPlaying) elapsedMediaMs(boundedNs, anchorNs) else 0L
         return present(anchorPosMs + elapsed, maxDurationMs)
     }
@@ -100,6 +143,11 @@ class PlaybackClockAnchor {
         return lastPresentedMs
     }
 
+    companion object {
+        const val FORWARD_DISCONTINUITY_THRESHOLD_MS = 420L
+        const val BACKWARD_DISCONTINUITY_THRESHOLD_MS = 380L
+        const val MAX_REMOTE_EXTRAPOLATION_MS = 250L
+    }
 }
 
 /**

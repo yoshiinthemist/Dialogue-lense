@@ -39,9 +39,10 @@ object ChapterPatrol {
     fun nextInspection(
         project: DialogueLensProject, coverage: List<CoverageInterval>, positionMs: Long,
         nowEpochMs: Long = System.currentTimeMillis(),
+        chapterId: String? = null,
     ): Result? {
         val boundaries = project.chapters.asSequence()
-            .filter { ch -> ch.startMs > 0 && project.chapterInspections.none {
+            .filter { ch -> ch.startMs > 0 && (chapterId == null || ch.id == chapterId) && project.chapterInspections.none {
                 it.chapterId == ch.id && it.boundaryMs == ch.startMs
             } }
             .sortedWith(compareBy<VideoChapter> { it.startMs < positionMs }.thenBy { kotlin.math.abs(it.startMs - positionMs) })

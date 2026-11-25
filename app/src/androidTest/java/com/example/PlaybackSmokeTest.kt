@@ -10,6 +10,7 @@ import android.content.res.Configuration
 import android.net.Uri
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebView
@@ -24,6 +25,8 @@ import androidx.compose.ui.test.performTextInput
 import androidx.lifecycle.ViewModelProvider
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.ui.PlayerView
+import androidx.test.espresso.Espresso.closeSoftKeyboard
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.SdkSuppress
 import androidx.test.platform.app.InstrumentationRegistry
@@ -55,10 +58,12 @@ class PlaybackSmokeTest {
 
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private lateinit var model: DialogueLensViewModel
+    private lateinit var screen: MainActivity
 
     @Before
     fun findActivityPlayer() {
         ui.activityRule.scenario.onActivity { activity ->
+            screen = activity
             model = ViewModelProvider(activity)[DialogueLensViewModel::class.java]
         }
     }
@@ -102,10 +107,17 @@ class PlaybackSmokeTest {
         val opening = cues.getValue("Opening line.")
         val afterCut = cues.getValue("After the cut.")
 
-        onPlayer { togglePlayPause() }
+        ui.onNodeWithTag("video_player_stage").assertIsDisplayed()
+        waitForPlayer("Watch video surface attached before the first tap") {
+            descendants(screen.window.decorView).filterIsInstance<PlayerView>().any { view ->
+                val surface = view.videoSurfaceView as? SurfaceView
+                view.player === exoPlayer && view.isShown && surface?.holder?.surface?.isValid == true
+            }
+        }
+        ui.onNodeWithTag("toggle_play_pause_button").assertIsDisplayed().performClick()
         waitForPlayer("decoded opening video frames with first cue") {
             exoPlayer.isPlaying && exoPlayer.currentPosition in 820L..2_300L &&
-                (exoPlayer.videoDecoderCounters?.renderedOutputBufferCount ?: 0) > 0 &&
+                (exoPlayer.videoDecoderCounters?.apply { ensureUpdated() }?.renderedOutputBufferCount ?: 0) > 0 &&
                 uiState.value.placedBalloons.any { it.event.id == opening }
         }
         onPlayer { seekTo(7_600L) }
@@ -226,12 +238,13 @@ class PlaybackSmokeTest {
                 uiState.value.project.videoSource.uriString == url &&
                     exoPlayer.playbackState == Player.STATE_READY && exoPlayer.duration in 11_900L..12_100L
             }
-            onPlayer { attachSubtitleFileToCurrentProject(fixture("two-lines.srt"), "two-lines.srt") }
+            val captions = fixture("two-lines.srt")
+            onPlayer { attachSubtitleFileToCurrentProject(captions, "two-lines.srt") }
             waitForPlayer("file attached to direct stream") { uiState.value.coverageSummary.isFullyVerified }
             onPlayer { seekTo(7_800L); togglePlayPause() }
             waitForPlayer("direct HTTP playback and matching second cue") {
                 exoPlayer.isPlaying && exoPlayer.currentPosition in 8_000L..9_400L &&
-                    (exoPlayer.videoDecoderCounters?.renderedOutputBufferCount ?: 0) > 0 &&
+                    (exoPlayer.videoDecoderCounters?.apply { ensureUpdated() }?.renderedOutputBufferCount ?: 0) > 0 &&
                     uiState.value.placedBalloons.any { it.event.sourceText == "After the cut." }
             }
             assertTrue(server.requested.contains("/clip.mp4"))
@@ -279,18 +292,21 @@ class PlaybackSmokeTest {
     private fun openLink(url: String) {
         onPlayer { setQuotaSaverMode(QuotaSaverMode.ZERO_CLOUD) }
         ui.onNodeWithTag("start_url_input").performTextInput(url)
+        closeSoftKeyboard()
         ui.onNodeWithTag("start_submit_url_button").performClick()
     }
 
-    private fun htmlMediaClock(): JSONArray {
-        fun webViews(view: View): List<WebView> = when (view) {
-            is WebView -> listOf(view)
-            is ViewGroup -> (0 until view.childCount).flatMap { webViews(view.getChildAt(it)) }
-            else -> emptyList()
+    private fun descendants(view: View): Sequence<View> = sequence {
+        yield(view)
+        if (view is ViewGroup) {
+            for (index in 0 until view.childCount) yieldAll(descendants(view.getChildAt(index)))
         }
+    }
+
+    private fun htmlMediaClock(): JSONArray {
         val result = LinkedBlockingQueue<String>(1)
         ui.activityRule.scenario.onActivity { activity ->
-            val viewer = webViews(activity.window.decorView).filter { it.isShown }
+            val viewer = descendants(activity.window.decorView).filterIsInstance<WebView>().filter { it.isShown }
                 .maxByOrNull { it.width.toLong() * it.height } ?: error("No visible WebView")
             viewer.evaluateJavascript("""
                 (() => {
@@ -312,16 +328,29 @@ class PlaybackSmokeTest {
 
     private fun waitForPlayer(description: String, ready: DialogueLensViewModel.() -> Boolean) {
         val deadline = SystemClock.elapsedRealtime() + 25_000L
+        val observations = mutableListOf<String>()
+        var nextSample = 0L
+        fun snapshot() = onPlayer {
+            val state = uiState.value
+            val frames = exoPlayer.videoDecoderCounters?.apply { ensureUpdated() }?.renderedOutputBufferCount
+            "media=${exoPlayer.currentPosition} ui=${state.currentTimeMs} frames=$frames " +
+                "transport=${exoPlayer.playbackState} intent=${state.viewerWantsPlay} " +
+                "phase=${state.playbackPhase} error=${exoPlayer.playerError?.errorCodeName} " +
+                "cues=${state.placedBalloons.map { it.event.sourceText }}"
+        }
         while (SystemClock.elapsedRealtime() < deadline) {
+            // Compose test frames and the real Media3 clock run independently. Render Watch
+            // between transport samples, as a real device choreographer does outside a test.
+            ui.mainClock.advanceTimeByFrame()
             if (onPlayer(ready)) return
+            val now = SystemClock.elapsedRealtime()
+            if (observations.size < 14 && now >= nextSample) {
+                observations += snapshot()
+                nextSample = now + 250L
+            }
             SystemClock.sleep(35L)
         }
-        val state = onPlayer {
-            "transport=${exoPlayer.playbackState} position=${exoPlayer.currentPosition} " +
-                "intent=${exoPlayer.playWhenReady} error=${exoPlayer.playerError?.errorCodeName} " +
-                "balloons=${uiState.value.placedBalloons.map { it.event.sourceText }}"
-        }
-        throw AssertionError("Timed out waiting for $description. $state")
+        throw AssertionError("Timed out waiting for $description. ${observations.joinToString(" | ")} | ${snapshot()}")
     }
 
     private fun <T> onPlayer(block: DialogueLensViewModel.() -> T): T {

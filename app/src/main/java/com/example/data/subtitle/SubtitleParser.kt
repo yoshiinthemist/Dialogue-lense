@@ -212,19 +212,123 @@ object SubtitleParser {
         events.sortedBy { it.startTimeMs }
 
     /**
-     * Ensures readable minimum dwell time (>= 1050ms unless constrained by next cue)
-     * so rapid micro-cues don't flicker too quickly to read.
+     * Reading-comfort pacing guardrails (Operation Golden Video Section 9):
+     * - Targets ~15–20 characters/second where trailing silence permits, without artificially
+     *   extending dialogue into subsequent speech or shifting speech onset.
+     * - Preserves minimum dwell (>= 1050ms unless constrained by next cue) and short interjections.
+     * - Splits overly dense single long cues (> 88 chars, > 23 CPS, duration >= 2.4s) cleanly at
+     *   natural punctuation or clause boundaries into two balanced consecutive sub-cues.
      */
     fun applyReadingPacingGuardrails(events: List<DialogueEvent>): List<DialogueEvent> {
         if (events.isEmpty()) return emptyList()
         val sorted = events.sortedBy { it.startTimeMs }
-        return sorted.mapIndexed { idx, evt ->
-            val nextStart = sorted.getOrNull(idx + 1)?.startTimeMs ?: Long.MAX_VALUE
-            val maxAllowedEnd = (nextStart - 60L).coerceAtLeast(evt.startTimeMs)
-            val desiredMinEnd = evt.startTimeMs + 1050L
-            val adjustedEnd = maxOf(evt.endTimeMs, minOf(desiredMinEnd, maxAllowedEnd))
+
+        // Pass 1: Extend short/fast cues gently into available trailing silence toward ~18-20 CPS
+        val paced = sorted.mapIndexed { idx, evt ->
+            if (evt.lockedByUser) return@mapIndexed evt
+            val text = evt.translatedText.ifBlank { evt.sourceText }.trim()
+            val nextSameOrAnyStart = sorted.getOrNull(idx + 1)?.startTimeMs ?: Long.MAX_VALUE
+            val isSimultaneousWithNext = nextSameOrAnyStart < evt.endTimeMs &&
+                sorted.getOrNull(idx + 1)?.speakerId != evt.speakerId
+            val maxAllowedEnd = if (isSimultaneousWithNext) {
+                evt.endTimeMs
+            } else {
+                (nextSameOrAnyStart - 60L).coerceAtLeast(evt.startTimeMs)
+            }
+            // Target ~18.5 CPS (~54ms/char) bounded between 1050ms and 6500ms, never exceeding original + 1800ms
+            // so dialogue never drifts into unrelated silence far after speech ends.
+            val readingTargetMs = (text.length * 54L).coerceIn(1_050L, 6_500L)
+            val maxGentleExtendEnd = maxOf(evt.endTimeMs + 1_800L, evt.startTimeMs + 1_050L)
+            val desiredEnd = minOf(evt.startTimeMs + readingTargetMs, maxGentleExtendEnd)
+            val adjustedEnd = maxOf(evt.endTimeMs, minOf(desiredEnd, maxAllowedEnd))
             evt.copy(endTimeMs = adjustedEnd)
         }
+
+        // Pass 2: Split overly dense monolithic cues (> 88 chars & > 23 CPS & >= 2400ms) at clause boundary
+        return buildList {
+            for (evt in paced) {
+                val displayText = evt.translatedText.ifBlank { evt.sourceText }.trim()
+                val durMs = (evt.endTimeMs - evt.startTimeMs).coerceAtLeast(1L)
+                val cps = displayText.length * 1000.0 / durMs.toDouble()
+                if (!evt.lockedByUser && displayText.length >= 88 && durMs >= 2_400L && cps > 23.0) {
+                    val splitPoint = findNaturalClauseSplitIndex(displayText)
+                    if (splitPoint != null) {
+                        val firstDisp = displayText.substring(0, splitPoint).trim()
+                        val secondDisp = displayText.substring(splitPoint).trim()
+                        if (firstDisp.length >= 16 && secondDisp.length >= 16) {
+                            val ratio = (firstDisp.length.toDouble() / (firstDisp.length + secondDisp.length).toDouble())
+                                .coerceIn(0.32, 0.68)
+                            val midMs = evt.startTimeMs + (durMs * ratio).toLong()
+                            val srcSame = evt.sourceText.trim() == evt.translatedText.trim()
+                            val srcSplit = if (srcSame) {
+                                firstDisp to secondDisp
+                            } else {
+                                val srcIdx = findNaturalClauseSplitIndex(evt.sourceText.trim())
+                                if (srcIdx != null) {
+                                    evt.sourceText.trim().substring(0, srcIdx).trim() to
+                                        evt.sourceText.trim().substring(srcIdx).trim()
+                                } else {
+                                    // Keep an indivisible source phrase together with its translation.
+                                    add(evt)
+                                    continue
+                                }
+                            }
+                            add(
+                                evt.copy(
+                                    endTimeMs = (midMs - 30L).coerceAtLeast(evt.startTimeMs + 700L),
+                                    sourceText = srcSplit.first.ifBlank { firstDisp },
+                                    translatedText = firstDisp,
+                                )
+                            )
+                            add(
+                                evt.copy(
+                                    id = "${evt.id}_p2",
+                                    startTimeMs = midMs,
+                                    sourceText = srcSplit.second.ifBlank { secondDisp },
+                                    translatedText = secondDisp,
+                                )
+                            )
+                            continue
+                        }
+                    }
+                }
+                add(evt)
+            }
+        }
+    }
+
+    private fun findNaturalClauseSplitIndex(text: String): Int? {
+        if (text.length < 48) return null
+        val mid = text.length / 2
+        val minIdx = (text.length * 0.28).toInt()
+        val maxIdx = (text.length * 0.72).toInt()
+        var bestPunctIdx: Int? = null
+        var bestPunctDist = Int.MAX_VALUE
+        for (i in minIdx..maxIdx) {
+            val ch = text[i]
+            if ((ch == '.' || ch == '!' || ch == '?' || ch == ';' || ch == ',' || ch == '—' || ch == ':') &&
+                i + 1 < text.length && text[i + 1] == ' '
+            ) {
+                val dist = kotlin.math.abs((i + 1) - mid)
+                if (dist < bestPunctDist) {
+                    bestPunctDist = dist
+                    bestPunctIdx = i + 1
+                }
+            }
+        }
+        if (bestPunctIdx != null) return bestPunctIdx
+        var bestSpaceIdx: Int? = null
+        var bestSpaceDist = Int.MAX_VALUE
+        for (i in minIdx..maxIdx) {
+            if (text[i] == ' ') {
+                val dist = kotlin.math.abs(i - mid)
+                if (dist < bestSpaceDist) {
+                    bestSpaceDist = dist
+                    bestSpaceIdx = i
+                }
+            }
+        }
+        return bestSpaceIdx
     }
 
     enum class SubtitleExportFormat(

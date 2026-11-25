@@ -121,9 +121,10 @@ enum class ConfidenceTier(val label: String) {
 }
 
 enum class BubbleVisualStyle(val label: String) {
-    CINEMA_SUBTLE("Cinema Subtle"),
-    MANGA_INK("Manga Ink"),
-    STREAMING_CLEAN("Clean Streaming"),
+    CINEMA_SUBTLE("Cinema"),
+    MANGA_INK("Manga"),
+    STREAMING_CLEAN("Minimal"),
+    READING_COMFORT("Reading Comfort"),
 }
 
 enum class SpeakerLabelMode(val label: String) {
@@ -365,6 +366,16 @@ enum class HealScope {
     CHAPTER,
 }
 
+enum class HealProblemHint(val label: String) {
+    NONE("Auto-diagnose"),
+    MISSING_DIALOGUE("Missing dialogue"),
+    WRONG_SPEAKER("Wrong speaker"),
+    INCORRECT_TIMING("Incorrect timing"),
+    UNSTABLE_BUBBLE("Unstable bubble"),
+    WRONG_POSITIONING("Wrong positioning"),
+    OTHER("Something else"),
+}
+
 @JsonClass(generateAdapter = true)
 data class HealBeacon(
     val id: String,
@@ -380,6 +391,12 @@ data class HealBeacon(
     val preHealSnapshotEvents: List<DialogueEvent> = emptyList(),
     val replacedEventIds: List<String> = emptyList(),
     val autoTriggered: Boolean = false,
+    val problemHint: HealProblemHint = HealProblemHint.NONE,
+    val repairRevision: Int = 0,
+    val changeSummary: String = "",
+    val patrolChapterId: String? = null,
+    val beforeSampleText: String = "",
+    val afterSampleText: String = "",
     val postHealSnapshotEvents: List<DialogueEvent> = emptyList(),
     val revision: Long = 0,
     val preRepairCoverage: List<CoverageInterval> = emptyList(),

@@ -182,6 +182,7 @@ fun VideoPlayerStage(
     onLiveFrameSnapshot: ((Long, LiveStageFrameSnapshot) -> Unit)? = null,
     playbackGeneration: Int = 0,
     onBodyRelocations: (Int) -> Unit = {},
+    onBalloonMeasurements: (String, Int, Map<String, Pair<Float, Float>>) -> Unit = { _, _, _ -> },
     onDismissQuickPicker: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -233,12 +234,14 @@ fun VideoPlayerStage(
                         stageBoundsInWindow = stageBoundsInWindow,
                         videoTimeMs = sampleTime,
                         videoSurface = localSurface,
-                        overlayBounds = captureMasks,
+                        overlayExclusionRects = captureMasks,
+                        projectId = project.id,
+                        seekGeneration = playbackGeneration.toLong(),
                     )
                     if (snapshot != null) {
                         val snapHandler = latestOnLiveSnapshot
                         if (snapHandler != null) {
-                            snapHandler(sampleTime, snapshot.copy(projectId = project.id, playbackGeneration = playbackGeneration))
+                            snapHandler(sampleTime, snapshot)
                         } else {
                             latestOnLiveFaces(sampleTime, snapshot.faces)
                         }
@@ -298,6 +301,7 @@ fun VideoPlayerStage(
                                 view.player = exoPlayer
                             }
                         },
+                        onRelease = { view -> view.player = null },
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -506,7 +510,9 @@ fun VideoPlayerStage(
             }
 
             // Deaf-First Cinema: Subtle Beat-Synced Music / Tension Mood Border (hairline outer glow on frame edge)
-            if (project.styleSettings.ambientMoodBorder && !project.styleSettings.highContrastMode) {
+            if (project.styleSettings.ambientMoodBorder && !project.styleSettings.highContrastMode &&
+                project.styleSettings.visualStyle != BubbleVisualStyle.READING_COMFORT
+            ) {
                 val activeSfx = placedBalloons.firstOrNull { it.event.dialogueType == DialogueType.SOUND_DESCRIPTION }
                 val activeShout = placedBalloons.firstOrNull { it.isShouted }
                 val moodTarget: Pair<Color, Float> = when {
@@ -741,6 +747,11 @@ fun VideoPlayerStage(
             val measured = sizes.toMap()
             val safeWidth = widthPx.coerceAtLeast(1f)
             val safeHeight = heightPx.coerceAtLeast(1f)
+            LaunchedEffect(project.id, playbackGeneration, measured, safeWidth, safeHeight) {
+                onBalloonMeasurements(project.id, playbackGeneration, measured.mapValues { (_, size) ->
+                    size.width / safeWidth to size.height / safeHeight
+                })
+            }
             val obstacles = activeFaceExclusions + project.textExclusionZones + activeShot?.focalExclusionZones.orEmpty()
             // Sample sustained speaker motion separately from cue timing and text measurement.
             val motionSample = if (visibleBodies.any { it.tailTarget != null && it.locationConfidence >= 0.8f }) {

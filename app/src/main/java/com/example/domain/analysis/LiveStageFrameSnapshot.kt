@@ -20,4 +20,11 @@ data class LiveStageFrameSnapshot(
     val hasLiveVisionSignal: Boolean = true,
     val projectId: String? = null,
     val playbackGeneration: Int? = null,
-)
+    val seekGeneration: Long = playbackGeneration?.toLong() ?: 0L,
+    val unmaskedSampleCount: Int = 48,
+    val emptyFrameConsecutiveCount: Int = 0,
+) {
+    companion object {
+        const val CONFIRMED_EMPTY_FRAME_STREAK = 2
+    }
+}

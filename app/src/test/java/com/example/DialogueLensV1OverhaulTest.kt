@@ -414,8 +414,8 @@ class DialogueLensV1OverhaulTest {
         val verified = com.example.data.model.CoverageStatus.VERIFIED_DIALOGUE
         val pending = com.example.data.model.CoverageStatus.PENDING
         ledger.reset(30_000, source = SubtitleSourceKind.AI_DRAFT)
-        val originals = ledger.recordRepairEvidence(listOf(com.example.data.model.CoverageInterval(10_000, 20_000, verified)), "attempt")
-        ledger.recordOutcome(12_000, 16_000, verified)
+        val originals = ledger.recordRepairEvidence(listOf(com.example.data.model.CoverageInterval(10_000, 20_000, verified, dialogueCount = 1)), "attempt")
+        ledger.recordOutcome(12_000, 16_000, verified, dialogueCount = 1)
         ledger.undoRepairEvidence(originals, "attempt")
         assertEquals(pending, ledger.intervalsSnapshot().single { 11_000L in it.startMs until it.endMs }.status)
         assertEquals(verified, ledger.intervalsSnapshot().single { 14_000L in it.startMs until it.endMs }.status)
@@ -453,6 +453,18 @@ class DialogueLensV1OverhaulTest {
         assertTrue(HierarchicalContextEngine.inferEditorialChapters(cues.mapIndexed { i, cue ->
             cue.copy(startTimeMs = i * 2_000L, endTimeMs = i * 2_000L + 2_000L)
         }, 500_000L).isEmpty())
+    }
+
+    @Test
+    fun legacyRepairWithoutPostSnapshotCannotDeleteALaterUnlockedTextEdit() {
+        val old = sampleEvent("old", 20_000, 24_000, "Original", "spk_a")
+        val edited = old.copy(id = "replacement", translatedText = "Later manual translation")
+        val mark = HealBeacon("v1", 22_000, 15_000, 30_000, status = HealBeaconStatus.HEALED,
+            preHealSnapshotEvents = listOf(old), replacedEventIds = listOf(edited.id))
+        val project = sampleProject(events = listOf(edited), beacons = listOf(mark))
+        val result = HealBeaconEngine.undoBeaconRepair(project, mark.id)
+        assertEquals(listOf(edited), result.dialogueEvents)
+        assertEquals(HealBeaconStatus.NEEDS_ATTENTION, result.healBeacons.single().status)
     }
 
     @Test

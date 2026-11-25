@@ -95,9 +95,9 @@ jobs:
           bundle=app/build/outputs/bundle/release/app-release.aab
           jarsigner -verify "$bundle"
           keytool -list -v -keystore "$KEYSTORE_PATH" -storepass:env STORE_PASSWORD -alias upload |
-            awk '/SHA256:/{print $2}' > "$RUNNER_TEMP/expected-sha256"
+            awk '/SHA256:/ && !seen++ {print $2}' > "$RUNNER_TEMP/expected-sha256"
           keytool -printcert -jarfile "$bundle" |
-            awk '/SHA256:/{print $2; exit}' > "$RUNNER_TEMP/bundle-sha256"
+            awk '/SHA256:/ && !seen++ {print $2}' > "$RUNNER_TEMP/bundle-sha256"
           test -s "$RUNNER_TEMP/bundle-sha256"
           diff "$RUNNER_TEMP/expected-sha256" "$RUNNER_TEMP/bundle-sha256"
       - uses: actions/upload-artifact@v4

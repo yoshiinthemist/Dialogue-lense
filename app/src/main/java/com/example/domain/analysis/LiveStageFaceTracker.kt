@@ -26,6 +26,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -64,7 +65,12 @@ class LiveStageFaceTracker {
     @Volatile
     private var previousVideoTimeMs: Long = -1L
 
+    private var consecutiveEmpty = 0
+    private var consecutiveSoftCuts = 0
+
     fun resetSceneHistory() {
+        consecutiveSoftCuts = 0
+        consecutiveEmpty = 0
         previousLumaGrid = null
         previousFaceSignature = emptyList()
         previousVideoTimeMs = -1L
@@ -82,7 +88,9 @@ class LiveStageFaceTracker {
         stageBoundsInWindow: ComposeRect,
         videoTimeMs: Long,
         videoSurface: SurfaceView? = null,
-        overlayBounds: List<NormalizedRect> = emptyList(),
+        overlayExclusionRects: List<NormalizedRect> = emptyList(),
+        projectId: String = "",
+        seekGeneration: Long = 0L,
     ): LiveStageFrameSnapshot? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
         if (closed || !hostView.isAttachedToWindow) return null
@@ -123,7 +131,7 @@ class LiveStageFaceTracker {
             }
             if (!copySuccess) return null
 
-            val masks = if (videoSurface != null) emptyList() else overlayBounds
+            val masks = if (videoSurface != null) emptyList() else overlayExclusionRects.map { it.expand(.018f, .018f) }
             val lumaGrid = computeLumaGrid(bitmap, masks)
             val lumaAverage = lumaGrid.filter { it.isFinite() }.average().toFloat()
             if (!lumaAverage.isFinite()) return null
@@ -160,22 +168,29 @@ class LiveStageFaceTracker {
                 .map { it.boundingBox.centerX to it.boundingBox.centerY }
 
             val prevGrid = previousLumaGrid
-            val lumaDiff = if (prevGrid != null) computeGridDistance(prevGrid, lumaGrid) else 0f
+            val (lumaDiff, cells) = if (prevGrid != null) computeMaskedGridDistance(prevGrid, lumaGrid) else 0f to lumaGrid.count { it.isFinite() }
             val timeDiscontinuity = previousVideoTimeMs >= 0L &&
                 kotlin.math.abs(videoTimeMs - previousVideoTimeMs) > 2_500L
             val faceLayoutJump = detectFaceLayoutCut(previousFaceSignature, currentFaceSig)
 
-            // Ignore completely dark transition frames as noise unless paired with big luma jump
-            val cutDetected = timeDiscontinuity ||
-                lumaDiff >= VISUAL_CUT_LUMA_THRESHOLD ||
-                (lumaDiff >= SOFT_CUT_LUMA_THRESHOLD && faceLayoutJump)
-
-            previousLumaGrid = lumaGrid
+            val reliable = cells >= MIN_UNMASKED_CELLS
+            val soft = reliable && lumaDiff >= SOFT_CUT_LUMA_THRESHOLD && faceLayoutJump
+            consecutiveSoftCuts = if (soft) consecutiveSoftCuts + 1 else 0
+            val cutDetected = timeDiscontinuity || (reliable && lumaDiff >= VISUAL_CUT_LUMA_THRESHOLD) ||
+                consecutiveSoftCuts >= 2
+            if (cutDetected) consecutiveSoftCuts = 0
+            consecutiveEmpty = if (observations.isEmpty()) consecutiveEmpty + 1 else 0
+            previousLumaGrid = if (cutDetected) lumaGrid else mergeGridPreservingMasked(prevGrid, lumaGrid)
             previousFaceSignature = currentFaceSig
             previousVideoTimeMs = videoTimeMs
 
             LiveStageFrameSnapshot(
                 faces = observations,
+                projectId = projectId,
+                playbackGeneration = seekGeneration.toInt(),
+                seekGeneration = seekGeneration,
+                emptyFrameConsecutiveCount = consecutiveEmpty,
+                unmaskedSampleCount = cells,
                 visualCutDetected = cutDetected,
                 cutDistance = lumaDiff,
                 frameLumaAverage = lumaAverage,
@@ -231,20 +246,38 @@ class LiveStageFaceTracker {
     }
 
     companion object {
-        const val VISUAL_CUT_LUMA_THRESHOLD = 0.165f
-        const val SOFT_CUT_LUMA_THRESHOLD = 0.105f
+        const val VISUAL_CUT_LUMA_THRESHOLD = 0.185f
+        const val SOFT_CUT_LUMA_THRESHOLD = 0.115f
+        const val MIN_UNMASKED_CELLS = 12
+        const val CONFIRMED_EMPTY_FRAME_STREAK = LiveStageFrameSnapshot.CONFIRMED_EMPTY_FRAME_STREAK
 
-        fun computeGridDistance(a: FloatArray, b: FloatArray): Float {
-            if (a.isEmpty() || a.size != b.size) return 0f
+        fun computeGridDistance(a: FloatArray, b: FloatArray): Float =
+            computeMaskedGridDistance(a, b).first
+
+        /**
+         * Compares two luma grids while ignoring any cell masked by active UI overlays (`Float.NaN`).
+         * Prevents appearing/moving speech balloons from causing false PixelCopy visual cuts.
+         */
+        fun computeMaskedGridDistance(a: FloatArray, b: FloatArray): Pair<Float, Int> {
+            if (a.isEmpty() || a.size != b.size) return 0f to 0
             var sum = 0f
-            var comparable = 0
+            var count = 0
             for (i in a.indices) {
-                if (a[i].isFinite() && b[i].isFinite()) {
-                    sum += kotlin.math.abs(a[i] - b[i])
-                    comparable++
+                val va = a[i]
+                val vb = b[i]
+                if (!va.isNaN() && !vb.isNaN()) {
+                    sum += abs(va - vb)
+                    count++
                 }
             }
-            return if (comparable >= (a.size + 1) / 2) sum / comparable else 0f
+            return if (count == 0) 0f to 0 else (sum / count) to count
+        }
+
+        fun mergeGridPreservingMasked(previous: FloatArray?, current: FloatArray): FloatArray {
+            if (previous == null || previous.size != current.size) return current
+            return FloatArray(current.size) { i ->
+                if (current[i].isNaN()) previous[i] else current[i]
+            }
         }
 
         fun detectFaceLayoutCut(

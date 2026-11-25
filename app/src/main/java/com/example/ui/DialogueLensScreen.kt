@@ -106,6 +106,7 @@ import com.example.ui.player.ScoutBrowserInspectorModal
 import com.example.ui.player.VideoPlayerStage
 import com.example.ui.player.WebBrowserControlStrip
 import com.example.ui.player.WebStreamSessionHolder
+import com.example.ui.settings.withVisualPreset
 import com.example.ui.settings.BalloonStyleSheet
 import com.example.ui.setup.ProjectAndPrivacySheet
 import com.example.ui.setup.StartLauncherScreen
@@ -141,6 +142,7 @@ fun DialogueLensScreen(
     var showPrivacySheet by remember { mutableStateOf(false) }
     var showStyleSheet by remember { mutableStateOf(false) }
     var showAdvancedImport by rememberSaveable { mutableStateOf(false) }
+    var showTour by rememberSaveable { mutableStateOf(false) }
     var showIntake by rememberSaveable { mutableStateOf(false) }
     var showLanguage by rememberSaveable { mutableStateOf(false) }
     var browserControls by rememberSaveable(state.project.id) { mutableStateOf(false) }
@@ -457,7 +459,8 @@ fun DialogueLensScreen(
                             }
                             Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black), contentAlignment = Alignment.Center) {
                                 val stageProjectId = state.project.id
-                                androidx.compose.runtime.key(stageProjectId) {
+                                val stageSession = state.playbackSessionId
+                                androidx.compose.runtime.key(stageProjectId, stageSession) {
                                     VideoPlayerStage(
                                         project = state.project,
                                         exoPlayer = viewModel.exoPlayer,
@@ -484,11 +487,12 @@ fun DialogueLensScreen(
                                         onLiveFacesDetected = viewModel::onLiveStageFacesDetected,
                                         playbackGeneration = state.playbackGeneration,
                                         onBodyRelocations = viewModel::recordBodyRelocations,
+                                        onBalloonMeasurements = viewModel::onBalloonMeasurements,
                                         onLiveFrameSnapshot = viewModel::onLiveStageFrameSnapshot,
                                         isEditMode = state.isEditMode,
                                         selectedEventId = state.selectedEventId,
                                         onStageTap = { controlsVisible = !controlsVisible },
-                                        onViewerTransport = { sample -> viewModel.onViewerTransport(stageProjectId, sample) },
+                                        onViewerTransport = { sample -> viewModel.onViewerTransport(stageProjectId, stageSession, sample) },
                                         onYouTubePlaybackState = viewModel::onYouTubePlaybackState,
                                         onYouTubeCaptionTrackStatus = viewModel::onYouTubeCaptionTrackStatus,
                                         onYouTubeEmbedFallback = viewModel::onYouTubeEmbedFallback,
@@ -625,9 +629,10 @@ fun DialogueLensScreen(
                                                 val nextStyle = when (state.styleSettings.visualStyle) {
                                                     BubbleVisualStyle.CINEMA_SUBTLE -> BubbleVisualStyle.MANGA_INK
                                                     BubbleVisualStyle.MANGA_INK -> BubbleVisualStyle.STREAMING_CLEAN
-                                                    BubbleVisualStyle.STREAMING_CLEAN -> BubbleVisualStyle.CINEMA_SUBTLE
+                                                    BubbleVisualStyle.STREAMING_CLEAN -> BubbleVisualStyle.READING_COMFORT
+                                                    BubbleVisualStyle.READING_COMFORT -> BubbleVisualStyle.CINEMA_SUBTLE
                                                 }
-                                                viewModel.updateStyleSettings(state.styleSettings.copy(visualStyle = nextStyle))
+                                                viewModel.updateStyleSettings(state.styleSettings.withVisualPreset(nextStyle))
                                             },
                                             onOpenStyleSheet = { showStyleSheet = true },
                                             onOpenProjectAndPrivacy = { showPrivacySheet = true },
@@ -680,6 +685,11 @@ fun DialogueLensScreen(
                                         onSelectQuotaMode = viewModel::setQuotaSaverMode,
                                         onRetryAiTranscription = viewModel::retryYouTubeAiTranscription,
                                         onAttachSubtitleFile = ::attach,
+                                        visualStabilitySnapshot = state.visualStabilitySnapshot,
+                                        readinessSnapshot = state.readinessSnapshot,
+                                        sentinelSnapshot = state.sentinelSnapshot,
+                                        onInspectChapterNow = viewModel::requestChapterInspection,
+                                        onResetStabilityDiagnostics = viewModel::resetVisualStabilityDiagnostics,
                                         verifiedLeadMs = state.verifiedLeadMs,
                                         playbackDurationMs = state.playbackDurationMs,
                                         layoutPasses = viewModel.spatialLayoutPasses,
@@ -695,7 +705,8 @@ fun DialogueLensScreen(
                                     val status = state.analysisStatus
                                     if (status is com.example.ui.state.AnalysisStatus.Error) Text(status.message, modifier = Modifier.padding(16.dp))
                                     if (status is com.example.ui.state.AnalysisStatus.Processing) Text(status.phaseLabel, modifier = Modifier.padding(16.dp))
-                                    WatchHome(state.savedProjects, viewModel, onSelectExisting = { showIntake = false }, onAdvancedImport = { showAdvancedImport = true },
+                                    WatchHome(state.savedProjects, viewModel, hasCompletedOnboarding = state.hasCompletedOnboarding,
+                                        cloudDialogueConfigured = state.cloudDialogueConfigured, onQuickTour = { showTour = true }, onSelectExisting = { showIntake = false }, onAdvancedImport = { showAdvancedImport = true },
                                         onLibrary = { navigate(AppDestination.LIBRARY) })
                                 }
                             }
@@ -703,6 +714,17 @@ fun DialogueLensScreen(
                     }
                 }
             }
+        }
+    }
+    if (showTour) {
+        fun finishTour() { showTour = false; viewModel.completeOnboarding() }
+        androidx.compose.ui.window.Dialog(onDismissRequest = ::finishTour,
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
+            com.example.ui.setup.FirstTimeOnboardingOverlay(onComplete = ::finishTour, onTryDemoScene = {
+                finishTour()
+                showIntake = false
+                viewModel.loadDemoScenario()
+            })
         }
     }
     if (showLanguage) {
@@ -787,6 +809,7 @@ fun DialogueLensScreen(
             onRetry = viewModel::retryHealBeacon,
             onUndo = viewModel::undoHealBeacon,
             onRemoveBeacon = viewModel::dismissHealBeacon,
+            onUpdateProblemHint = viewModel::updateHealBeaconProblemHint,
         )
     }
 }

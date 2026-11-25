@@ -63,9 +63,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.HealBeacon
 import com.example.data.model.HealBeaconStatus
+import com.example.data.model.HealProblemHint
 import com.example.data.model.HealScope
 import com.example.ui.state.HumanReadableReadiness
 import com.example.ui.state.ReadinessTone
+import com.example.ui.theme.AmethystHeal
 import com.example.ui.theme.CinemaBorder
 import com.example.ui.theme.CinemaElevated
 import com.example.ui.theme.CinemaSurface
@@ -77,9 +79,11 @@ import com.example.ui.theme.InkPrimary
 import com.example.ui.theme.InkSecondary
 import com.example.ui.theme.LensAmethyst
 import com.example.ui.theme.LensSky
+import com.example.ui.theme.SoftJade
+import com.example.ui.theme.WarmAmber
 
 /**
- * Contextual "Heal this moment" pill shown calmly when playback is paused.
+ * Contextual "Heal this moment" pill shown calmly when playback is intentionally paused.
  * Follows DialogueLens's guiding principle: "Pause. Mark. Heal. Continue."
  */
 @Composable
@@ -91,8 +95,8 @@ fun HealThisMomentPill(
     Surface(
         onClick = onClick,
         shape = RoundedCornerShape(999.dp),
-        color = LensAmethyst.copy(alpha = 0.16f),
-        border = BorderStroke(1.dp, LensAmethyst.copy(alpha = 0.55f)),
+        color = AmethystHeal.copy(alpha = 0.16f),
+        border = BorderStroke(1.dp, AmethystHeal.copy(alpha = 0.58f)),
         modifier = modifier
             .heightIn(min = 48.dp)
             .testTag("heal_this_moment_button")
@@ -109,7 +113,7 @@ fun HealThisMomentPill(
             Icon(
                 imageVector = Icons.Rounded.AutoFixHigh,
                 contentDescription = null,
-                tint = LensAmethyst,
+                tint = AmethystHeal,
                 modifier = Modifier.size(18.dp),
             )
             Text(
@@ -199,19 +203,19 @@ fun ReadinessStatusPill(
 }
 
 fun healBeaconColor(status: HealBeaconStatus): Color = when (status) {
-    HealBeaconStatus.UNDONE -> LensSky
-    HealBeaconStatus.MARKED -> LensSky
-    HealBeaconStatus.HEALING -> LensSky
-    HealBeaconStatus.HEALED -> ConfidenceHighColor
-    HealBeaconStatus.NEEDS_ATTENTION -> ConfidenceMediumColor
+    HealBeaconStatus.MARKED -> AmethystHeal
+    HealBeaconStatus.HEALING -> AmethystHeal
+    HealBeaconStatus.HEALED -> SoftJade
+    HealBeaconStatus.NEEDS_ATTENTION -> WarmAmber
+    HealBeaconStatus.UNDONE -> InkSecondary
 }
 
 fun healBeaconStatusLabel(status: HealBeaconStatus): String = when (status) {
-    HealBeaconStatus.UNDONE -> "Undone"
     HealBeaconStatus.MARKED -> "Marked"
     HealBeaconStatus.HEALING -> "Healing"
     HealBeaconStatus.HEALED -> "Healed"
     HealBeaconStatus.NEEDS_ATTENTION -> "Needs attention"
+    HealBeaconStatus.UNDONE -> "Undone"
 }
 
 fun healScopeLabel(scope: HealScope): String = when (scope) {
@@ -273,8 +277,8 @@ fun RepairComparison(beacon: HealBeacon) {
 }
 
 /**
- * Contextual Bottom Sheet for inspecting, jumping to, retrying with an expanded scope, undoing,
- * or dismissing a single Heal Beacon.
+ * Contextual Bottom Sheet for inspecting, jumping to, retrying with an expanded scope or problem hint,
+ * previewing before/after repair changes, undoing, or dismissing a single Heal Beacon.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -286,8 +290,10 @@ fun HealBeaconDetailSheet(
     onRetry: (String, HealScope) -> Unit,
     onUndo: (String) -> Unit,
     onRemoveBeacon: (String) -> Unit,
+    onUpdateProblemHint: (String, HealProblemHint) -> Unit = { _, _ -> },
 ) {
     var selectedScope by remember(beacon.id, beacon.scope) { mutableStateOf(beacon.scope) }
+    var selectedHint by remember(beacon.id, beacon.problemHint) { mutableStateOf(beacon.problemHint) }
     val statusColor = healBeaconColor(beacon.status)
     val canUndo = beacon.status !in setOf(HealBeaconStatus.HEALING, HealBeaconStatus.UNDONE) &&
         (beacon.preHealSnapshotEvents.isNotEmpty() || beacon.replacedEventIds.isNotEmpty() || beacon.preRepairCoverage.isNotEmpty())
@@ -339,9 +345,14 @@ fun HealBeaconDetailSheet(
                                     tint = statusColor,
                                     modifier = Modifier.size(20.dp),
                                 )
-                                HealBeaconStatus.UNDONE -> Icon(Icons.AutoMirrored.Rounded.Undo, contentDescription = "Undone")
                                 HealBeaconStatus.MARKED -> Icon(
                                     Icons.Rounded.Schedule,
+                                    contentDescription = null,
+                                    tint = statusColor,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                                HealBeaconStatus.UNDONE -> Icon(
+                                    Icons.AutoMirrored.Rounded.Undo,
                                     contentDescription = null,
                                     tint = statusColor,
                                     modifier = Modifier.size(20.dp),
@@ -366,19 +377,84 @@ fun HealBeaconDetailSheet(
 
             RepairComparison(beacon)
 
-            if (beacon.statusNote.isNotBlank()) {
+            if (beacon.statusNote.isNotBlank() || beacon.changeSummary.isNotBlank()) {
                 Surface(
                     shape = RoundedCornerShape(12.dp),
                     color = CinemaElevated,
                     border = BorderStroke(1.dp, CinemaBorder),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text(
-                        text = beacon.statusNote,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = InkPrimary,
+                    Column(
                         modifier = Modifier.padding(12.dp),
-                    )
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        if (beacon.statusNote.isNotBlank()) {
+                            Text(
+                                text = beacon.statusNote,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = InkPrimary,
+                            )
+                        }
+                        if (beacon.changeSummary.isNotBlank() && beacon.changeSummary != beacon.statusNote) {
+                            Text(
+                                text = beacon.changeSummary,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = SoftJade,
+                            )
+                        }
+                        if (beacon.postHealSnapshotEvents.isEmpty() && (beacon.beforeSampleText.isNotBlank() || beacon.afterSampleText.isNotBlank())) {
+                            HorizontalDivider(color = CinemaBorder)
+                            if (beacon.beforeSampleText.isNotBlank()) {
+                                Text(
+                                    text = "Before: ${beacon.beforeSampleText}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = InkSecondary,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            if (beacon.afterSampleText.isNotBlank()) {
+                                Text(
+                                    text = "After: ${beacon.afterSampleText}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = InkPrimary,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Optional problem hint selector (helps narrow what to inspect without blocking quick healing)
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = "What looked off? (Optional)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = InkSecondary,
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    HealProblemHint.entries.forEach { hint ->
+                        FilterChip(
+                            selected = selectedHint == hint,
+                            onClick = {
+                                selectedHint = hint
+                                onUpdateProblemHint(beacon.id, hint)
+                            },
+                            label = { Text(hint.label, style = MaterialTheme.typography.labelSmall) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = AmethystHeal.copy(alpha = 0.22f),
+                                selectedLabelColor = InkPrimary,
+                            ),
+                            modifier = Modifier
+                                .heightIn(min = 38.dp)
+                                .testTag("heal_hint_${hint.name.lowercase()}"),
+                        )
+                    }
                 }
             }
 
@@ -405,7 +481,7 @@ fun HealBeaconDetailSheet(
                             onClick = { selectedScope = scope },
                             label = { Text(healScopeLabel(scope)) },
                             colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = LensSky.copy(alpha = 0.2f),
+                                selectedContainerColor = AmethystHeal.copy(alpha = 0.22f),
                                 selectedLabelColor = InkPrimary,
                             ),
                             modifier = Modifier.heightIn(min = 40.dp),
@@ -429,7 +505,7 @@ fun HealBeaconDetailSheet(
                         .weight(1f)
                         .heightIn(min = 48.dp)
                         .testTag("heal_beacon_jump_button"),
-                    colors = ButtonDefaults.buttonColors(containerColor = LensSky),
+                    colors = ButtonDefaults.buttonColors(containerColor = SoftJade, contentColor = CinemaSurface),
                 ) {
                     Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
@@ -471,11 +547,11 @@ fun HealBeaconDetailSheet(
                         Icon(
                             Icons.AutoMirrored.Rounded.Undo,
                             contentDescription = null,
-                            tint = LensSky,
+                            tint = AmethystHeal,
                             modifier = Modifier.size(18.dp),
                         )
                         Spacer(Modifier.width(6.dp))
-                        Text("Undo repair", color = LensSky)
+                        Text("Undo repair", color = AmethystHeal)
                     }
                 } else {
                     Spacer(Modifier.width(1.dp))

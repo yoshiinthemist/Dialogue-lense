@@ -94,13 +94,18 @@ import com.example.data.model.Speaker
 import com.example.data.model.VideoSourceKind
 import com.example.data.subtitle.SubtitleParser
 import com.example.domain.analysis.TranscriptDiagnostics
+import com.example.domain.layout.VisualStabilityDiagnosticsSnapshot
 import com.example.domain.media.MediaCapabilities
 import com.example.domain.media.MediaSourceAdapterRegistry
+import com.example.domain.playback.PlaybackReadinessSnapshot
+import com.example.domain.sentinel.ChapterInspectionStatus
+import com.example.domain.sentinel.SentinelInspectorSnapshot
 import com.example.ui.player.formatBeaconTimestamp
 import com.example.ui.player.healBeaconColor
 import com.example.ui.player.RepairComparison
 import com.example.ui.player.healBeaconStatusLabel
 import com.example.ui.player.healScopeLabel
+import com.example.ui.theme.AmethystHeal
 import com.example.ui.theme.CinemaElevated
 import com.example.ui.theme.CinemaObsidian
 import com.example.ui.theme.CinemaSurface
@@ -110,8 +115,10 @@ import com.example.ui.theme.ConfidenceMediumColor
 import com.example.ui.theme.LensAmber
 import com.example.ui.theme.LensMint
 import com.example.ui.theme.LensSky
+import com.example.ui.theme.SoftJade
 import com.example.ui.theme.SpeakerAccentPalette
 import com.example.ui.theme.UnknownSpeakerGray
+import com.example.ui.theme.WarmAmber
 import kotlin.math.roundToInt
 
 enum class InspectorTab {
@@ -166,6 +173,9 @@ fun TimelineSubtitleEditor(
     onChapterHealAt: (timestampMs: Long) -> Unit = {},
     mediaCapabilities: MediaCapabilities = MediaSourceAdapterRegistry.default.capabilitiesFor(project.videoSource),
     transcriptDiagnostics: TranscriptDiagnostics = TranscriptDiagnostics(),
+    visualStabilitySnapshot: VisualStabilityDiagnosticsSnapshot = VisualStabilityDiagnosticsSnapshot(),
+    readinessSnapshot: PlaybackReadinessSnapshot = PlaybackReadinessSnapshot(),
+    sentinelSnapshot: SentinelInspectorSnapshot = SentinelInspectorSnapshot(),
     quotaSaverMode: QuotaSaverMode = QuotaSaverMode.PRO_ACCURACY,
     onSelectQuotaMode: (QuotaSaverMode) -> Unit = {},
     onRetryAiTranscription: () -> Unit = {},
@@ -174,6 +184,8 @@ fun TimelineSubtitleEditor(
     playbackDurationMs: Long? = null,
     coverage: com.example.domain.analysis.CoverageSummary = com.example.domain.analysis.CoverageSummary(),
     layoutPasses: Long = 0L,
+    onInspectChapterNow: (String) -> Unit = {},
+    onResetStabilityDiagnostics: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var activeTab by rememberSaveable(initialTab) { mutableStateOf(initialTab) }
@@ -549,8 +561,10 @@ fun TimelineSubtitleEditor(
                 StudioChaptersTab(
                     project = project,
                     currentTimeMs = currentTimeMs,
+                    sentinelSnapshot = sentinelSnapshot,
                     onSeekTo = onSeekTo,
                     onChapterHeal = onChapterHealAt,
+                    onInspectChapterNow = onInspectChapterNow,
                     modifier = Modifier.fillMaxSize(),
                 )
             }
@@ -559,10 +573,15 @@ fun TimelineSubtitleEditor(
                     project = project,
                     mediaCapabilities = mediaCapabilities,
                     transcriptDiagnostics = transcriptDiagnostics,
+                    visualStabilitySnapshot = visualStabilitySnapshot,
+                    readinessSnapshot = readinessSnapshot,
+                    sentinelSnapshot = sentinelSnapshot,
                     quotaSaverMode = quotaSaverMode,
                     onSelectQuotaMode = onSelectQuotaMode,
                     onRetryAi = onRetryAiTranscription,
                     onAttachSubtitles = onAttachSubtitleFile,
+                    onInspectChapterNow = onInspectChapterNow,
+                    onResetStabilityDiagnostics = onResetStabilityDiagnostics,
                     modifier = Modifier.fillMaxSize(),
                 )
             }
@@ -1596,10 +1615,15 @@ private fun StudioHealBeaconsTab(
 private fun StudioChaptersTab(
     project: DialogueLensProject,
     currentTimeMs: Long,
+    sentinelSnapshot: SentinelInspectorSnapshot = SentinelInspectorSnapshot(),
     onSeekTo: (Long) -> Unit,
     onChapterHeal: (Long) -> Unit,
+    onInspectChapterNow: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
+    val patrolByChapterId = remember(sentinelSnapshot.chapterPatrolRecords) {
+        sentinelSnapshot.chapterPatrolRecords.associateBy { it.chapterId }
+    }
     LazyColumn(
         contentPadding = PaddingValues(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -1637,6 +1661,8 @@ private fun StudioChaptersTab(
                     ChapterSource.YOUTUBE_METADATA -> "Video chapter"
                     ChapterSource.INFERRED_EDITORIAL -> "Inferred section"
                 }
+                val patrol = patrolByChapterId[chapter.id]
+                val patrolStatusColor = patrol?.status?.let { chapterInspectionColor(it) }
                 Card(
                     colors = CardDefaults.cardColors(
                         containerColor = if (isCurrent) CinemaElevated else CinemaSurface,
@@ -1651,34 +1677,63 @@ private fun StudioChaptersTab(
                         .clickable { onSeekTo(chapter.startMs + 50L) }
                         .testTag("studio_chapter_card_${chapter.id}"),
                 ) {
-                    Row(
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = "${idx + 1}. ${chapter.title}",
+                                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = "${formatBeaconTimestamp(chapter.startMs)}–${formatBeaconTimestamp(chapter.endMs)} · $sourceLabel",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (isCurrent) LensSky else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                if (patrol != null) {
+                                    OutlinedButton(
+                                        onClick = { onInspectChapterNow(chapter.id) },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                        modifier = Modifier.testTag("inspect_chapter_${chapter.id}"),
+                                    ) {
+                                        Text("Inspect", fontSize = 11.sp)
+                                    }
+                                }
+                                OutlinedButton(
+                                    onClick = { onChapterHeal(chapter.startMs) },
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                ) {
+                                    Icon(Icons.Filled.AutoFixHigh, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Heal", fontSize = 11.5.sp)
+                                }
+                            }
+                        }
+                        if (patrol == null && chapter.startMs > 0L) {
+                            Text(patrolStatus, style = MaterialTheme.typography.labelSmall)
+                        }
+                        if (patrol != null && patrolStatusColor != null) {
                             Text(
-                                text = "${idx + 1}. ${chapter.title}",
-                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
-                                color = MaterialTheme.colorScheme.onSurface,
-                                maxLines = 1,
+                                text = if (inspection != null && repair == null && inspection.finding.isEmpty()) "Transcript and pointer checks passed"
+                                    else "${patrol.status.label}${patrol.summary.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = patrolStatusColor,
+                                maxLines = 2,
                                 overflow = TextOverflow.Ellipsis,
                             )
-                            Text(
-                                text = "${formatBeaconTimestamp(chapter.startMs)}–${formatBeaconTimestamp(chapter.endMs)} · $sourceLabel · $patrolStatus",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (isCurrent) LensSky else MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        OutlinedButton(
-                            onClick = { onChapterHeal(chapter.startMs) },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                        ) {
-                            Icon(Icons.Filled.AutoFixHigh, contentDescription = null, modifier = Modifier.size(14.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Heal", fontSize = 11.5.sp)
                         }
                     }
                 }
@@ -1687,15 +1742,30 @@ private fun StudioChaptersTab(
     }
 }
 
+private fun chapterInspectionColor(status: ChapterInspectionStatus): Color = when (status) {
+    ChapterInspectionStatus.INSPECTED_WITHOUT_DEFECTS,
+    ChapterInspectionStatus.REPAIR_VERIFIED -> SoftJade
+    ChapterInspectionStatus.INSPECTING,
+    ChapterInspectionStatus.INSPECTION_QUEUED,
+    ChapterInspectionStatus.REPAIR_IN_PROGRESS -> AmethystHeal
+    ChapterInspectionStatus.REPAIR_REQUIRED -> WarmAmber
+    ChapterInspectionStatus.NOT_INSPECTED -> UnknownSpeakerGray
+}
+
 @Composable
 private fun StudioDiagnosticsTab(
     project: DialogueLensProject,
     mediaCapabilities: MediaCapabilities,
     transcriptDiagnostics: TranscriptDiagnostics,
+    visualStabilitySnapshot: VisualStabilityDiagnosticsSnapshot = VisualStabilityDiagnosticsSnapshot(),
+    readinessSnapshot: PlaybackReadinessSnapshot = PlaybackReadinessSnapshot(),
+    sentinelSnapshot: SentinelInspectorSnapshot = SentinelInspectorSnapshot(),
     quotaSaverMode: QuotaSaverMode,
     onSelectQuotaMode: (QuotaSaverMode) -> Unit,
     onRetryAi: () -> Unit,
     onAttachSubtitles: () -> Unit,
+    onInspectChapterNow: (String) -> Unit = {},
+    onResetStabilityDiagnostics: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     LazyColumn(
@@ -1703,6 +1773,158 @@ private fun StudioDiagnosticsTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
         modifier = modifier.testTag("studio_diagnostics_list"),
     ) {
+        // 1. Visual Stability Diagnostics (DialogueLens 2.0)
+        item(key = "visual_stability_diag_card") {
+            Surface(
+                color = CinemaSurface,
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, SoftJade.copy(alpha = 0.35f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("visual_stability_diagnostics_card"),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "Visual Stability Diagnostics",
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        TextButton(
+                            onClick = onResetStabilityDiagnostics,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        ) {
+                            Text("Reset", fontSize = 11.sp)
+                        }
+                    }
+                    Text(
+                        text = "${visualStabilitySnapshot.totalRelocations} relocations · ${visualStabilitySnapshot.suppressedAbaOscillations} bounces blocked · ${visualStabilitySnapshot.tailVisibilityToggles} tail flips",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SoftJade,
+                    )
+                    DiagnosticMetricRow("Layout evaluations", "${visualStabilitySnapshot.layoutEvaluations}")
+                    DiagnosticMetricRow("Committed relocations", "${visualStabilitySnapshot.totalRelocations}")
+                    DiagnosticMetricRow("A-B-A bounces blocked", "${visualStabilitySnapshot.suppressedAbaOscillations}")
+                    DiagnosticMetricRow("Tail state toggles", "${visualStabilitySnapshot.tailVisibilityToggles}")
+                    DiagnosticMetricRow("Tracking dropouts", "${visualStabilitySnapshot.trackingDropouts}")
+                    DiagnosticMetricRow("Scene epochs", "${visualStabilitySnapshot.sceneEpochChanges}")
+                }
+            }
+        }
+
+        // 2. Playback Timing & Adaptive Buffering Diagnostics (DialogueLens 2.0)
+        item(key = "playback_timing_diag_card") {
+            val diag = readinessSnapshot.diagnostics
+            Surface(
+                color = CinemaSurface,
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, LensSky.copy(alpha = 0.35f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("playback_timing_diagnostics_card"),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = "Playback Readiness & Adaptive Buffer",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = "${readinessSnapshot.state.name} · Intent: ${readinessSnapshot.userIntent.name}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = LensSky,
+                    )
+                    DiagnosticMetricRow("Playback speed", "${diag.playbackSpeed}x")
+                    DiagnosticMetricRow(
+                        "Verified lead",
+                        "${readinessSnapshot.contiguousVerifiedLeadMs / 1000L}s (target ${readinessSnapshot.requiredLeadMs / 1000L}s / healthy ${diag.healthyLeadTargetMs / 1000L}s)",
+                    )
+                    DiagnosticMetricRow(
+                        "Seek gen / ack",
+                        "#${diag.seekGeneration} · ${if (!diag.isSeekInFlight) "Acknowledged" else "Awaiting"}",
+                    )
+                    DiagnosticMetricRow("Buffering episodes", "${diag.bufferingEpisodeCount}")
+                    DiagnosticMetricRow("Auto-resumes", "${diag.autoResumeCount}")
+                    if (readinessSnapshot.isWatchNowBypassActive) {
+                        DiagnosticMetricRow("Watch Now bypass", "Active for current segment")
+                    }
+                }
+            }
+        }
+
+        // 3. Sentinel Workforce & YouTube Chapter Patrol Inspector (DialogueLens 2.0)
+        item(key = "sentinel_inspector_card") {
+            Surface(
+                color = CinemaSurface,
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, AmethystHeal.copy(alpha = 0.40f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("sentinel_inspector_card"),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = "Sentinel Workforce & Chapter Patrol",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        text = "${sentinelSnapshot.activeWorkerCount}/${sentinelSnapshot.maxAllowedWorkers} workers · ${sentinelSnapshot.queuedItems.size} queued · ${sentinelSnapshot.totalLocalCleanChapterChecks} clean / ${sentinelSnapshot.totalCloudEscalatedChapterChecks} escalated",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = AmethystHeal,
+                    )
+                    DiagnosticMetricRow("Active workers", "${sentinelSnapshot.activeWorkerCount} / ${sentinelSnapshot.maxAllowedWorkers}")
+                    DiagnosticMetricRow("Queued jobs", "${sentinelSnapshot.queuedItems.size}")
+                    DiagnosticMetricRow("Active reservations", "${sentinelSnapshot.activeReservations.size}")
+                    DiagnosticMetricRow(
+                        "Chapter patrol",
+                        when {
+                            sentinelSnapshot.chapterPatrolRecords.isEmpty() -> "No chapter inspections queued"
+                            sentinelSnapshot.patrolSuspendedForPlayback -> "Suspended (${sentinelSnapshot.patrolSuspensionReason.ifBlank { "buffering priority" }})"
+                            else -> "Active (${sentinelSnapshot.chapterPatrolRecords.size} chapters)"
+                        },
+                    )
+                    if (sentinelSnapshot.chapterPatrolRecords.isNotEmpty()) {
+                        sentinelSnapshot.chapterPatrolRecords.take(6).forEach { entry ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = "${entry.chapterTitle.take(22)} · ${entry.status.label}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = chapterInspectionColor(entry.status),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                TextButton(
+                                    onClick = { onInspectChapterNow(entry.chapterId) },
+                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                ) {
+                                    Text("Inspect", fontSize = 10.5.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         item(key = "media_compat_card") {
             Surface(
                 color = CinemaSurface,
@@ -1819,5 +2041,28 @@ private fun StudioDiagnosticsTab(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun DiagnosticMetricRow(
+    label: String,
+    value: String,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+            color = MaterialTheme.colorScheme.onSurface,
+        )
     }
 }

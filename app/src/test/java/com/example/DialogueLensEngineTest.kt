@@ -2191,7 +2191,8 @@ class DialogueLensEngineTest {
     @Test
     fun quotaSaverDefaultsAndCacheKeysAreDeterministic() {
         val uiDefaults = com.example.ui.state.DialogueLensUiState()
-        assertEquals(com.example.data.model.QuotaSaverMode.PRO_ACCURACY, uiDefaults.quotaSaverMode)
+        assertFalse(uiDefaults.cloudDialogueConfigured)
+        assertEquals(com.example.data.model.QuotaSaverMode.ZERO_CLOUD, uiDefaults.quotaSaverMode)
 
         val ytKey1 = com.example.data.project.ProjectStore.canonicalYouTubeCacheKey("dQw4w9WgXcQ", "English")
         val ytKey2 = com.example.data.project.ProjectStore.canonicalYouTubeCacheKey("dQw4w9WgXcQ", "english")

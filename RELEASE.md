@@ -1,6 +1,6 @@
 # Building DialogueLens for Android
 
-DialogueLens 2.0.0 uses version code 28 and application ID `com.aistudio.dialoguelens.vkpzmx`. The Gradle wrapper pins Gradle 9.3.1 and verifies its distribution checksum. Use JDK 21 and Android SDK platform 36.1 with build tools 36.0.0.
+DialogueLens 2.0.0 uses version code 29 and application ID `com.aistudio.dialoguelens.vkpzmx`. The Gradle wrapper pins Gradle 9.3.1 and verifies its distribution checksum. Use JDK 21 and Android SDK platform 36.1 with build tools 36.0.0.
 
 ## Build and test locally
 

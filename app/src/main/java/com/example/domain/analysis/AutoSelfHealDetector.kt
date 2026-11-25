@@ -3,6 +3,7 @@ package com.example.domain.analysis
 import com.example.data.model.DialogueEvent
 import com.example.data.model.DialogueLensProject
 import com.example.data.model.HealBeaconStatus
+import com.example.data.model.Speaker
 import com.example.data.model.QuotaSaverMode
 import com.example.domain.layout.PlacedBalloon
 import kotlin.math.abs
@@ -179,6 +180,73 @@ class AutoSelfHealDetector {
         const val REGION_COOLDOWN_MS = 60_000L
         const val REGION_BUCKET_MS = 30_000L
         const val TEMPORAL_OVERHANG_TOLERANCE_MS = 450L
+
+        fun consolidateDuplicateSpeakers(project: DialogueLensProject): DialogueLensProject {
+            if (project.speakers.size < 2) return project
+            val keptSpeakers = mutableListOf<Speaker>()
+            val canonicalByNorm = linkedMapOf<String, Int>()
+            val remapIds = mutableMapOf<String, String>()
+
+            for (speaker in project.speakers) {
+                val norm = HierarchicalContextEngine.normalizeSpeakerKey(speaker.displayName)
+                if (norm.isBlank()) {
+                    keptSpeakers.add(speaker)
+                    continue
+                }
+                val existingIdx = canonicalByNorm[norm]
+                if (existingIdx == null) {
+                    canonicalByNorm[norm] = keptSpeakers.size
+                    keptSpeakers.add(speaker)
+                } else {
+                    val existing = keptSpeakers[existingIdx]
+                    val bothConfirmedDistinct = existing.isConfirmedCharacter && speaker.isConfirmedCharacter
+                    val conflictingSides = existing.preferredScreenSideX != null &&
+                        speaker.preferredScreenSideX != null &&
+                        abs(existing.preferredScreenSideX - speaker.preferredScreenSideX) >= 0.25f
+                    val nearbyKnownPositions = existing.preferredScreenSideX != null && speaker.preferredScreenSideX != null &&
+                        abs(existing.preferredScreenSideX - speaker.preferredScreenSideX) <= 0.05f
+                    val correctedSpeakerIds = project.corrections.flatMap { listOfNotNull(it.previousSpeakerId, it.newSpeakerId) }.toSet()
+                    if (bothConfirmedDistinct || !nearbyKnownPositions || conflictingSides ||
+                        (!existing.isConfirmedCharacter && !speaker.isConfirmedCharacter) ||
+                        existing.id in correctedSpeakerIds || speaker.id in correctedSpeakerIds ||
+                        project.dialogueEvents.any { it.lockedByUser && it.speakerId in setOf(existing.id, speaker.id) } ||
+                        (existing.isLocked && speaker.isLocked)) {
+                        // Never merge two distinct confirmed people solely on display name
+                        keptSpeakers.add(speaker)
+                        continue
+                    }
+                    val winner = if (!existing.isConfirmedCharacter && speaker.isConfirmedCharacter) {
+                        speaker.copy(
+                            preferredScreenSideX = speaker.preferredScreenSideX ?: existing.preferredScreenSideX,
+                            accentIndex = existing.accentIndex,
+                        )
+                    } else {
+                        existing.copy(
+                            preferredScreenSideX = existing.preferredScreenSideX ?: speaker.preferredScreenSideX,
+                        )
+                    }
+                    val loserId = if (winner.id == existing.id) speaker.id else existing.id
+                    keptSpeakers[existingIdx] = winner
+                    remapIds[loserId] = winner.id
+                }
+            }
+
+            if (remapIds.isEmpty()) return project
+
+            val mergedEvents = project.dialogueEvents.map { evt ->
+                val remapped = evt.speakerId?.let { remapIds[it] }
+                if (remapped != null) evt.copy(speakerId = remapped) else evt
+            }
+            val mergedTracks = project.faceTracks.map { track ->
+                val remapped = track.speakerId?.let { remapIds[it] }
+                if (remapped != null) track.copy(speakerId = remapped) else track
+            }
+            return project.copy(
+                speakers = keptSpeakers,
+                dialogueEvents = mergedEvents,
+                faceTracks = mergedTracks,
+            )
+        }
 
         /**
          * Clamps any corrupted/out-of-bounds event anchor coordinates cleanly back inside [0.05..0.95]

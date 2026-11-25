@@ -1,5 +1,6 @@
 package com.example.ui.player
 
+import com.example.ui.theme.MotionTokens
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.runtime.key
@@ -143,7 +144,7 @@ fun SpeechBalloonView(
             SpeakerAccentPalette[it.accentIndex % SpeakerAccentPalette.size]
         } ?: UnknownSpeakerGray
     }
-    val accentAnimSpec = if (style.reducedMotion) snap<Color>() else tween<Color>(durationMillis = 220)
+    val accentAnimSpec = MotionTokens.calmTween<Color>(MotionTokens.COLOR_TRANSITION_MS, style.reducedMotion || style.visualStyle == BubbleVisualStyle.READING_COMFORT)
     val speakerAccent by animateColorAsState(
         targetValue = rawSpeakerAccent,
         animationSpec = accentAnimSpec,
@@ -161,14 +162,14 @@ fun SpeechBalloonView(
 
 
     // Wait until first pixel measurement finishes before fading in so balloons never hop on Frame 1 -> Frame 2
-    val immediate = style.reducedMotion || event.endTimeMs - event.startTimeMs < 250L
+    val immediate = style.reducedMotion || style.visualStyle == BubbleVisualStyle.READING_COMFORT || event.endTimeMs - event.startTimeMs < 250L
     val enterAlpha = remember(event.id) { Animatable(if (immediate) 1f else 0f) }
     LaunchedEffect(event.id, committedRect != null, immediate) {
         if (committedRect == null) return@LaunchedEffect
         if (immediate) {
             enterAlpha.snapTo(1f)
         } else {
-            enterAlpha.animateTo(1f, animationSpec = tween(durationMillis = 120))
+            enterAlpha.animateTo(1f, animationSpec = tween(durationMillis = MotionTokens.BUBBLE_ENTRANCE_MS))
         }
     }
 
@@ -205,7 +206,7 @@ fun SpeechBalloonView(
     val baseCenter by rememberUpdatedState(NormalizedPoint(body.centerX, body.centerY))
     val commitDrag by rememberUpdatedState(onDragCommit)
 
-    val showPointerTail = style.showTail &&
+    val showPointerTail = style.showTail && style.visualStyle != BubbleVisualStyle.READING_COMFORT &&
         !isSpecialNonSpoken &&
         !placed.isOffScreenEdge &&
         !placed.isAmbiguousFallback &&
@@ -331,10 +332,12 @@ private fun UnifiedBalloonBody(
     val luminanceBias = ((placed.sceneLuminance - 0.35f) * 0.14f).coerceIn(-0.04f, 0.07f)
     val adaptiveOpacity = (style.balloonOpacity + luminanceBias).coerceIn(0.58f, 0.98f)
 
-    val colorAnimSpec = if (style.reducedMotion) snap<Color>() else tween<Color>(durationMillis = 220)
+    val colorAnimSpec = MotionTokens.calmTween<Color>(MotionTokens.COLOR_TRANSITION_MS, style.reducedMotion || style.visualStyle == BubbleVisualStyle.READING_COMFORT)
 
+    val isReadingComfort = style.visualStyle == BubbleVisualStyle.READING_COMFORT
     val rawFillColor = when {
         style.highContrastMode -> BalloonHighContrastSurface.copy(alpha = 0.98f)
+        isReadingComfort -> Color(0xFF151C24).copy(alpha = style.balloonOpacity.coerceAtLeast(0.92f))
         isSilentTsubuyaki -> CinemaWhisperScrim.copy(alpha = (adaptiveOpacity * 0.88f).coerceIn(0.62f, 0.86f))
         placed.isAmbiguousFallback -> Color(0xFF1E293B).copy(alpha = 0.92f)
         isCinemaSubtle -> when {
@@ -361,6 +364,7 @@ private fun UnifiedBalloonBody(
 
     val textColor = when {
         style.highContrastMode -> BalloonHighContrastInk
+        isReadingComfort -> Color(0xFFF3F1EC)
         isSilentTsubuyaki -> Color(0xFFE2E8F0)
         placed.isAmbiguousFallback -> Color(0xFFF8FAFC)
         isCinemaSubtle -> Color(0xFFF8FAFC)
@@ -371,7 +375,7 @@ private fun UnifiedBalloonBody(
 
     val subTextColor = when {
         style.highContrastMode -> Color(0xFFE2E8F0)
-        isCinemaSubtle || isSilentTsubuyaki || placed.isAmbiguousFallback -> Color(0xFFCBD5E1)
+        isCinemaSubtle || isReadingComfort || isSilentTsubuyaki || placed.isAmbiguousFallback -> Color(0xFFCBD5E1)
         isManga -> MangaSubtleInk
         textColor == BalloonLightInk -> BalloonLightSubtleInk
         else -> Color(0xFFCBD5E1)
@@ -383,6 +387,7 @@ private fun UnifiedBalloonBody(
         isSelected -> MaterialTheme.colorScheme.primary
         isUnknownSpeaker -> UnknownSpeakerGray.copy(alpha = if (isEditMode) 0.96f else 0.88f)
         style.highContrastMode -> BalloonHighContrastBorder
+        isReadingComfort -> speakerAccent.copy(alpha = 0.82f)
         isNonSpeakerBubble -> NonSpeakerBubbleWhite.copy(
             alpha = when {
                 isManga -> 0.94f
@@ -401,6 +406,7 @@ private fun UnifiedBalloonBody(
     )
 
     val innerPadH = when {
+        isReadingComfort -> 14.dp
         isSilentTsubuyaki -> 12.dp
         isHighEnergyShout -> 13.dp
         isCinemaSubtle -> 12.dp
@@ -408,6 +414,7 @@ private fun UnifiedBalloonBody(
         else -> 10.dp
     }
     val innerPadV = when {
+        isReadingComfort -> 8.dp
         isSilentTsubuyaki -> 5.dp
         isHighEnergyShout -> 7.dp
         isCinemaSubtle -> 6.5.dp
@@ -1589,14 +1596,14 @@ fun SpatialSfxNoteView(
         }
     }
 
-    val immediate = style.reducedMotion || event.endTimeMs - event.startTimeMs < 250L
+    val immediate = style.reducedMotion || style.visualStyle == BubbleVisualStyle.READING_COMFORT || event.endTimeMs - event.startTimeMs < 250L
     val enterAlpha = remember(event.id) { Animatable(if (immediate) 1f else 0f) }
     LaunchedEffect(event.id, committedRect != null, immediate) {
         if (committedRect == null) return@LaunchedEffect
         if (immediate) {
             enterAlpha.snapTo(1f)
         } else {
-            enterAlpha.animateTo(1f, animationSpec = tween(durationMillis = 120))
+            enterAlpha.animateTo(1f, animationSpec = tween(durationMillis = MotionTokens.BUBBLE_ENTRANCE_MS))
         }
     }
 

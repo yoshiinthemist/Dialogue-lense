@@ -224,8 +224,9 @@ object LookaheadWindowPlanner {
     }
 
     /**
-     * Returns true when active playback reaches a pending window not yet completed by Scout
-     * (and no existing dialogue cue covers the next ~1.1s), allowing a brief auto-buffer pause.
+     * Authoritative continuous-verified-lead buffering check (Operation Golden Video Section 8).
+     * Never treats a single stray cue or a tiny remaining slice (< minLeadMs) as sufficient coverage,
+     * works for short videos (<30s) and near-end unverified regions, and scales by playback speed.
      */
     fun isPlayheadWaitingOnUnbufferedWindow(
         playheadMs: Long,
@@ -233,18 +234,29 @@ object LookaheadWindowPlanner {
         bufferedRanges: List<TimeWindowRange>,
         events: List<DialogueEvent>,
         isScoutActive: Boolean,
+        playbackSpeed: Float = 1.0f,
+        minLeadMs: Long = 2_000L,
     ): Boolean {
-        if (!isScoutActive || totalDurationMs <= 30_000L || bufferedRanges.isEmpty()) return false
-        if (playheadMs >= totalDurationMs - 2_000L) return false
-        val insideBuffered = bufferedRanges.any { playheadMs in it.startMs until it.endMs }
-        if (insideBuffered) return false
-        val hasUpcomingCue = events.any { evt ->
-            evt.endTimeMs >= (playheadMs - 250L) &&
-                evt.startTimeMs <= (playheadMs + 1_100L) &&
-                !evt.sourceText.startsWith("Embedded YouTube Player active") &&
-                !evt.sourceText.startsWith("Web Cinema ready")
-        }
-        return !hasUpcomingCue
+        if (!isScoutActive || totalDurationMs <= 0L) return false
+        val safePos = playheadMs.coerceIn(0L, totalDurationMs)
+        val remainingMs = (totalDurationMs - safePos).coerceAtLeast(0L)
+        if (remainingMs <= 500L) return false
+        if (bufferedRanges.isEmpty()) return true
+
+        val coalesced = coalesceBufferedRanges(bufferedRanges, bridgeGapMs = 1L)
+        val covering = coalesced.firstOrNull { safePos in it.startMs until it.endMs }
+            ?: return true
+
+        val contiguousLeadMs = (covering.endMs - safePos).coerceAtLeast(0L)
+        // If verified coverage reaches the end of the media (within 500ms), never stall
+        if (covering.endMs >= totalDurationMs - 500L) return false
+
+        val speedScaledReq = (minLeadMs.toDouble() * playbackSpeed.coerceIn(0.5f, 3.0f)).toLong()
+        val effectiveRequiredLeadMs = minOf(
+            speedScaledReq,
+            (remainingMs - 500L).coerceAtLeast(minOf(1_000L, remainingMs)),
+        )
+        return contiguousLeadMs < effectiveRequiredLeadMs
     }
 
     /**
@@ -512,19 +524,73 @@ object LookaheadWindowPlanner {
                 continue
             }
 
+            // Authoritative Scout Window-Boundary Stitching (Operation Golden Video Section 5):
+            // Handles adjacent cues abutting windowStartMs (where hard clamping eliminated overlapMs)
+            // without touching mid-window intentional repeats or simultaneous distinct speakers.
+            var stitchedCandidate = candidate
+            var droppedByBoundaryStitch = false
+            if (windowStartMs > 0L && candidate.startTimeMs in (windowStartMs - 1_500L)..(windowStartMs + 2_200L)) {
+                val boundaryNeighbor = merged
+                    .filter { prev ->
+                        prev.endTimeMs in (windowStartMs - 1_500L)..(windowStartMs + 1_200L) &&
+                            (candidate.startTimeMs - prev.endTimeMs) in -1_200L..900L &&
+                            areSpeakersCompatible(prev.speakerId, candidate.speakerId)
+                    }
+                    .maxByOrNull { it.endTimeMs }
+
+                if (boundaryNeighbor != null) {
+                    val stitchResult = stitchBoundaryUtterance(boundaryNeighbor, candidate)
+                    when (stitchResult) {
+                        is BoundaryStitchOutcome.DropAsDuplicate -> {
+                            droppedByBoundaryStitch = true
+                            rejectedCount++
+                            decisions.add(
+                                DuplicateDecisionRecord(
+                                    accepted = false,
+                                    reason = stitchResult.reason,
+                                    incomingTextPreview = candidate.sourceText.take(48),
+                                    incomingStartMs = candidate.startTimeMs,
+                                    matchedStartMs = boundaryNeighbor.startTimeMs,
+                                    speakerId = candidate.speakerId,
+                                )
+                            )
+                        }
+                        is BoundaryStitchOutcome.TrimPrefix -> {
+                            stitchedCandidate = stitchResult.trimmedCandidate
+                            if (decisions.size < 24) {
+                                decisions.add(
+                                    DuplicateDecisionRecord(
+                                        accepted = true,
+                                        reason = "BOUNDARY_PREFIX_TRIMMED",
+                                        incomingTextPreview = stitchedCandidate.sourceText.take(48),
+                                        incomingStartMs = stitchedCandidate.startTimeMs,
+                                        matchedStartMs = boundaryNeighbor.startTimeMs,
+                                        speakerId = stitchedCandidate.speakerId,
+                                    )
+                                )
+                            }
+                        }
+                        BoundaryStitchOutcome.KeepAsIs -> Unit
+                    }
+                }
+            }
+            if (droppedByBoundaryStitch) {
+                continue
+            }
+
             // Lookback pre-boundary cue rescue: only drop if the exact pre-boundary moment
             // already has a covered cue from the same/compatible speaker or falls >4.5s earlier.
-            val stalePreBoundaryMatch = if (candidate.startTimeMs < windowStartMs) {
-                if (candidate.startTimeMs < (windowStartMs - 4_500L)) {
-                    candidate
+            val stalePreBoundaryMatch = if (stitchedCandidate.startTimeMs < windowStartMs) {
+                if (stitchedCandidate.startTimeMs < (windowStartMs - 4_500L)) {
+                    stitchedCandidate
                 } else {
                     merged.firstOrNull { prev ->
                         val overlapsOrSameMoment =
-                            (candidate.startTimeMs <= prev.endTimeMs + 350L && candidate.endTimeMs >= prev.startTimeMs - 350L) ||
-                                abs(prev.startTimeMs - candidate.startTimeMs) < 900L
+                            (stitchedCandidate.startTimeMs <= prev.endTimeMs + 350L && stitchedCandidate.endTimeMs >= prev.startTimeMs - 350L) ||
+                                abs(prev.startTimeMs - stitchedCandidate.startTimeMs) < 900L
                         overlapsOrSameMoment && (
-                            areDuplicateUtterances(prev, candidate) ||
-                                areSpeakersCompatible(prev.speakerId, candidate.speakerId)
+                            areDuplicateUtterances(prev, stitchedCandidate) ||
+                                areSpeakersCompatible(prev.speakerId, stitchedCandidate.speakerId)
                             )
                     }
                 }
@@ -537,25 +603,25 @@ object LookaheadWindowPlanner {
                     DuplicateDecisionRecord(
                         accepted = false,
                         reason = "COVERED_PREBOUNDARY_OVERLAP",
-                        incomingTextPreview = candidate.sourceText.take(48),
-                        incomingStartMs = candidate.startTimeMs,
+                        incomingTextPreview = stitchedCandidate.sourceText.take(48),
+                        incomingStartMs = stitchedCandidate.startTimeMs,
                         matchedStartMs = stalePreBoundaryMatch.startTimeMs,
-                        speakerId = candidate.speakerId,
+                        speakerId = stitchedCandidate.speakerId,
                     )
                 )
                 continue
             }
 
-            merged.add(candidate)
+            merged.add(stitchedCandidate)
             acceptedCount++
             if (decisions.size < 24) {
                 decisions.add(
                     DuplicateDecisionRecord(
                         accepted = true,
                         reason = "ACCEPTED_EVENT",
-                        incomingTextPreview = candidate.sourceText.take(48),
-                        incomingStartMs = candidate.startTimeMs,
-                        speakerId = candidate.speakerId,
+                        incomingTextPreview = stitchedCandidate.sourceText.take(48),
+                        incomingStartMs = stitchedCandidate.startTimeMs,
+                        speakerId = stitchedCandidate.speakerId,
                     )
                 )
             }
@@ -568,11 +634,112 @@ object LookaheadWindowPlanner {
         )
     }
 
+    private sealed interface BoundaryStitchOutcome {
+        data object KeepAsIs : BoundaryStitchOutcome
+        data class DropAsDuplicate(val reason: String) : BoundaryStitchOutcome
+        data class TrimPrefix(val trimmedCandidate: DialogueEvent) : BoundaryStitchOutcome
+    }
+
+    private fun stitchBoundaryUtterance(
+        prev: DialogueEvent,
+        cand: DialogueEvent,
+    ): BoundaryStitchOutcome {
+        val prevText = prev.sourceText.trim()
+        val candText = cand.sourceText.trim()
+        val prevNorm = normalizeCueComparisonText(prevText)
+        val candNorm = normalizeCueComparisonText(candText)
+        if (prevNorm.isEmpty() || candNorm.isEmpty()) return BoundaryStitchOutcome.KeepAsIs
+
+        // 1. Exact or near-exact boundary duplicate (including short 2+ word utterances like "That's right" at 12:35)
+        val prevWordList = tokenizeOrderedWords(prevText)
+        val candWordList = tokenizeOrderedWords(candText)
+        if (prevNorm == candNorm && (candWordList.size >= 2 || candNorm.length >= 8)) {
+            return BoundaryStitchOutcome.DropAsDuplicate("BOUNDARY_DUPLICATE_STITCHED")
+        }
+        if (isTextEquivalent(prevText, candText)) {
+            return BoundaryStitchOutcome.DropAsDuplicate("BOUNDARY_DUPLICATE_STITCHED")
+        }
+
+        // 2. Candidate is wholly contained in the trailing part of prev (partial boundary echo, e.g. 16:35)
+        if (candNorm.length >= 10 && prevNorm.endsWith(candNorm)) {
+            return BoundaryStitchOutcome.DropAsDuplicate("BOUNDARY_SUFFIX_ECHO_STITCHED")
+        }
+        if (candWordList.size >= 3 && prevWordList.size >= candWordList.size) {
+            val tailSlice = prevWordList.takeLast(candWordList.size + 1)
+            val overlapWords = candWordList.count { it in tailSlice }
+            if (overlapWords == candWordList.size) {
+                return BoundaryStitchOutcome.DropAsDuplicate("BOUNDARY_SUFFIX_ECHO_STITCHED")
+            }
+        }
+
+        // 3. Suffix-prefix phrase overlap across boundary (e.g. 03:15, 16:35, 17:15):
+        // Trim repeated leading words from candidate while keeping new continuation words intact.
+        val maxOverlap = minOf(prevWordList.size, candWordList.size)
+        var bestOverlapCount = 0
+        for (k in maxOverlap downTo 2) {
+            val prevSuffix = prevWordList.subList(prevWordList.size - k, prevWordList.size)
+            val candPrefix = candWordList.subList(0, k)
+            if (prevSuffix == candPrefix) {
+                val charLen = candPrefix.sumOf { it.length }
+                if (k >= 3 || charLen >= 10) {
+                    bestOverlapCount = k
+                    break
+                }
+            }
+        }
+        if (bestOverlapCount > 0) {
+            if (bestOverlapCount >= candWordList.size) {
+                return BoundaryStitchOutcome.DropAsDuplicate("BOUNDARY_SUFFIX_ECHO_STITCHED")
+            }
+            val trimmedSource = dropLeadingWordsPreservingOriginal(candText, bestOverlapCount)
+            if (trimmedSource.length < 4) {
+                return BoundaryStitchOutcome.DropAsDuplicate("BOUNDARY_SUFFIX_ECHO_STITCHED")
+            }
+            val trimmedTranslated = if (cand.translatedText.trim().equals(candText, ignoreCase = true)) {
+                trimmedSource
+            } else {
+                val prevTransWords = tokenizeOrderedWords(prev.translatedText)
+                val candTransWords = tokenizeOrderedWords(cand.translatedText)
+                val transMatch = minOf(bestOverlapCount, prevTransWords.size, candTransWords.size)
+                if (transMatch >= 2 &&
+                    prevTransWords.takeLast(transMatch) == candTransWords.take(transMatch)
+                ) {
+                    dropLeadingWordsPreservingOriginal(cand.translatedText.trim(), transMatch)
+                        .ifBlank { cand.translatedText }
+                } else {
+                    cand.translatedText
+                }
+            }
+            return BoundaryStitchOutcome.TrimPrefix(
+                cand.copy(
+                    sourceText = trimmedSource,
+                    translatedText = trimmedTranslated,
+                )
+            )
+        }
+
+        return BoundaryStitchOutcome.KeepAsIs
+    }
+
+    private fun tokenizeOrderedWords(raw: String): List<String> =
+        raw.trim().lowercase()
+            .split(Regex("[^\\p{L}\\p{N}']+"))
+            .filter { it.isNotBlank() }
+
+    private fun dropLeadingWordsPreservingOriginal(raw: String, wordsToDrop: Int): String {
+        if (wordsToDrop <= 0) return raw.trim()
+        val matcher = Regex("[\\p{L}\\p{N}']+").findAll(raw).toList()
+        if (wordsToDrop >= matcher.size) return ""
+        val cutIndex = matcher[wordsToDrop].range.first
+        return raw.substring(cutIndex).trimStart(' ', ',', ';', ':', '-', '—', '.').trim()
+    }
+
     /**
-     * Suppresses hallucinated opening-scene subtitle echoes ONLY when a late video window replays
-     * opening dialogue at the start of the window (or across the majority of the chunk) with
-     * compatible speaker identity. Legitimate repeated phrases, choruses, callbacks, or distinct-speaker
-     * echoes elsewhere in a window are never discarded.
+     * Suppresses hallucinated opening-scene or earlier-window Scout dialogue echoes (Operation Golden Video Section 4):
+     * - Detects ordered multi-cue cross-window sequence echoes (even when speaker assignments differ or
+     *   wording is slightly paraphrased/re-segmented) and rejects the contaminated chunk so the ledger
+     *   marks the window FAILED for bounded recovery instead of committing echoed dialogue.
+     * - Preserves legitimate isolated repeated lines, refrains, callbacks, and simultaneous speakers.
      */
     fun filterEchoedOpeningCues(
         existing: List<DialogueEvent>,
@@ -580,38 +747,97 @@ object LookaheadWindowPlanner {
         windowStartMs: Long,
     ): List<DialogueEvent> {
         if (incoming.isEmpty() || existing.isEmpty() || windowStartMs < 35_000L) return incoming
-        val priorAnchors = existing.filter {
-            it.startTimeMs < (windowStartMs - 40_000L).coerceAtLeast(0L) &&
-                normalizeCueComparisonText(it.sourceText).length >= 16
-        }
+        val priorAnchors = existing
+            .filter {
+                it.startTimeMs < (windowStartMs - 25_000L).coerceAtLeast(0L) &&
+                    normalizeCueComparisonText(it.sourceText).length >= 14
+            }
+            .sortedBy { it.startTimeMs }
         if (priorAnchors.isEmpty()) return incoming
 
-        val matchingIndices = mutableSetOf<Int>()
+        val exactOrFuzzyMatches = mutableListOf<Pair<Int, DialogueEvent>>() // (incomingIdx, matchedPrior)
+        val sameSpeakerMatches = mutableSetOf<Int>()
+
         incoming.forEachIndexed { idx, evt ->
             val norm = normalizeCueComparisonText(evt.sourceText)
-            if (norm.length < 16) return@forEachIndexed
-            val matchedPrior = priorAnchors.any { prior ->
-                normalizeCueComparisonText(prior.sourceText) == norm &&
-                    areSpeakersCompatible(prior.speakerId, evt.speakerId)
+            if (norm.length < 14) return@forEachIndexed
+            val matchedPrior = priorAnchors.firstOrNull { prior ->
+                isEchoCandidateTextMatch(prior.sourceText, evt.sourceText)
             }
-            if (matchedPrior) {
-                matchingIndices.add(idx)
+            if (matchedPrior != null) {
+                exactOrFuzzyMatches.add(idx to matchedPrior)
+                if (areSpeakersCompatible(matchedPrior.speakerId, evt.speakerId)) {
+                    sameSpeakerMatches.add(idx)
+                }
             }
         }
 
-        // Whole-chunk opening hallucination: >=2 matching lines making up >=50% of incoming chunk
-        if (matchingIndices.size >= 2 && matchingIndices.size * 10 >= incoming.size * 5) {
+        // 1. Ordered multi-cue sequence echo (speaker-independent!):
+        // If >= 2 incoming cues match distant earlier cues in the same chronological sequence
+        // (within a ~90s source cluster) and form >= 40% of the chunk (or >= 3 ordered cues total),
+        // the model clearly re-read an earlier scene instead of the requested window!
+        if (exactOrFuzzyMatches.size >= 2) {
+            val orderedChainLength = longestMonotonicPriorCluster(exactOrFuzzyMatches.map { it.second.startTimeMs })
+            val ratioEchoed = exactOrFuzzyMatches.size * 10 >= incoming.size * 4
+            if (orderedChainLength >= 3 || (orderedChainLength >= 2 && ratioEchoed)) {
+                return emptyList()
+            }
+        }
+
+        // 2. Classic whole-chunk same-speaker opening hallucination (>= 2 lines & >= 50% of chunk)
+        if (sameSpeakerMatches.size >= 2 && sameSpeakerMatches.size * 10 >= incoming.size * 5) {
             return emptyList()
         }
 
-        // Leading-edge echo guard: only suppress a lone opening-edge replay (within first 4s of windowStartMs,
-        // >=26 normalized chars) from the same/unassigned speaker when matching an earlier-scene line.
+        // 3. Leading-edge echo guard: suppress a lone opening-edge replay (within first 4s of windowStartMs,
+        // >= 26 normalized chars) from the same/unassigned speaker when matching an earlier-scene line.
         return incoming.filterIndexed { idx, evt ->
-            if (idx !in matchingIndices) return@filterIndexed true
+            if (idx !in sameSpeakerMatches) return@filterIndexed true
             val norm = normalizeCueComparisonText(evt.sourceText)
             val atWindowOpening = (evt.startTimeMs - windowStartMs) in -1_000L..4_000L
             !(atWindowOpening && norm.length >= 26)
         }
+    }
+
+    private fun isEchoCandidateTextMatch(priorText: String, incomingText: String): Boolean {
+        val priorNorm = normalizeCueComparisonText(priorText)
+        val incNorm = normalizeCueComparisonText(incomingText)
+        if (priorNorm.length < 14 || incNorm.length < 14) return false
+        if (priorNorm == incNorm) return true
+        val shorter = minOf(priorNorm.length, incNorm.length)
+        if (shorter >= 18 && (priorNorm.contains(incNorm) || incNorm.contains(priorNorm))) return true
+        val priorWords = tokenizeComparisonWords(priorText)
+        val incWords = tokenizeComparisonWords(incomingText)
+        if (priorWords.size >= 4 && incWords.size >= 4) {
+            val intersection = priorWords.intersect(incWords).size
+            val union = priorWords.union(incWords).size.coerceAtLeast(1)
+            val minSet = minOf(priorWords.size, incWords.size).coerceAtLeast(1)
+            if (intersection.toFloat() / union.toFloat() >= 0.58f ||
+                (intersection >= 4 && intersection.toFloat() / minSet.toFloat() >= 0.72f)
+            ) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun longestMonotonicPriorCluster(matchedPriorTimesMs: List<Long>): Int {
+        if (matchedPriorTimesMs.isEmpty()) return 0
+        var best = 1
+        for (i in matchedPriorTimesMs.indices) {
+            var count = 1
+            var lastTime = matchedPriorTimesMs[i]
+            val clusterStart = lastTime
+            for (j in (i + 1) until matchedPriorTimesMs.size) {
+                val t = matchedPriorTimesMs[j]
+                if (t >= lastTime - 2_000L && (t - clusterStart) <= 95_000L) {
+                    count++
+                    lastTime = maxOf(lastTime, t)
+                }
+            }
+            if (count > best) best = count
+        }
+        return best
     }
 
     /**
