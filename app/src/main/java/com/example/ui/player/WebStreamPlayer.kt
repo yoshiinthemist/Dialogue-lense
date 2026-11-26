@@ -365,8 +365,21 @@ private fun createGuardedWebView(
 
             @JavascriptInterface
             fun onCapturedAudioChunk(startMs: Long, base64Audio: String, mimeType: String) {
-                if (base64Audio.isNotBlank()) {
-                    mainHandler.post { holder.audioSliceCallback(startMs, base64Audio, mimeType) }
+                if (base64Audio.isBlank()) return
+                mainHandler.post {
+                    val currentPageUrl = url.orEmpty()
+                    val seedDomain = WebNavigationGuard.registrableDomain(
+                        WebNavigationGuard.extractHost(seedUrlProvider())
+                    )
+                    val curHost = WebNavigationGuard.extractHost(currentPageUrl)
+                    val curDomain = WebNavigationGuard.registrableDomain(curHost)
+                    val allowedNow = holder.activeAllowedHostsSnapshot()
+                    val originAuthorized = seedDomain.isEmpty() ||
+                        curDomain.isEmpty() ||
+                        curDomain == seedDomain ||
+                        allowedNow.any { curHost == it || curHost.endsWith(".$it") }
+                    if (!originAuthorized) return@post
+                    holder.audioSliceCallback(startMs.coerceAtLeast(0L), base64Audio, mimeType)
                 }
             }
 
@@ -1145,7 +1158,6 @@ private fun buildWebStreamHookScript(
     if (!isScout || window.__dlAudioCapStarted || !video || !window.MediaRecorder) return;
     var captureFn = video.captureStream || video.mozCaptureStream;
     if (!captureFn) return;
-    window.__dlAudioCapStarted = true;
     try {
       var stream = captureFn.call(video);
       var audioTracks = stream.getAudioTracks ? stream.getAudioTracks() : [];
@@ -1156,12 +1168,32 @@ private fun buildWebStreamHookScript(
         : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '');
       if (!mime) return;
 
-      var sliceStartMs = Math.round((video.currentTime || 0) * 1000);
+      var sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+      var seekDirty = false;
+      var onSeeked = function() {
+        sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+        seekDirty = true;
+      };
+      var resetCapture = function() {
+        window.__dlAudioCapStarted = false;
+        try { video.removeEventListener('seeked', onSeeked); } catch (e) {}
+      };
+      video.addEventListener('seeked', onSeeked);
+      video.addEventListener('emptied', resetCapture, { once: true });
+      video.addEventListener('ended', resetCapture, { once: true });
+
       var rec = new MediaRecorder(audioOnly, { mimeType: mime });
+      rec.onerror = resetCapture;
+      rec.onstop = resetCapture;
       rec.ondataavailable = function(ev) {
+        if (seekDirty) {
+          seekDirty = false;
+          sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+          return;
+        }
         if (ev.data && ev.data.size > 1800 && window.DialogueLensWeb) {
           var capturedStart = sliceStartMs;
-          sliceStartMs = Math.round((video.currentTime || 0) * 1000);
+          sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
           var reader = new FileReader();
           reader.onloadend = function() {
             var res = reader.result || '';
@@ -1177,7 +1209,11 @@ private fun buildWebStreamHookScript(
         }
       };
       rec.start(6800);
-    } catch (securityErr) {}
+      // Mark started ONLY after MediaRecorder.start() succeeds so transient early calls can retry
+      window.__dlAudioCapStarted = true;
+    } catch (securityErr) {
+      window.__dlAudioCapStarted = false;
+    }
   }
 
   function harvestTextTracks(video) {

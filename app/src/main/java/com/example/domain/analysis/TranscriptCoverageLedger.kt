@@ -415,6 +415,87 @@ class TranscriptCoverageLedger(
         }
     }
 
+    /**
+     * Reconstructs honest interval coverage when reopening a saved AI project so incomplete
+     * regions remain PENDING and resume acquisition rather than appearing falsely complete.
+     */
+    fun restoreFromSavedAiEvents(
+        durationMs: Long,
+        events: List<DialogueEvent>,
+        verifiedUpToMs: Long = 0L,
+        source: SubtitleSourceKind = SubtitleSourceKind.AI_DRAFT,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ) {
+        val maxCueEnd = events.maxOfOrNull { it.endTimeMs } ?: 0L
+        val effectiveDur = maxOf(durationMs, maxCueEnd).coerceAtLeast(1_000L)
+        val realSorted = events.filter { it.endTimeMs > it.startTimeMs }.sortedBy { it.startTimeMs }
+        if (realSorted.isEmpty()) {
+            reset(effectiveDur, emptyList(), source)
+            return
+        }
+        val built = mutableListOf<CoverageInterval>()
+        var cursor = 0L
+        // Group cues into covered spans separated by > 12s uncovered gaps
+        var i = 0
+        while (i < realSorted.size) {
+            val spanStart = realSorted[i].startTimeMs.coerceIn(0L, effectiveDur)
+            var spanEnd = realSorted[i].endTimeMs.coerceIn(spanStart, effectiveDur)
+            var count = 1
+            while (i + 1 < realSorted.size && realSorted[i + 1].startTimeMs <= spanEnd + 12_000L) {
+                i++
+                spanEnd = maxOf(spanEnd, realSorted[i].endTimeMs.coerceIn(spanStart, effectiveDur))
+                count++
+            }
+            if (spanStart > cursor) {
+                val withinVerifiedPrefix = verifiedUpToMs > 0L && spanStart <= verifiedUpToMs
+                built.add(
+                    CoverageInterval(
+                        startMs = cursor,
+                        endMs = spanStart,
+                        status = if (withinVerifiedPrefix) CoverageStatus.VERIFIED_SILENCE else CoverageStatus.PENDING,
+                        source = source,
+                        verified = withinVerifiedPrefix,
+                        silenceConfirmed = withinVerifiedPrefix,
+                        updatedAtEpochMs = nowEpochMs,
+                    )
+                )
+            }
+            if (spanEnd > spanStart) {
+                val isWithinVerified = verifiedUpToMs <= 0L || spanEnd <= verifiedUpToMs
+                val st = if (isWithinVerified) CoverageStatus.VERIFIED_DIALOGUE else CoverageStatus.RELEASED_FALLBACK
+                built.add(
+                    CoverageInterval(
+                        startMs = maxOf(cursor, spanStart),
+                        endMs = spanEnd,
+                        status = st,
+                        source = source,
+                        verified = st.isVerified,
+                        dialogueCount = count,
+                        updatedAtEpochMs = nowEpochMs,
+                    )
+                )
+                cursor = maxOf(cursor, spanEnd)
+            }
+            i++
+        }
+        if (cursor < effectiveDur) {
+            built.add(
+                CoverageInterval(
+                    startMs = cursor,
+                    endMs = effectiveDur,
+                    status = CoverageStatus.PENDING,
+                    source = source,
+                    verified = false,
+                    updatedAtEpochMs = nowEpochMs,
+                )
+            )
+        }
+        reset(effectiveDur, built, source)
+        synchronized(lock) {
+            acceptedEvents = realSorted.size
+        }
+    }
+
     fun intervalsSnapshot(): List<CoverageInterval> = synchronized(lock) { intervals.toList() }
 
     fun bufferedRanges(): List<TimeWindowRange> = synchronized(lock) {
@@ -696,17 +777,32 @@ class TranscriptCoverageLedger(
         lookaheadHorizonMs: Long = 180_000L,
         openingWindowMs: Long = LookaheadWindowPlanner.OPENING_SCOUT_WINDOW_SEC * 1000L,
         rollingWindowMs: Long = LookaheadWindowPlanner.ROLLING_SCOUT_WINDOW_SEC * 1000L,
+        allowUploadedCaptionGapRecovery: Boolean = true,
+        minRecoverableUploadedGapMs: Long = 15_000L,
     ): CoverageInterval? = synchronized(lock) {
         if (totalDurationMs <= 0L) return@synchronized null
         val safePlayhead = playheadMs.coerceIn(0L, totalDurationMs)
         val candidates = intervals.filter { iv ->
+            val withinRetryBudget = when (iv.status) {
+                CoverageStatus.FAILED,
+                CoverageStatus.PARTIAL_RECOVERY,
+                CoverageStatus.SUSPECTED_MISSING_DIALOGUE -> iv.retryAttempts < maxRetryAttempts
+                else -> true
+            }
+            val uploadedGapEligible = if (iv.status == CoverageStatus.CAPTION_GAP && iv.source == SubtitleSourceKind.UPLOADED_FILE) {
+                allowUploadedCaptionGapRecovery &&
+                    (iv.endMs - iv.startMs) >= minRecoverableUploadedGapMs &&
+                    iv.retryAttempts < maxRetryAttempts
+            } else {
+                true
+            }
             !iv.verified &&
                 iv.status != CoverageStatus.IN_PROGRESS &&
                 iv.status != CoverageStatus.UNAVAILABLE_EVIDENCE &&
                 iv.status != CoverageStatus.RELEASED_FALLBACK &&
-                !(iv.status == CoverageStatus.CAPTION_GAP && iv.source == SubtitleSourceKind.UPLOADED_FILE) &&
+                uploadedGapEligible &&
                 iv.endMs > iv.startMs &&
-                (iv.status != CoverageStatus.FAILED || iv.retryAttempts < maxRetryAttempts)
+                withinRetryBudget
         }
         if (candidates.isEmpty()) return@synchronized null
 

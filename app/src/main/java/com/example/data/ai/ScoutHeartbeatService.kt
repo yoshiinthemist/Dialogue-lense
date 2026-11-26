@@ -1,6 +1,7 @@
 package com.example.data.ai
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -160,6 +161,8 @@ class ScoutHeartbeatService(
             val startedMs = clockMs()
             lastResult = try {
                 block()
+            } catch (e: TimeoutCancellationException) {
+                Result.failure(e)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -173,7 +176,7 @@ class ScoutHeartbeatService(
             }
 
             val err = lastResult.exceptionOrNull()
-            if (err is CancellationException) throw err
+            if (err is CancellationException && err !is TimeoutCancellationException) throw err
             if (TranslationAiService.isQuotaOrCreditExhaustedError(err)) {
                 recordFailure(err, retryAttempt = attempt, maxRetries = maxRetries, nextDelayMs = 0L)
                 return lastResult

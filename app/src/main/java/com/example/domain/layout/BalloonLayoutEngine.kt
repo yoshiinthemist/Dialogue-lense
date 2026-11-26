@@ -70,6 +70,9 @@ class BalloonLayoutEngine {
         val lastScore: Float = Float.MAX_VALUE,
         val missingFaceStreak: Int = 0,
         val lastTailTarget: NormalizedPoint? = null,
+        val lastDetectorFrameId: Long = -1L,
+        val lastWidth: Float = 0f,
+        val lastHeight: Float = 0f,
     )
 
     private val smoothedPositions = mutableMapOf<String, NormalizedPoint>()
@@ -144,6 +147,7 @@ class BalloonLayoutEngine {
         styleSettings: BalloonStyleSettings = project.styleSettings,
         liveFaces: List<LiveFaceObservation> = emptyList(),
         fixedZoneTaillessMode: Boolean = false,
+        measuredNormalizedSizes: Map<String, Pair<Float, Float>> = emptyMap(),
     ): CuePlacementStabilityReport {
         val sandbox = BalloonLayoutEngine()
         val dur = (event.endTimeMs - event.startTimeMs).coerceAtLeast(300L)
@@ -152,7 +156,7 @@ class BalloonLayoutEngine {
             event.startTimeMs + dur / 2L,
             (event.endTimeMs - 50L).coerceAtLeast(event.startTimeMs + 50L),
         ).distinct()
-        val placedSamples = sampleTimes.mapNotNull { t ->
+        val placedSamples = sampleTimes.mapIndexedNotNull { idx, t ->
             sandbox.computeLayout(
                 project = project,
                 currentMs = t,
@@ -161,7 +165,9 @@ class BalloonLayoutEngine {
                 sceneEpoch = 1,
                 hasLiveVisionSignal = liveFaces.isNotEmpty(),
                 liveFrameObservedEmpty = false,
+                measuredNormalizedSizes = measuredNormalizedSizes,
                 fixedZoneTaillessMode = fixedZoneTaillessMode,
+                detectorFrameId = idx.toLong() + 1L,
             ).firstOrNull { it.event.id == event.id }
         }
         if (placedSamples.isEmpty()) {
@@ -221,6 +227,7 @@ class BalloonLayoutEngine {
         activeChapterId: String? = null,
         measuredNormalizedSizes: Map<String, Pair<Float, Float>> = emptyMap(),
         fixedZoneTaillessMode: Boolean = false,
+        detectorFrameId: Long = -1L,
     ): List<PlacedBalloon> {
         stabilityDiagnostics.recordLayoutEvaluation()
         val activeEvents = timelineMatcher.matchActiveEvents(project.dialogueEvents, currentMs)
@@ -449,51 +456,51 @@ class BalloonLayoutEngine {
                 continue
             }
 
-            // 1a. Tailless Fixed-Zone Subtitle Mode: deterministic calm screen lanes with almost no movement and NO speech tail
+            // 1a. Tailless Fixed-Zone Subtitle Mode: deterministic calm screen lanes governed by the
+            // central movement-commitment gate and preserving actual measured bubble dimensions.
             if (fixedZoneTaillessMode && event.dialogueType == DialogueType.SPOKEN) {
                 val isUnknown = isBubbleSpeakerUnknown(event, speaker)
-                val fixedW = estWidth.coerceIn(0.28f, 0.50f)
-                val fixedH = estHeight.coerceIn(0.10f, 0.24f)
-                val existingFixed = committedBodies[event.id]
-                val fixedRect = if (existingFixed != null) {
-                    val lockedRect = centeredRect(existingFixed.center.x, existingFixed.center.y, fixedW, fixedH)
-                    val severelyObstructed = faceExclusionZones.any { it.intersectionArea(lockedRect) > 0.012f } ||
-                        occupiedBalloonRects.any { it.intersectionArea(lockedRect) > 0.004f }
-                    if (!severelyObstructed) {
-                        lockedRect
-                    } else {
-                        placeFixedZoneTaillessRect(
-                            w = fixedW,
-                            h = fixedH,
-                            speaker = speaker,
-                            anchorX = event.anchorPosition?.x,
-                            occupied = occupiedBalloonRects + allSceneObstacles,
-                            faceExclusions = faceExclusionZones,
-                            lipCorridorZones = lipCorridorZones,
-                            hasMultipleSpeakers = project.speakers.size >= 2,
-                        )
-                    }
-                } else {
-                    placeFixedZoneTaillessRect(
-                        w = fixedW,
-                        h = fixedH,
-                        speaker = speaker,
-                        anchorX = event.anchorPosition?.x,
-                        occupied = occupiedBalloonRects + allSceneObstacles,
-                        faceExclusions = faceExclusionZones,
-                        lipCorridorZones = lipCorridorZones,
-                        hasMultipleSpeakers = project.speakers.size >= 2,
-                    )
-                }
-                committedBodies[event.id] = CommittedBodyState(
-                    sceneKey = effectiveSceneKey,
-                    center = NormalizedPoint(fixedRect.centerX, fixedRect.centerY),
-                    previousCenter = existingFixed?.center,
-                    lastRelocationMs = existingFixed?.lastRelocationMs ?: currentMs,
-                    lastScore = 0f,
-                    missingFaceStreak = 0,
-                    lastTailTarget = null,
+                val fixedW = if (measuredPair != null) estWidth.coerceIn(0.06f, 0.88f) else estWidth.coerceIn(0.28f, 0.50f)
+                val fixedH = if (measuredPair != null) estHeight.coerceIn(0.04f, 0.48f) else estHeight.coerceIn(0.10f, 0.24f)
+                val targetFixedRect = placeFixedZoneTaillessRect(
+                    w = fixedW,
+                    h = fixedH,
+                    speaker = speaker,
+                    anchorX = event.anchorPosition?.x,
+                    occupied = occupiedBalloonRects + allSceneObstacles,
+                    faceExclusions = faceExclusionZones,
+                    lipCorridorZones = lipCorridorZones,
+                    hasMultipleSpeakers = project.speakers.size >= 2,
                 )
+                val fixedAllObstacles = occupiedBalloonRects + allSceneObstacles
+                fun scoreFixedCenter(pt: NormalizedPoint): Float {
+                    val r = centeredRect(pt.x, pt.y, fixedW, fixedH)
+                    val faceOv = faceExclusionZones.sumOf { it.intersectionArea(r).toDouble() }.toFloat()
+                    val lipOv = lipCorridorZones.sumOf { it.intersectionArea(r).toDouble() }.toFloat()
+                    val occOv = fixedAllObstacles.sumOf { it.intersectionArea(r).toDouble() }.toFloat()
+                    val dist = hypot((pt.x - targetFixedRect.centerX).toDouble(), (pt.y - targetFixedRect.centerY).toDouble()).toFloat()
+                    return (faceOv * 5000f + if (faceOv > 0f) 180f else 0f) +
+                        (lipOv * 4200f + if (lipOv > 0f) 150f else 0f) +
+                        (occOv * 3000f + if (occOv > 0f) 120f else 0f) +
+                        dist * 4f
+                }
+                val candFixedCenter = NormalizedPoint(targetFixedRect.centerX, targetFixedRect.centerY)
+                val committedFixedCenter = commitBodyPosition(
+                    eventId = event.id,
+                    sceneKey = effectiveSceneKey,
+                    candidateCenter = candFixedCenter,
+                    candidateScore = scoreFixedCenter(candFixedCenter),
+                    scoreCommitted = { prevPt -> scoreFixedCenter(prevPt) },
+                    isCriticallyInvalid = { prevPt ->
+                        val r = centeredRect(prevPt.x, prevPt.y, fixedW, fixedH)
+                        faceExclusionZones.any { r.intersectionArea(it) > 0.014f } ||
+                            occupiedBalloonRects.any { r.intersectionArea(it) > 0.004f }
+                    },
+                    currentMs = currentMs,
+                    styleSettings = styleSettings.copy(reducedMotion = true),
+                    forceResponsiveTracking = false,
+                )
+                val fixedRect = centeredRect(committedFixedCenter.x, committedFixedCenter.y, fixedW, fixedH)
                 occupiedBalloonRects.add(fixedRect)
                 val emphasis = resolveEmphasis(event)
                 results.add(
@@ -519,12 +526,13 @@ class BalloonLayoutEngine {
                 continue
             }
 
-            // 1b. Accessibility Stable Positioning or Reading Comfort mode: calm, steady, tailless reading zone preserving speaker identity & color
+            // 1b. Accessibility Stable Positioning or Reading Comfort mode: calm, steady, tailless reading zone
+            // routed through the same central movement-commitment gate so it never jumps frame-to-frame.
             val useStableCalmMode = styleSettings.stablePositioning ||
                 styleSettings.visualStyle == BubbleVisualStyle.READING_COMFORT
             if (useStableCalmMode && event.dialogueType == DialogueType.SPOKEN) {
                 val isUnknown = isBubbleSpeakerUnknown(event, speaker)
-                val stableRect = placeNeutralFallbackRect(
+                val targetStableRect = placeNeutralFallbackRect(
                     w = estWidth,
                     h = estHeight,
                     occupied = occupiedBalloonRects + allSceneObstacles,
@@ -533,6 +541,37 @@ class BalloonLayoutEngine {
                     speakerAccentIndex = speaker?.accentIndex,
                     hasMultipleSpeakers = project.speakers.size >= 2,
                 )
+                val stableW = if (measuredPair != null) estWidth.coerceIn(0.06f, 0.88f) else targetStableRect.width
+                val stableH = if (measuredPair != null) estHeight.coerceIn(0.04f, 0.48f) else targetStableRect.height
+                val stableObstacles = occupiedBalloonRects + allSceneObstacles
+                fun scoreStableCenter(pt: NormalizedPoint): Float {
+                    val r = centeredRect(pt.x, pt.y, stableW, stableH)
+                    val faceOv = faceExclusionZones.sumOf { it.intersectionArea(r).toDouble() }.toFloat()
+                    val lipOv = lipCorridorZones.sumOf { it.intersectionArea(r).toDouble() }.toFloat()
+                    val occOv = stableObstacles.sumOf { it.intersectionArea(r).toDouble() }.toFloat()
+                    val dist = hypot((pt.x - targetStableRect.centerX).toDouble(), (pt.y - targetStableRect.centerY).toDouble()).toFloat()
+                    return (faceOv * 4000f + if (faceOv > 0f) 140f else 0f) +
+                        (lipOv * 3000f + if (lipOv > 0f) 120f else 0f) +
+                        (occOv * 2400f + if (occOv > 0f) 100f else 0f) +
+                        dist * 4f
+                }
+                val candStableCenter = NormalizedPoint(targetStableRect.centerX, targetStableRect.centerY)
+                val committedStableCenter = commitBodyPosition(
+                    eventId = event.id,
+                    sceneKey = effectiveSceneKey,
+                    candidateCenter = candStableCenter,
+                    candidateScore = scoreStableCenter(candStableCenter),
+                    scoreCommitted = { prevPt -> scoreStableCenter(prevPt) },
+                    isCriticallyInvalid = { prevPt ->
+                        val r = centeredRect(prevPt.x, prevPt.y, stableW, stableH)
+                        faceExclusionZones.any { r.intersectionArea(it) > 0.014f } ||
+                            occupiedBalloonRects.any { r.intersectionArea(it) > 0.004f }
+                    },
+                    currentMs = currentMs,
+                    styleSettings = styleSettings.copy(reducedMotion = true),
+                    forceResponsiveTracking = false,
+                )
+                val stableRect = centeredRect(committedStableCenter.x, committedStableCenter.y, stableW, stableH)
                 occupiedBalloonRects.add(stableRect)
                 val emphasis = resolveEmphasis(event)
                 results.add(
@@ -576,9 +615,10 @@ class BalloonLayoutEngine {
                     resolvedEdgeType == DialogueType.OFF_SCREEN_BEHIND
                 val stackSlot = if (isOffScreen) offScreenCount++ else 0
                 val edgeRect = if (resolvedEdgeType == DialogueType.SOUND_DESCRIPTION) {
-                    val sfxW = estWidth.coerceIn(0.22f, 0.44f)
-                    val sfxH = (estHeight * 0.78f).coerceIn(0.065f, 0.14f)
-                    val sameShotPrevCenter = smoothedPositions[event.id]?.takeIf { lastShotIds[event.id] == effectiveSceneKey }
+                    val sfxW = if (measuredPair != null) estWidth.coerceIn(0.06f, 0.88f) else estWidth.coerceIn(0.22f, 0.44f)
+                    val sfxH = if (measuredPair != null) estHeight.coerceIn(0.04f, 0.48f) else (estHeight * 0.78f).coerceIn(0.065f, 0.14f)
+                    val sameShotPrevCenter = committedBodies[event.id]?.takeIf { it.sceneKey == effectiveSceneKey }?.center
+                        ?: smoothedPositions[event.id]?.takeIf { lastShotIds[event.id] == effectiveSceneKey }
                     val targetSfxRect = placeSfxSafeRect(
                         w = sfxW,
                         h = sfxH,
@@ -589,14 +629,30 @@ class BalloonLayoutEngine {
                         focalObstacles = allSceneObstacles,
                         previousCenter = sameShotPrevCenter,
                     )
-                    val smoothedSfxCenter = applyTemporalSmoothing(
+                    fun scoreSfxCenter(pt: NormalizedPoint): Float {
+                        val r = centeredRect(pt.x, pt.y, sfxW, sfxH)
+                        val faceOv = faceExclusionZones.sumOf { it.intersectionArea(r).toDouble() }.toFloat()
+                        val occOv = (occupiedBalloonRects + allSceneObstacles).sumOf { it.intersectionArea(r).toDouble() }.toFloat()
+                        val dist = hypot((pt.x - targetSfxRect.centerX).toDouble(), (pt.y - targetSfxRect.centerY).toDouble()).toFloat()
+                        return faceOv * 4000f + occOv * 3000f + dist * 4f
+                    }
+                    val candSfx = NormalizedPoint(targetSfxRect.centerX, targetSfxRect.centerY)
+                    val committedSfx = commitBodyPosition(
                         eventId = event.id,
-                        shotId = effectiveSceneKey,
-                        target = NormalizedPoint(targetSfxRect.centerX, targetSfxRect.centerY),
-                        reducedMotion = styleSettings.reducedMotion,
-                        movementSensitivity = styleSettings.movementSensitivity,
+                        sceneKey = effectiveSceneKey,
+                        candidateCenter = candSfx,
+                        candidateScore = scoreSfxCenter(candSfx),
+                        scoreCommitted = { prevPt -> scoreSfxCenter(prevPt) },
+                        isCriticallyInvalid = { prevPt ->
+                            val r = centeredRect(prevPt.x, prevPt.y, sfxW, sfxH)
+                            faceExclusionZones.any { r.intersectionArea(it) > 0.004f } ||
+                                occupiedBalloonRects.any { r.intersectionArea(it) > 0.003f }
+                        },
+                        currentMs = currentMs,
+                        styleSettings = styleSettings,
+                        forceResponsiveTracking = false,
                     )
-                    centeredRect(smoothedSfxCenter.x, smoothedSfxCenter.y, sfxW, sfxH)
+                    centeredRect(committedSfx.x, committedSfx.y, sfxW, sfxH)
                 } else {
                     placeSpecialDialogueRect(
                         type = resolvedEdgeType,
@@ -632,7 +688,10 @@ class BalloonLayoutEngine {
             }
 
             // 3. Spatial positioning via face track / live ML Kit mouth match / Scout-reported speaker coordinates
+            // Strictly respect PlacementMode.NEUTRAL_FALLBACK so conservative fallback cues are NEVER re-attached to faces.
+            val forcedNeutralFallback = !event.lockedByUser && event.placementMode == PlacementMode.NEUTRAL_FALLBACK
             val matchedPair = when {
+                forcedNeutralFallback -> null
                 event.faceTrackId != null -> faceSamples.firstOrNull { it.first == event.faceTrackId }
                 liveConvertedSamples.isNotEmpty() && !isBubbleSpeakerUnknown(event, speaker) ->
                     matchLiveFaceForSpokenEvent(
@@ -644,7 +703,7 @@ class BalloonLayoutEngine {
             }
             val matchedSample = matchedPair?.second
             val trackSample = matchedSample?.boundingBox
-            val scoutAnchor = event.anchorPosition
+            val scoutAnchor = if (forcedNeutralFallback) null else event.anchorPosition
             val isUnknown = isBubbleSpeakerUnknown(event, speaker)
 
             // Cutaway safeguard for YouTube live ML Kit: if ML Kit clearly sees 1-2 faces in frame and NONE are near
@@ -732,8 +791,9 @@ class BalloonLayoutEngine {
                     null
                 }
                 val bystanderAvoidBoxes = event.avoidBoxes.map { it.expand(0.02f, 0.02f) }
-                val scoutEstWidth = estWidth.coerceIn(0.26f, 0.48f)
-                val scoutEstHeight = estHeight.coerceIn(0.12f, 0.24f)
+                // Never clamp measured dimensions BELOW the actual rendered size!
+                val scoutEstWidth = if (measuredPair != null) estWidth.coerceIn(0.06f, 0.88f) else estWidth.coerceIn(0.26f, 0.48f)
+                val scoutEstHeight = if (measuredPair != null) estHeight.coerceIn(0.04f, 0.48f) else estHeight.coerceIn(0.12f, 0.24f)
                 val halfW = scoutEstWidth * 0.5f
                 val halfH = scoutEstHeight * 0.5f
                 val allObstacles = allSceneObstacles + occupiedBalloonRects
@@ -896,6 +956,9 @@ class BalloonLayoutEngine {
                     currentMs = currentMs,
                     styleSettings = styleSettings,
                     forceResponsiveTracking = false,
+                    detectorFrameId = detectorFrameId,
+                    rectWidth = scoutEstWidth,
+                    rectHeight = scoutEstHeight,
                 )
                 val finalRect = centeredRect(committedCenter.x, committedCenter.y, scoutEstWidth, scoutEstHeight)
                 if (liveConvertedSamples.isNotEmpty()) {
@@ -958,22 +1021,33 @@ class BalloonLayoutEngine {
 
             if (event.confidenceTier == ConfidenceTier.LOW || trackSample == null) {
                 // Brief single/double-frame face tracking dropout grace hold:
-                // Never teleport an already-committed active balloon to bottom-center on a transient
-                // ML Kit dropout within the same scene epoch; hold its stable body position (tailless
-                // if frame is empty) and only release to neutral fallback on sustained absence.
+                // Count DISTINCT detector observations (detectorFrameId), NEVER faster playback layout ticks,
+                // so a 30fps playback tick cannot burn through the grace hold before the next 6fps detector frame!
                 val heldBody = committedBodies[event.id]?.takeIf { it.sceneKey == effectiveSceneKey }
-                if (event.confidenceTier != ConfidenceTier.LOW &&
+                val isNewDetectorObservation = detectorFrameId < 0L || heldBody == null || detectorFrameId != heldBody.lastDetectorFrameId
+                val nextMissingStreak = if (heldBody != null) {
+                    if (isNewDetectorObservation) heldBody.missingFaceStreak + 1 else heldBody.missingFaceStreak
+                } else {
+                    0
+                }
+                if (!forcedNeutralFallback &&
+                    event.confidenceTier != ConfidenceTier.LOW &&
                     heldBody != null &&
-                    heldBody.missingFaceStreak < 2
+                    nextMissingStreak <= 2
                 ) {
-                    val heldRect = centeredRect(heldBody.center.x, heldBody.center.y, estWidth, estHeight)
+                    val holdW = if (heldBody.lastWidth > 0f) heldBody.lastWidth else estWidth
+                    val holdH = if (heldBody.lastHeight > 0f) heldBody.lastHeight else estHeight
+                    val heldRect = centeredRect(heldBody.center.x, heldBody.center.y, holdW, holdH)
                     val collidesNow = faceExclusionZones.any { heldRect.intersectionArea(it) > 0.002f } ||
                         occupiedBalloonRects.any { heldRect.intersectionArea(it) > 0.002f }
                     if (!collidesNow) {
-                        committedBodies[event.id] = heldBody.copy(
-                            missingFaceStreak = heldBody.missingFaceStreak + 1,
-                        )
-                        stabilityDiagnostics.recordTrackingDropout()
+                        if (isNewDetectorObservation) {
+                            committedBodies[event.id] = heldBody.copy(
+                                missingFaceStreak = nextMissingStreak,
+                                lastDetectorFrameId = detectorFrameId,
+                            )
+                            stabilityDiagnostics.recordTrackingDropout()
+                        }
                         occupiedBalloonRects.add(heldRect)
                         val emphasis = resolveEmphasis(event)
                         results.add(
@@ -1154,6 +1228,9 @@ class BalloonLayoutEngine {
                 currentMs = currentMs,
                 styleSettings = styleSettings,
                 forceResponsiveTracking = false,
+                detectorFrameId = detectorFrameId,
+                rectWidth = estWidth,
+                rectHeight = estHeight,
             )
 
             val finalRect = centeredRect(committedCenter.x, committedCenter.y, estWidth, estHeight)
@@ -1375,6 +1452,9 @@ class BalloonLayoutEngine {
         currentMs: Long,
         styleSettings: BalloonStyleSettings,
         forceResponsiveTracking: Boolean,
+        detectorFrameId: Long = -1L,
+        rectWidth: Float = 0f,
+        rectHeight: Float = 0f,
     ): NormalizedPoint {
         val existing = committedBodies[eventId]
         if (existing == null || existing.sceneKey != sceneKey) {
@@ -1401,6 +1481,9 @@ class BalloonLayoutEngine {
                 lastScore = candidateScore,
                 missingFaceStreak = 0,
                 lastTailTarget = null,
+                lastDetectorFrameId = detectorFrameId,
+                lastWidth = rectWidth,
+                lastHeight = rectHeight,
             )
             smoothedPositions[eventId] = candidateCenter
             lastShotIds[eventId] = sceneKey
@@ -1521,6 +1604,15 @@ class BalloonLayoutEngine {
                 previousCenter = if (actualMove >= 0.03f) existing.center else existing.previousCenter,
                 lastRelocationMs = if (actualMove >= 0.03f) currentMs else existing.lastRelocationMs,
                 lastScore = candidateScore,
+                lastDetectorFrameId = if (detectorFrameId >= 0L) detectorFrameId else existing.lastDetectorFrameId,
+                lastWidth = if (rectWidth > 0f) rectWidth else existing.lastWidth,
+                lastHeight = if (rectHeight > 0f) rectHeight else existing.lastHeight,
+            )
+        } else if (detectorFrameId >= 0L && detectorFrameId != existing.lastDetectorFrameId) {
+            committedBodies[eventId] = existing.copy(
+                lastDetectorFrameId = detectorFrameId,
+                lastWidth = if (rectWidth > 0f) rectWidth else existing.lastWidth,
+                lastHeight = if (rectHeight > 0f) rectHeight else existing.lastHeight,
             )
         }
         return smoothed

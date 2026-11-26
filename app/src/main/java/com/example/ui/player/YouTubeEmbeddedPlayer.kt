@@ -262,10 +262,23 @@ fun YouTubeEmbeddedPlayer(
 
                     @JavascriptInterface
                     fun onTimedTextCaptured(url: String?, body: String?) {
-                        val safeUrl = url.orEmpty()
+                        val safeUrl = url.orEmpty().trim()
                         val safeBody = body.orEmpty()
                         if (safeUrl.isBlank() && safeBody.isBlank()) return
+                        if (safeUrl.isNotBlank()) {
+                            val host = runCatching { android.net.Uri.parse(safeUrl).host.orEmpty().lowercase() }.getOrDefault("")
+                            val isYouTubeHost = host == "youtube.com" ||
+                                host.endsWith(".youtube.com") ||
+                                host == "youtube-nocookie.com" ||
+                                host.endsWith(".youtube-nocookie.com")
+                            if (!isYouTubeHost) return
+                        }
                         mainHandler.post {
+                            val activeVid = loadedVideoId?.replace(Regex("[^0-9A-Za-z_-]"), "").orEmpty()
+                            val urlVid = Regex("[?&]v=([^&]+)").find(safeUrl)?.groupValues?.getOrNull(1).orEmpty()
+                            if (activeVid.isNotBlank() && urlVid.isNotBlank() && urlVid != activeVid) {
+                                return@post
+                            }
                             val cookie = if (safeUrl.startsWith("http")) {
                                 runCatching { CookieManager.getInstance().getCookie(safeUrl) }.getOrNull()
                             } else {

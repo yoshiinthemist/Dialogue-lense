@@ -44,6 +44,7 @@ data class LiveStageFrameSnapshot(
     val seekGeneration: Long = 0L,
     val unmaskedSampleCount: Int = 48,
     val emptyFrameConsecutiveCount: Int = 0,
+    val observationSeq: Long = 0L,
 )
 
 /**
@@ -76,6 +77,9 @@ class LiveStageFaceTracker {
     private var previousLumaGrid: FloatArray? = null
 
     @Volatile
+    private var previousLumaAges: IntArray? = null
+
+    @Volatile
     private var previousFaceSignature: List<Pair<Float, Float>> = emptyList()
 
     @Volatile
@@ -87,8 +91,11 @@ class LiveStageFaceTracker {
     @Volatile
     private var consecutiveSoftCutFrames: Int = 0
 
+    private val observationCounter = java.util.concurrent.atomic.AtomicLong(0L)
+
     fun resetSceneHistory() {
         previousLumaGrid = null
+        previousLumaAges = null
         previousFaceSignature = emptyList()
         previousVideoTimeMs = -1L
         consecutiveEmptyFrames = 0
@@ -139,7 +146,8 @@ class LiveStageFaceTracker {
             val unmaskedValues = lumaGrid.filter { !it.isNaN() }
             val lumaAverage = if (unmaskedValues.isNotEmpty()) unmaskedValues.average().toFloat() else 0.5f
 
-            val faces = detectFacesOnBitmap(bitmap)
+            // Detector failure returns null — NEVER treat a detector error as a successful observation of 0 faces!
+            val faces = detectFacesOnBitmap(bitmap) ?: return null
             val w = bitmap.width.toFloat().coerceAtLeast(1f)
             val h = bitmap.height.toFloat().coerceAtLeast(1f)
             val nowMs = System.currentTimeMillis()
@@ -192,11 +200,17 @@ class LiveStageFaceTracker {
             val cutDetected = timeDiscontinuity || hardCut || consecutiveSoftCutFrames >= 2
             if (cutDetected) {
                 consecutiveSoftCutFrames = 0
+                // On real cuts, discard stale masked-cell history completely so old scene pixels never carry over
+                previousLumaGrid = lumaGrid
+                previousLumaAges = IntArray(lumaGrid.size) { if (lumaGrid[it].isNaN()) MAX_MASKED_CELL_AGE else 0 }
+            } else {
+                val (mergedGrid, mergedAges) = mergeGridWithMaxAge(prevGrid, previousLumaAges, lumaGrid)
+                previousLumaGrid = mergedGrid
+                previousLumaAges = mergedAges
             }
-
-            previousLumaGrid = mergeGridPreservingMasked(prevGrid, lumaGrid)
             previousFaceSignature = currentFaceSig
             previousVideoTimeMs = videoTimeMs
+            val seq = observationCounter.incrementAndGet()
 
             LiveStageFrameSnapshot(
                 faces = observations,
@@ -209,6 +223,7 @@ class LiveStageFaceTracker {
                 seekGeneration = seekGeneration,
                 unmaskedSampleCount = validCells,
                 emptyFrameConsecutiveCount = consecutiveEmptyFrames,
+                observationSeq = seq,
             )
         } catch (_: Throwable) {
             null
@@ -288,11 +303,49 @@ class LiveStageFaceTracker {
             return if (count == 0) 0f to 0 else (sum / count) to count
         }
 
+        const val MAX_MASKED_CELL_AGE = 3
+
         fun mergeGridPreservingMasked(previous: FloatArray?, current: FloatArray): FloatArray {
             if (previous == null || previous.size != current.size) return current
             return FloatArray(current.size) { i ->
                 if (current[i].isNaN()) previous[i] else current[i]
             }
+        }
+
+        /**
+         * Merges masked luma cells with a strict age TTL so cells covered by a stationary balloon
+         * for several frames expire to NaN instead of producing false cuts when the balloon clears.
+         */
+        fun mergeGridWithMaxAge(
+            previous: FloatArray?,
+            previousAges: IntArray?,
+            current: FloatArray,
+            maxAge: Int = MAX_MASKED_CELL_AGE,
+        ): Pair<FloatArray, IntArray> {
+            val ages = IntArray(current.size)
+            if (previous == null || previous.size != current.size) {
+                for (i in current.indices) {
+                    ages[i] = if (current[i].isNaN()) maxAge else 0
+                }
+                return current to ages
+            }
+            val merged = FloatArray(current.size)
+            for (i in current.indices) {
+                if (!current[i].isNaN()) {
+                    merged[i] = current[i]
+                    ages[i] = 0
+                } else {
+                    val nextAge = (previousAges?.getOrNull(i) ?: 0) + 1
+                    if (nextAge < maxAge && !previous[i].isNaN()) {
+                        merged[i] = previous[i]
+                        ages[i] = nextAge
+                    } else {
+                        merged[i] = Float.NaN
+                        ages[i] = maxAge
+                    }
+                }
+            }
+            return merged to ages
         }
 
         fun detectFaceLayoutCut(
@@ -340,7 +393,7 @@ class LiveStageFaceTracker {
         }
     }
 
-    private suspend fun detectFacesOnBitmap(bitmap: Bitmap): List<Face> =
+    private suspend fun detectFacesOnBitmap(bitmap: Bitmap): List<Face>? =
         suspendCancellableCoroutine { cont ->
             val input = InputImage.fromBitmap(bitmap, 0)
             detector.process(input)
@@ -348,7 +401,7 @@ class LiveStageFaceTracker {
                     if (cont.isActive) cont.resume(faces)
                 }
                 .addOnFailureListener {
-                    if (cont.isActive) cont.resume(emptyList())
+                    if (cont.isActive) cont.resume(null)
                 }
         }
 

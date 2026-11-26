@@ -139,6 +139,7 @@ fun SpeechBalloonView(
     forceTaillessFixedZone: Boolean = false,
     onRenderedFrameReported: ((cueKey: String, leftPx: Float, topPx: Float, widthPx: Float, heightPx: Float) -> Unit)? = null,
     onEntryAnimationStarted: ((cueKey: String) -> Unit)? = null,
+    measurementEpoch: Long = 0L,
     modifier: Modifier = Modifier,
 ) {
     val event = placed.event
@@ -170,7 +171,7 @@ fun SpeechBalloonView(
         event.dialogueType == DialogueType.INTERNAL_MONOLOGUE
 
     var measuredSize by remember(stableKey) { mutableStateOf(IntSize.Zero) }
-    var lastReportedNormSize by remember(stableKey) { mutableStateOf<Pair<Float, Float>?>(null) }
+    var lastReportedNormSize by remember(stableKey, measurementEpoch) { mutableStateOf<Pair<Float, Float>?>(null) }
 
     // Wait until first pixel measurement finishes before revealing so bubbles never hop Frame 1 -> Frame 2.
     // Keyed strictly on persistent stableKey so rolling caption updates & controlled repairs never replay entry!
@@ -232,13 +233,17 @@ fun SpeechBalloonView(
     val bubbleLeftPx = (desiredCenterX - actualW * 0.5f).coerceIn(safeMarginX, maxLeftPx)
     val bubbleTopPx = (desiredCenterY - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
 
-    // Smooth critically-damped body motion: snaps cleanly on first measured frame, then glides
-    // with zero overshoot or tweaking on subsequent gentle-drift updates.
+    // Smooth critically-damped body motion around CENTER (never top-left):
+    // When text length changes during a rolling update or translation refinement, actualW/actualH
+    // expands symmetrically around the committed center with ZERO A->B->A lurch or bounce.
     var hasInitializedBodyOffset by remember(stableKey) { mutableStateOf(false) }
     val isDraggingNow = dragOffsetXPx != 0f || dragOffsetYPx != 0f
-    val targetBodyOffset = Offset(bubbleLeftPx, bubbleTopPx)
-    val animatedBodyOffset by animateOffsetAsState(
-        targetValue = targetBodyOffset,
+    val targetBodyCenter = Offset(
+        x = bubbleLeftPx + actualW * 0.5f,
+        y = bubbleTopPx + actualH * 0.5f,
+    )
+    val animatedBodyCenter by animateOffsetAsState(
+        targetValue = targetBodyCenter,
         animationSpec = if (
             measuredSize == IntSize.Zero ||
             !hasInitializedBodyOffset ||
@@ -260,8 +265,8 @@ fun SpeechBalloonView(
         }
     }
 
-    val renderedLeftPx = animatedBodyOffset.x
-    val renderedTopPx = animatedBodyOffset.y
+    val renderedLeftPx = (animatedBodyCenter.x - actualW * 0.5f).coerceIn(safeMarginX, maxLeftPx)
+    val renderedTopPx = (animatedBodyCenter.y - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
     val actualCenterX = renderedLeftPx + actualW * 0.5f
     val actualCenterY = renderedTopPx + actualH * 0.5f
 
@@ -281,9 +286,9 @@ fun SpeechBalloonView(
         }
     }
 
-    // Report normalized dimensions ONLY when actual measured pixel size shifts beyond deadband
-    // (breaks measurement <-> movement feedback loops).
-    LaunchedEffect(stableKey, measuredSize, containerWidthPx, containerHeightPx) {
+    // Report normalized dimensions whenever actual measured pixel size shifts beyond deadband
+    // OR when measurementEpoch increments (viewport resize / orientation / font-scale cache invalidation).
+    LaunchedEffect(stableKey, measuredSize, containerWidthPx, containerHeightPx, measurementEpoch) {
         if (measuredSize != IntSize.Zero && containerWidthPx > 0f && containerHeightPx > 0f) {
             val normW = (actualW / containerWidthPx).coerceIn(0.06f, 0.88f)
             val normH = (actualH / containerHeightPx).coerceIn(0.04f, 0.48f)
@@ -1197,6 +1202,7 @@ private fun BalloonContentColumn(
         val showSpeakerHeader = !isSilentTsubuyaki && (
             showEditBadges ||
                 showAutoSpeakerLabel ||
+                event.needsTranslation ||
                 (event.dialogueType == DialogueType.NARRATION && isEditMode) ||
                 event.dialogueType == DialogueType.INTERNAL_MONOLOGUE
             )
@@ -1206,6 +1212,19 @@ private fun BalloonContentColumn(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
+                if (event.needsTranslation) {
+                    Text(
+                        text = "Untranslated",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.Medium),
+                        color = textColor.copy(alpha = 0.78f),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(textColor.copy(alpha = 0.12f))
+                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                            .testTag("untranslated_badge_${event.stableCueKey.ifBlank { event.id }}"),
+                        maxLines = 1,
+                    )
+                }
                 if (isEditMode && style.speakerSpecificColors && placed.speaker != null && !isSpecialNonSpoken && !isUnknownSpeaker) {
                     Box(
                         modifier = Modifier
@@ -1834,9 +1853,10 @@ fun SpatialSfxNoteView(
         }
     }
 
-    var measuredSize by remember(event.id) { mutableStateOf(IntSize.Zero) }
-    val enterAlpha = remember(event.id) { Animatable(if (style.reducedMotion) 1f else 0f) }
-    LaunchedEffect(event.id, measuredSize != IntSize.Zero, style.reducedMotion) {
+    val stableKey = event.stableCueKey.ifBlank { event.id }
+    var measuredSize by remember(stableKey) { mutableStateOf(IntSize.Zero) }
+    val enterAlpha = remember(stableKey) { Animatable(if (style.reducedMotion) 1f else 0f) }
+    LaunchedEffect(stableKey, measuredSize != IntSize.Zero, style.reducedMotion) {
         if (measuredSize == IntSize.Zero && !style.reducedMotion) return@LaunchedEffect
         if (style.reducedMotion) {
             enterAlpha.snapTo(1f)
@@ -1855,30 +1875,12 @@ fun SpatialSfxNoteView(
     val safeMarginY = 8f * density
     val maxLeftPx = (containerWidthPx - actualW - safeMarginX).coerceAtLeast(safeMarginX)
     val maxTopPx = (containerHeightPx - actualH - safeMarginY).coerceAtLeast(safeMarginY)
-    val baseLeftPx = (placed.rect.centerX * containerWidthPx - actualW * 0.5f).coerceIn(safeMarginX, maxLeftPx)
-    val baseTopPx = (placed.rect.centerY * containerHeightPx - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
+    // Single-Authority Positioning: BalloonLayoutEngine owns SFX placement & movement commitment;
+    // SpatialSfxNoteView clamps safely inside viewport bounds without running a competing solver.
+    val sfxLeftPx = (placed.rect.centerX * containerWidthPx - actualW * 0.5f).coerceIn(safeMarginX, maxLeftPx)
+    val sfxTopPx = (placed.rect.centerY * containerHeightPx - actualH * 0.5f).coerceIn(safeMarginY, maxTopPx)
 
-    val (sfxLeftPx, sfxTopPx) = if (measuredSize != IntSize.Zero) {
-        resolveSfxSafePixelPosition(
-            baseLeftPx = baseLeftPx,
-            baseTopPx = baseTopPx,
-            actualW = actualW,
-            actualH = actualH,
-            safeMarginX = safeMarginX,
-            safeMarginY = safeMarginY,
-            maxLeftPx = maxLeftPx,
-            maxTopPx = maxTopPx,
-            containerWidthPx = containerWidthPx,
-            containerHeightPx = containerHeightPx,
-            faceExclusionRects = faceExclusionRects,
-            occupiedBubbleRects = occupiedBubbleRects,
-            density = density,
-        )
-    } else {
-        baseLeftPx to baseTopPx
-    }
-
-    LaunchedEffect(event.id, measuredSize, sfxLeftPx, sfxTopPx) {
+    LaunchedEffect(stableKey, measuredSize, sfxLeftPx, sfxTopPx) {
         if (measuredSize != IntSize.Zero) {
             onPixelBoundsResolved(
                 Rect(

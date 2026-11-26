@@ -1,0 +1,118 @@
+{
+  "fixtureId": "main-dialogue",
+  "durationMs": 28000,
+  "width": 640,
+  "height": 360,
+  "sceneCutMs": 14000,
+  "confirmedSilenceIntervalMs": {
+    "startMs": 11500,
+    "endMs": 13500
+  },
+  "crossingIntervalMs": {
+    "startMs": 6000,
+    "endMs": 8500
+  },
+  "speakers": [
+    {
+      "trackId": "track-maya",
+      "label": "Maya",
+      "role": "person"
+    },
+    {
+      "trackId": "track-devon",
+      "label": "Devon",
+      "role": "person"
+    }
+  ],
+  "expectedCues": [
+    {
+      "startMs": 500,
+      "endMs": 4200,
+      "speakerLabel": "Maya",
+      "trackId": "track-maya",
+      "sceneId": "scene-1",
+      "text": "Do not open the vault before 3 minutes have passed.",
+      "hasNegation": true,
+      "quantities": [
+        "3"
+      ]
+    },
+    {
+      "startMs": 4500,
+      "endMs": 7800,
+      "speakerLabel": "Devon",
+      "trackId": "track-devon",
+      "sceneId": "scene-1",
+      "text": "Keep moving left while I cross behind the stage lamp."
+    },
+    {
+      "startMs": 8000,
+      "endMs": 9000,
+      "speakerLabel": "Maya",
+      "trackId": "track-maya",
+      "sceneId": "scene-1",
+      "text": "Wait."
+    },
+    {
+      "startMs": 9200,
+      "endMs": 10800,
+      "speakerLabel": "Maya",
+      "trackId": "track-maya",
+      "sceneId": "scene-1",
+      "text": "Wait."
+    },
+    {
+      "startMs": 14400,
+      "endMs": 17000,
+      "speakerLabel": "Devon",
+      "trackId": "track-devon",
+      "sceneId": "scene-2",
+      "text": "After the cut, the north door is still locked!",
+      "sameTimeCorrectionExpected": true
+    },
+    {
+      "startMs": 17200,
+      "endMs": 20200,
+      "speakerLabel": "Maya",
+      "trackId": "track-maya",
+      "sceneId": "scene-2",
+      "text": "I checked the latch twice from this corridor."
+    },
+    {
+      "startMs": 18000,
+      "endMs": 20400,
+      "speakerLabel": "Devon",
+      "trackId": "track-devon",
+      "sceneId": "scene-2",
+      "text": "Then bring the spare key from console 2 right now.",
+      "quantities": [
+        "2"
+      ]
+    },
+    {
+      "startMs": 20600,
+      "endMs": 22600,
+      "speakerLabel": "Off-screen",
+      "role": "offscreen",
+      "sceneId": "scene-2",
+      "text": "Check the stairwell camera before anyone leaves."
+    },
+    {
+      "startMs": 22800,
+      "endMs": 24800,
+      "speakerLabel": "Narrator",
+      "role": "narrator",
+      "sceneId": "scene-2",
+      "text": "Two floors below, the emergency generator hummed back to life."
+    },
+    {
+      "startMs": 25000,
+      "endMs": 27600,
+      "speakerLabel": "Maya",
+      "trackId": "track-maya",
+      "sceneId": "scene-2",
+      "styleVariant": "shout",
+      "text": "HOLD THE ELEVATOR DOOR! We need to fit this longer message cleanly inside the measured bubble bounds without clipping."
+    }
+  ]
+}

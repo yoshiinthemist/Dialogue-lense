@@ -18,6 +18,7 @@ import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
 import com.squareup.moshi.Moshi
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import kotlin.math.roundToInt
@@ -504,6 +505,9 @@ class TranslationAiService {
             }
             val elapsed = (android.os.SystemClock.elapsedRealtime() - startedMs).coerceAtLeast(1L)
             Result.success(elapsed)
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "Flash-Lite heartbeat ping timed out", e)
+            Result.failure(e)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -612,6 +616,9 @@ class TranslationAiService {
                     priorWindowNormalizedTexts = priorWindowNormalizedTexts,
                 )
             )
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "YouTube video AI transcription timed out ($cleanId ${windowStartSec}s-${windowEndSec}s)", e)
+            Result.failure(e)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -752,6 +759,9 @@ class TranslationAiService {
                     groundingSources = sources.distinct().take(6),
                 )
             )
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "Cast discovery timed out", e)
+            Result.failure(e)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -788,6 +798,7 @@ class TranslationAiService {
         glossary: List<GlossaryEntry> = emptyList(),
         audioMimeType: String = "audio/wav",
         preferLiteModel: Boolean = true,
+        chunkDurationMs: Long = 0L,
     ): Result<AiAudioTranscriptionResult> {
         if (wavBytes.isEmpty()) {
             return Result.success(
@@ -838,7 +849,16 @@ class TranslationAiService {
             val rawJson = response.text
                 ?: return Result.failure(IllegalStateException("Audio transcription returned an empty response."))
 
-            Result.success(parseAudioTranscriptionPayload(rawJson = rawJson, chunkStartMs = chunkStartMs))
+            Result.success(
+                parseAudioTranscriptionPayload(
+                    rawJson = rawJson,
+                    chunkStartMs = chunkStartMs,
+                    chunkDurationMs = chunkDurationMs,
+                )
+            )
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "Audio transcription timed out", e)
+            Result.failure(e)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -943,6 +963,9 @@ class TranslationAiService {
                 }
             }
             Result.success(parsed)
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "Translation batch timed out", e)
+            Result.failure(e)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1032,6 +1055,9 @@ class TranslationAiService {
                 }
             }
             Result.success(parsed)
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "Context speaker attribution timed out", e)
+            Result.failure(e)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1386,6 +1412,7 @@ class TranslationAiService {
         fun parseAudioTranscriptionPayload(
             rawJson: String,
             chunkStartMs: Long,
+            chunkDurationMs: Long = 0L,
         ): AiAudioTranscriptionResult {
             val root = runCatching { parseJsonMapLenientStatic(rawJson) }.getOrNull()
                 ?: return AiAudioTranscriptionResult(
@@ -1399,6 +1426,7 @@ class TranslationAiService {
                     diagnosticNote = "Missing cues array in audio transcript JSON",
                 )
 
+            val maxAllowedOffsetMs = if (chunkDurationMs > 0L) chunkDurationMs + 3_000L else Long.MAX_VALUE
             var invalidCueCount = 0
             val parsed = buildList {
                 for (item in cuesList) {
@@ -1413,10 +1441,20 @@ class TranslationAiService {
                         invalidCueCount++
                         continue
                     }
-                    val sMs = chunkStartMs + (startOffsetSec * 1000.0).toLong().coerceAtLeast(0L)
+                    val startOffsetMs = (startOffsetSec * 1000.0).toLong().coerceAtLeast(0L)
+                    if (startOffsetMs > maxAllowedOffsetMs) {
+                        invalidCueCount++
+                        continue
+                    }
+                    val sMs = chunkStartMs + startOffsetMs
                     val rawEndOffset = obj.jsonDouble("endOffsetSec", startOffsetSec + 1.5)
                     val safeEndOffset = if (rawEndOffset.isNaN() || rawEndOffset < startOffsetSec) startOffsetSec + 1.5 else rawEndOffset
-                    val eMs = (chunkStartMs + (safeEndOffset * 1000.0).toLong()).coerceAtLeast(sMs + 950L)
+                    val rawEndMs = (chunkStartMs + (safeEndOffset * 1000.0).toLong()).coerceAtLeast(sMs + 950L)
+                    val eMs = if (chunkDurationMs > 0L) {
+                        rawEndMs.coerceAtMost((chunkStartMs + chunkDurationMs + 2_000L).coerceAtLeast(sMs + 450L))
+                    } else {
+                        rawEndMs
+                    }
                     val typeName = obj.jsonString("dialogueType", "SPOKEN")
                     val dialogueType = DialogueType.entries.firstOrNull { it.name == typeName } ?: DialogueType.SPOKEN
                     add(
@@ -1439,7 +1477,7 @@ class TranslationAiService {
             val outcome = when {
                 parsed.isNotEmpty() && invalidCueCount > 0 -> TranscriptionOutcome.PARTIAL_SUCCESS
                 parsed.isNotEmpty() -> TranscriptionOutcome.DIALOGUE_DETECTED
-                cuesList.isNotEmpty() && invalidCueCount > 0 -> TranscriptionOutcome.INVALID_AI_RESPONSE
+                cuesList.isNotEmpty() && invalidCueCount > 0 -> TranscriptionOutcome.INVALID_OR_AMBIGUOUS_TIMESTAMPS
                 noSpeechConfirmed -> TranscriptionOutcome.VERIFIED_SILENCE
                 else -> TranscriptionOutcome.EMPTY_UNCONFIRMED
             }

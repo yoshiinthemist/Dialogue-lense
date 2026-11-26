@@ -532,12 +532,13 @@ class SpeakerAttributionEngine {
                     )
                 }
                 // Active learning propagation: boost subsequent unlocked uncertain events sharing
-                // matching face track, spatial cluster, or acoustic voice signature
+                // POSITIVE matching speaker ID, face track ID, or acoustic voice signature.
+                // Never propagate when two missing (null/blank) IDs compare equal!
                 idx > targetIndex && !evt.lockedByUser && newSpeakerId != null &&
                     evt.speakerConfidence < 0.65f &&
                     (
-                        evt.speakerId == targetEvent.speakerId ||
-                            evt.faceTrackId == targetEvent.faceTrackId ||
+                        (!targetEvent.speakerId.isNullOrBlank() && evt.speakerId == targetEvent.speakerId) ||
+                            (!targetEvent.faceTrackId.isNullOrBlank() && evt.faceTrackId == targetEvent.faceTrackId) ||
                             isAcousticVoiceMatch(evt.audioFeatures, correctedSpeakerPitch, targetEvent.audioFeatures)
                         ) -> {
                     val matchingTrack = updatedFaceTracks.firstOrNull {

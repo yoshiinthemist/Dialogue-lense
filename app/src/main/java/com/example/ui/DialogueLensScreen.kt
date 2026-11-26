@@ -516,6 +516,7 @@ fun DialogueLensScreen(
                 onRenderedBalloonFrame = viewModel::onRenderedBalloonFrame,
                 onBalloonEntryStarted = viewModel::onBalloonEntryStarted,
                 onViewportOrFontScaleChanged = viewModel::onViewportOrFontScaleChanged,
+                measurementEpoch = state.measurementEpoch,
                 readinessSnapshot = state.readinessSnapshot,
                 onRetryBuffering = viewModel::retryBufferingReadiness,
                 modifier = Modifier.fillMaxSize(),
@@ -1036,6 +1037,7 @@ fun DialogueLensScreen(
                                             onRenderedBalloonFrame = viewModel::onRenderedBalloonFrame,
                                             onBalloonEntryStarted = viewModel::onBalloonEntryStarted,
                                             onViewportOrFontScaleChanged = viewModel::onViewportOrFontScaleChanged,
+                                            measurementEpoch = state.measurementEpoch,
                                             readinessSnapshot = state.readinessSnapshot,
                                             onRetryBuffering = viewModel::retryBufferingReadiness,
                                             modifier = Modifier.weight(1f),
@@ -1245,6 +1247,7 @@ fun DialogueLensScreen(
                                         onRenderedBalloonFrame = viewModel::onRenderedBalloonFrame,
                                         onBalloonEntryStarted = viewModel::onBalloonEntryStarted,
                                         onViewportOrFontScaleChanged = viewModel::onViewportOrFontScaleChanged,
+                                        measurementEpoch = state.measurementEpoch,
                                         readinessSnapshot = state.readinessSnapshot,
                                         onRetryBuffering = viewModel::retryBufferingReadiness,
                                     )

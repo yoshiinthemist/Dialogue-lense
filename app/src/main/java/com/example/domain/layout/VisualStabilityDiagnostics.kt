@@ -234,14 +234,31 @@ class VisualStabilityDiagnostics {
             }
             val pPrevX = prev.prevCxNorm
             val pPrevY = prev.prevCyNorm
+            var countedOscillation = false
             if (pPrevX != null && pPrevY != null && step >= RENDERED_ABA_STEP_THRESHOLD) {
                 val distToTwoAgo = hypot((cx - pPrevX).toDouble(), (cy - pPrevY).toDouble()).toFloat()
                 val prevStep = hypot((prev.cxNorm - pPrevX).toDouble(), (prev.cyNorm - pPrevY).toDouble()).toFloat()
                 if (prevStep >= RENDERED_ABA_STEP_THRESHOLD && distToTwoAgo <= RENDERED_ABA_RETURN_TOLERANCE) {
                     renderedOscillations++
+                    countedOscillation = true
                 }
             }
+            // Sliding-window gradual multi-frame A->B->A reversal check (catches spring-smoothed drift reversals)
+            val trail = renderedTrailsByCue.getOrPut(cueKey) { ArrayDeque() }
             if (step >= 0.008f) {
+                if (!countedOscillation && trail.size >= 3) {
+                    val oldest = trail.first()
+                    val peakDist = trail.maxOf { pt ->
+                        hypot((pt.first - oldest.first).toDouble(), (pt.second - oldest.second).toDouble()).toFloat()
+                    }
+                    val returnDist = hypot((cx - oldest.first).toDouble(), (cy - oldest.second).toDouble()).toFloat()
+                    if (peakDist >= RENDERED_GRADUAL_ABA_PEAK && returnDist <= RENDERED_ABA_RETURN_TOLERANCE) {
+                        renderedOscillations++
+                        trail.clear()
+                    }
+                }
+                if (trail.size >= 8) trail.removeFirst()
+                trail.addLast(cx to cy)
                 renderedHistoryByCue[cueKey] = RenderedPosSample(
                     cxNorm = cx,
                     cyNorm = cy,
@@ -252,9 +269,13 @@ class VisualStabilityDiagnostics {
         } else {
             if (renderedHistoryByCue.size > 200) {
                 val oldest = renderedHistoryByCue.keys.firstOrNull()
-                if (oldest != null) renderedHistoryByCue.remove(oldest)
+                if (oldest != null) {
+                    renderedHistoryByCue.remove(oldest)
+                    renderedTrailsByCue.remove(oldest)
+                }
             }
             renderedHistoryByCue[cueKey] = RenderedPosSample(cxNorm = cx, cyNorm = cy)
+            renderedTrailsByCue[cueKey] = ArrayDeque<Pair<Float, Float>>().apply { addLast(cx to cy) }
         }
     }
 
@@ -276,6 +297,7 @@ class VisualStabilityDiagnostics {
         synchronized(lock) {
             seenEntryKeys.remove(cueKey)
             renderedHistoryByCue.remove(cueKey)
+            renderedTrailsByCue.remove(cueKey)
         }
     }
 
@@ -302,9 +324,12 @@ class VisualStabilityDiagnostics {
         )
     }
 
+    private val renderedTrailsByCue = linkedMapOf<String, ArrayDeque<Pair<Float, Float>>>()
+
     companion object {
         private const val RENDERED_LARGE_JUMP_THRESHOLD = 0.14f
         private const val RENDERED_ABA_STEP_THRESHOLD = 0.055f
+        private const val RENDERED_GRADUAL_ABA_PEAK = 0.075f
         private const val RENDERED_ABA_RETURN_TOLERANCE = 0.025f
     }
 }

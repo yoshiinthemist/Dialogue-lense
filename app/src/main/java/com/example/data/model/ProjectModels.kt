@@ -303,6 +303,7 @@ data class DialogueEvent(
     val preferredDeadSpaceZone: DeadSpaceZone = DeadSpaceZone.AUTO,
     val avoidBoxes: List<NormalizedRect> = emptyList(),
     val stableCueKey: String = "",
+    val needsTranslation: Boolean = false,
 ) {
     val confidenceTier: ConfidenceTier
         get() = confidenceTierFor(speakerConfidence)

@@ -174,7 +174,7 @@ class ResilientYouTubeSegmentExecutor(
                         res = clarified.getOrThrow()
                     } else {
                         val cErr = clarified.exceptionOrNull()
-                        if (cErr is CancellationException) throw cErr
+                        if (cErr is CancellationException && cErr !is TimeoutCancellationException) throw cErr
                     }
                 }
 
@@ -224,7 +224,7 @@ class ResilientYouTubeSegmentExecutor(
                 }
             } else {
                 val err = firstAttempt.exceptionOrNull()
-                if (err is CancellationException) throw err
+                if (err is CancellationException && err !is TimeoutCancellationException) throw err
 
                 // Quota exhaustion -> cascade stream permanently to Flash-Lite, then Free CC trigger
                 if (TranslationAiService.isQuotaOrCreditExhaustedError(err)) {
@@ -274,7 +274,7 @@ class ResilientYouTubeSegmentExecutor(
                             }
                         } else {
                             val liteErr = liteRetry.exceptionOrNull()
-                            if (liteErr is CancellationException) throw liteErr
+                            if (liteErr is CancellationException && liteErr !is TimeoutCancellationException) throw liteErr
                             if (TranslationAiService.isQuotaOrCreditExhaustedError(liteErr)) {
                                 hitQuotaStop = true
                                 quotaStopError = liteErr
@@ -357,7 +357,7 @@ class ResilientYouTubeSegmentExecutor(
                     }
                 } else {
                     val rescueErr = rescueAttempt.exceptionOrNull()
-                    if (rescueErr is CancellationException) throw rescueErr
+                    if (rescueErr is CancellationException && rescueErr !is TimeoutCancellationException) throw rescueErr
                     if (TranslationAiService.isQuotaOrCreditExhaustedError(rescueErr)) {
                         hitQuotaStop = true
                         quotaStopError = rescueErr

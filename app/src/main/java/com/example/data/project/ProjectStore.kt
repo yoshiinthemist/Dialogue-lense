@@ -334,7 +334,14 @@ class ProjectStore(private val context: Context) {
         content: String,
     ): Result<String> = withContext(Dispatchers.IO) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            return@withContext Result.failure(UnsupportedOperationException("Use file picker on Android 9 and below."))
+            return@withContext runCatching {
+                val baseDir = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: context.filesDir
+                val exportDir = File(baseDir, "DialogueLens").apply { mkdirs() }
+                val safeName = fileName.replace(Regex("[/\\\\:*?\"<>|]"), "_").ifBlank { "subtitles.srt" }
+                val outFile = File(exportDir, safeName)
+                outFile.writeText(content, Charsets.UTF_8)
+                "Documents/DialogueLens/$safeName"
+            }
         }
         runCatching {
             val resolver = context.contentResolver

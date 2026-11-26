@@ -58,6 +58,7 @@ data class SentinelWorkItem(
     val beaconId: String? = null,
     val chapterId: String? = null,
     val chapterTitle: String? = null,
+    val draftRevision: Long = 0L,
     val createdAtEpochMs: Long = System.currentTimeMillis(),
 )
 
@@ -186,7 +187,18 @@ class SentinelWorkforceCoordinator {
             this.isPlaybackBuffering = isPlaybackBuffering
             this.contiguousPlayheadLeadMs = contiguousPlayheadLeadMs.coerceAtLeast(0L)
             this.isBatteryOrThermalConstrained = isBatteryOrThermalConstrained
+            if (quotaMode == QuotaSaverMode.ZERO_CLOUD) {
+                // Immediately reject queued cloud-requiring work when Free CC Only is enabled;
+                // retain strictly local deterministic Scout 2 review work.
+                queue.removeAll { it.kind != SentinelTaskKind.SCOUT2_REQUIRED_REVIEW }
+            }
         }
+    }
+
+    fun cancelQueuedCloudWork(): Int = synchronized(lock) {
+        val before = queue.size
+        queue.removeAll { it.kind != SentinelTaskKind.SCOUT2_REQUIRED_REVIEW }
+        before - queue.size
     }
 
     fun recordQuotaError() {
@@ -440,21 +452,33 @@ class SentinelWorkforceCoordinator {
         startMs: Long,
         endMs: Long,
         playheadMs: Long,
+        draftRevision: Long = 0L,
         nowEpochMs: Long = System.currentTimeMillis(),
     ): Boolean = synchronized(lock) {
+        // Supersede any older queued review task for the same intervalId so stale drafts are never claimed
+        val existingForInterval = queue.firstOrNull {
+            it.kind == SentinelTaskKind.SCOUT2_REQUIRED_REVIEW && it.beaconId == intervalId
+        }
+        if (existingForInterval != null) {
+            if (draftRevision > 0L && draftRevision <= existingForInterval.draftRevision) {
+                return@synchronized false
+            }
+            queue.remove(existingForInterval)
+        }
         val distanceAhead = if (endMs >= playheadMs) {
             (startMs - playheadMs).coerceAtLeast(0L)
         } else {
             1_000_000_000L + (playheadMs - endMs)
         }
         val item = SentinelWorkItem(
-            id = "scout2_review_$intervalId",
+            id = "scout2_review_${intervalId}_rev${draftRevision}",
             tier = SentinelPriorityTier.CRITICAL_PLAYBACK_RECOVERY,
             kind = SentinelTaskKind.SCOUT2_REQUIRED_REVIEW,
             startMs = startMs,
             endMs = endMs,
             beaconId = intervalId,
             chapterTitle = "Review ${startMs / 1000L}s–${endMs / 1000L}s",
+            draftRevision = draftRevision,
             createdAtEpochMs = distanceAhead.coerceAtLeast(0L),
         )
         enqueueLocked(item)
@@ -462,13 +486,14 @@ class SentinelWorkforceCoordinator {
 
     /**
      * Claims the nearest unresolved [SentinelTaskKind.SCOUT2_REQUIRED_REVIEW] interval ahead of
-     * [playheadMs]. Deliberately bypasses [isPatrolSuspendedLocked] because Scout 2 review is a
-     * required stage in Prepare -> Review -> Release, never optional background patrol.
+     * [playheadMs] (or an exact [targetIntervalId] if requested). Deliberately bypasses
+     * [isPatrolSuspendedLocked] because Scout 2 review is a required stage in Prepare -> Review -> Release.
      */
     fun claimRequiredReviewWork(
         workerId: String = WORKER_2_ID,
         playheadMs: Long = 0L,
         nowEpochMs: Long = System.currentTimeMillis(),
+        targetIntervalId: String? = null,
     ): Pair<SentinelWorkItem, IntervalReservation>? = synchronized(lock) {
         val activeCount = workers.values.count { it.isActive }
         val isWorkerAlreadyActive = workers[workerId]?.isActive == true
@@ -477,7 +502,10 @@ class SentinelWorkforceCoordinator {
         }
 
         val reviewCandidates = queue
-            .filter { it.kind == SentinelTaskKind.SCOUT2_REQUIRED_REVIEW }
+            .filter {
+                it.kind == SentinelTaskKind.SCOUT2_REQUIRED_REVIEW &&
+                    (targetIntervalId == null || it.beaconId == targetIntervalId)
+            }
             .sortedWith(
                 compareBy<SentinelWorkItem> { item ->
                     if (item.endMs >= playheadMs) 0 else 1

@@ -855,8 +855,8 @@ object YouTubeCaptionFetcher {
             if (prevWords.isNotEmpty() && currWords.isNotEmpty()) {
                 // Case 1: Rolling ASR repeats prev as prefix of curr -> keep only new suffix words
                 if (currWords.size > prevWords.size &&
-                    currWords.take(prevWords.size).map { it.lowercase(Locale.US) } ==
-                    prevWords.map { it.lowercase(Locale.US) }
+                    currWords.take(prevWords.size).map { it.lowercase(Locale.US).trim(',', '.', '!', '?', ';', ':') } ==
+                    prevWords.map { it.lowercase(Locale.US).trim(',', '.', '!', '?', ';', ':') }
                 ) {
                     val trimmed = currWords.drop(prevWords.size).joinToString(" ").trim()
                     if (trimmed.isNotEmpty()) {

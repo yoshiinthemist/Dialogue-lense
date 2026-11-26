@@ -228,7 +228,7 @@ class AudioAnalyzer(private val context: Context) {
     suspend fun extractChunkedWavForAsr(
         uri: Uri,
         chunkWindowMs: Long = 50_000L,
-        maxTotalMs: Long = 180_000L,
+        maxTotalMs: Long = Long.MAX_VALUE,
     ): List<AudioWavChunk> = withContext(Dispatchers.Default) {
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
@@ -254,8 +254,9 @@ class AudioAnalyzer(private val context: Context) {
             val channels = if (audioFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
                 audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceIn(1, 8)
             } else 1
-            val targetRate = 16000
-            val stepRatio = (srcRate.toDouble() / targetRate.toDouble()).coerceAtLeast(1.0)
+            // Never write a higher WAV sample rate than srcRate (fixes 8kHz/11kHz/12kHz chipmunk speed-up)
+            val outputRate = minOf(srcRate, 16000)
+            val stepRatio = (srcRate.toDouble() / outputRate.toDouble()).coerceAtLeast(1.0)
 
             extractor.selectTrack(audioIdx)
             codec = MediaCodec.createDecoderByType(mime).apply {
@@ -264,6 +265,7 @@ class AudioAnalyzer(private val context: Context) {
             }
 
             var currentChunkStartMs = 0L
+            var lastDecodedPtsMs = 0L
             var pcmOut = ByteArrayOutputStream()
             var sampleAccumPos = 0.0
             val info = MediaCodec.BufferInfo()
@@ -277,7 +279,7 @@ class AudioAnalyzer(private val context: Context) {
                         AudioWavChunk(
                             startMs = currentChunkStartMs,
                             endMs = endMs.coerceAtLeast(currentChunkStartMs + 500L),
-                            wavBytes = wrapPcmAsWav(pcm, targetRate),
+                            wavBytes = wrapPcmAsWav(pcm, outputRate),
                         )
                     )
                 }
@@ -299,7 +301,7 @@ class AudioAnalyzer(private val context: Context) {
                                 val ptsUs = extractor.sampleTime
                                 codec.queueInputBuffer(inIdx, 0, sz, ptsUs, 0)
                                 extractor.advance()
-                                if (ptsUs > maxTotalMs * 1000L) inDone = true
+                                if (maxTotalMs < Long.MAX_VALUE && ptsUs > maxTotalMs * 1000L) inDone = true
                             }
                         }
                     }
@@ -309,6 +311,7 @@ class AudioAnalyzer(private val context: Context) {
                     if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outDone = true
                     val outBuf = codec.getOutputBuffer(outIdx)
                     val ptsMs = (info.presentationTimeUs / 1000L).coerceAtLeast(0L)
+                    if (ptsMs > lastDecodedPtsMs) lastDecodedPtsMs = ptsMs
                     if (outBuf != null && info.size > 0) {
                         if (ptsMs - currentChunkStartMs >= chunkWindowMs && pcmOut.size() > 3200) {
                             flushChunk(ptsMs)
@@ -332,12 +335,19 @@ class AudioAnalyzer(private val context: Context) {
                         }
                     }
                     codec.releaseOutputBuffer(outIdx, false)
-                    if (ptsMs > maxTotalMs && inDone) outDone = true
+                    if (maxTotalMs < Long.MAX_VALUE && ptsMs > maxTotalMs && inDone) outDone = true
                 } else if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER && inDone) {
                     break
                 }
             }
-            flushChunk(maxTotalMs)
+            val finalEndMs = if (lastDecodedPtsMs > currentChunkStartMs) {
+                lastDecodedPtsMs
+            } else if (maxTotalMs < Long.MAX_VALUE) {
+                maxTotalMs
+            } else {
+                currentChunkStartMs + chunkWindowMs
+            }
+            flushChunk(finalEndMs)
         } catch (e: Exception) {
             Log.e(TAG, "WAV export for ASR failed", e)
         } finally {
@@ -447,7 +457,8 @@ class AudioAnalyzer(private val context: Context) {
                     out.write(initBytes)
                 }
                 for (seg in overlapping) {
-                    val segBytes = httpDownloadBytes(seg.url, headers) ?: continue
+                    // Do not silently skip failed HLS segments — partial concatenation shifts timestamps
+                    val segBytes = httpDownloadBytes(seg.url, headers) ?: return@withContext null
                     out.write(segBytes)
                 }
             }
@@ -500,8 +511,8 @@ class AudioAnalyzer(private val context: Context) {
             val channels = if (audioFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
                 audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceIn(1, 8)
             } else 1
-            val targetRate = 16000
-            val stepRatio = (srcRate.toDouble() / targetRate.toDouble()).coerceAtLeast(1.0)
+            val outputRate = minOf(srcRate, 16000)
+            val stepRatio = (srcRate.toDouble() / outputRate.toDouble()).coerceAtLeast(1.0)
 
             extractor.selectTrack(audioIdx)
             if (padStartMs > 250L) {
@@ -584,7 +595,7 @@ class AudioAnalyzer(private val context: Context) {
             AudioWavChunk(
                 startMs = resolvedStart,
                 endMs = windowEndMs.coerceAtLeast(resolvedStart + 500L),
-                wavBytes = wrapPcmAsWav(pcm, targetRate),
+                wavBytes = wrapPcmAsWav(pcm, outputRate),
             )
         } finally {
             runCatching { codec?.stop() }

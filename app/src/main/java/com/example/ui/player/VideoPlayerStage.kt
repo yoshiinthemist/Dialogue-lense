@@ -213,6 +213,7 @@ fun VideoPlayerStage(
     onRenderedBalloonFrame: (cueKey: String, leftPx: Float, topPx: Float, widthPx: Float, heightPx: Float, containerW: Float, containerH: Float) -> Unit = { _, _, _, _, _, _, _ -> },
     onBalloonEntryStarted: (cueKey: String) -> Unit = {},
     onViewportOrFontScaleChanged: (widthPx: Int, heightPx: Int, fontScale: Float) -> Unit = { _, _, _ -> },
+    measurementEpoch: Long = 0L,
     readinessSnapshot: PlaybackReadinessSnapshot? = null,
     onRetryBuffering: () -> Unit = onRetryYouTubeAiTranscript,
     onDismissQuickPicker: () -> Unit = {},
@@ -923,6 +924,7 @@ fun VideoPlayerStage(
                             onMeasuredNormalizedSize = { normW, normH ->
                                 onMeasuredBubbleSize(placed.event.id, normW, normH)
                             },
+                            measurementEpoch = measurementEpoch,
                             onRenderedFrameReported = { cueKey, leftPx, topPx, wPx, hPx ->
                                 onRenderedBalloonFrame(cueKey, leftPx, topPx, wPx, hPx, widthPx, heightPx)
                             },

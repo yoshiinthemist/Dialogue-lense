@@ -36,6 +36,16 @@ enum class PlacementReviewStatus {
     REPAIRED,
 }
 
+data class CueReviewRecord(
+    val eventId: String,
+    val stableCueKey: String,
+    val status: DialogueReviewStatus,
+    val isSourceVerified: Boolean,
+    val isTranslationVerified: Boolean,
+    val needsTranslation: Boolean = false,
+    val note: String = "",
+)
+
 data class IntervalReviewOutcome(
     val dialogueStatus: DialogueReviewStatus,
     val attributionStatus: AttributionReviewStatus,
@@ -47,6 +57,12 @@ data class IntervalReviewOutcome(
     val needsModelEscalation: Boolean = false,
     val notes: List<String> = emptyList(),
     val repairedEvents: List<DialogueEvent> = emptyList(),
+    val perCueReviews: List<CueReviewRecord> = emptyList(),
+    val draftRevision: Long = 0L,
+    val sourceRevision: Long = 0L,
+    val referenceTrackId: String? = null,
+    val isTranslationVerified: Boolean = true,
+    val isApproximatePreviewOnly: Boolean = false,
 ) {
     val coverageStatus: CoverageStatus
         get() = when (dialogueStatus) {
@@ -158,6 +174,8 @@ class Scout2IndependentReviewer {
         liveFaces: List<LiveFaceObservation> = emptyList(),
         styleSettings: BalloonStyleSettings = projectTemplate.styleSettings,
         displayMode: CaptionDisplayMode = CaptionDisplayMode.BALLOONS,
+        liveFacesPlayheadMs: Long? = null,
+        measuredNormalizedSizes: Map<String, Pair<Float, Float>> = emptyMap(),
     ): IntervalReviewOutcome {
         val notes = mutableListOf<String>()
         val alignedRefs = referenceTrack?.cues
@@ -167,6 +185,47 @@ class Scout2IndependentReviewer {
                     cue.text.isNotBlank()
             }
             .orEmpty()
+
+        // Only treat liveFaces as valid observations for this draft interval when they belong to
+        // the same time region; NEVER evaluate a future scene using the viewer's current live faces!
+        val intervalLiveFaces = if (liveFacesPlayheadMs != null &&
+            (liveFacesPlayheadMs < draft.startMs - 3_000L || liveFacesPlayheadMs > draft.endMs + 3_000L)
+        ) {
+            notes.add("Future interval preview omitted current viewer faces")
+            emptyList()
+        } else {
+            liveFaces
+        }
+        val isApproximatePreview = intervalLiveFaces.isEmpty() || measuredNormalizedSizes.isEmpty()
+
+        val targetLangNorm = normalizeLanguageTag(draft.targetLanguage)
+        val sourceLangNorm = normalizeLanguageTag(draft.sourceLanguage)
+        val sampleRefText = alignedRefs.take(3).joinToString(" ") { it.text }
+        val declaredRefLang = normalizeLanguageTag(referenceTrack?.languageCode.orEmpty())
+        val inferredRefScriptLang = detectDominantScriptLanguage(sampleRefText)
+        val effectiveRefLang = when {
+            declaredRefLang.isNotBlank() && declaredRefLang != "auto" -> declaredRefLang
+            inferredRefScriptLang.isNotBlank() -> inferredRefScriptLang
+            else -> "auto"
+        }
+
+        // Language check applies identically to explicit sourceLanguage, Auto-Detect, AND empty-draft recovery
+        val hasConcreteTarget = targetLangNorm.isNotBlank() && targetLangNorm != "auto"
+        val refMatchesTarget = hasConcreteTarget && effectiveRefLang == targetLangNorm
+        val refDiffersFromTarget = hasConcreteTarget &&
+            effectiveRefLang.isNotBlank() &&
+            effectiveRefLang != "auto" &&
+            effectiveRefLang != targetLangNorm
+        val isTranslationRequested = hasConcreteTarget && (
+            (sourceLangNorm.isNotBlank() && sourceLangNorm != "auto" && sourceLangNorm != targetLangNorm) ||
+                refDiffersFromTarget
+            )
+        val refMatchesSource = when {
+            sourceLangNorm.isNotBlank() && sourceLangNorm != "auto" && effectiveRefLang != "auto" ->
+                effectiveRefLang == sourceLangNorm
+            sourceLangNorm == "auto" && effectiveRefLang != "auto" && !refMatchesTarget -> true
+            else -> false
+        }
 
         // 1. Handle unavailable source evidence honestly without faking verification
         if (draft.hasUnavailableEvidence && draft.events.isEmpty() && alignedRefs.isEmpty()) {
@@ -182,24 +241,40 @@ class Scout2IndependentReviewer {
                 needsModelEscalation = false,
                 notes = notes,
                 repairedEvents = emptyList(),
+                perCueReviews = emptyList(),
+                draftRevision = draft.draftRevision,
+                sourceRevision = draft.sourceRevision,
+                referenceTrackId = draft.referenceTrackId,
+                isTranslationVerified = false,
+                isApproximatePreviewOnly = isApproximatePreview,
             )
         }
 
         // 2. Coverage check: empty draft vs confirmed silence vs caption dropout/gap
         if (draft.events.isEmpty()) {
             if (alignedRefs.isNotEmpty()) {
-                // Draft missed dialogue that is present in reference captions -> repair from reference!
-                notes.add("Recovered ${alignedRefs.size} cue(s) missed by Scout 1 from reference captions")
+                // Draft missed dialogue present in reference captions -> recover with strict language guards!
+                val missingTranslation = isTranslationRequested && !refMatchesTarget
+                val refOriginIsHighTrust = referenceTrack?.originKind == CaptionOriginKind.AUTHORED ||
+                    referenceTrack?.originKind == CaptionOriginKind.USER_IMPORTED
+                if (missingTranslation) {
+                    notes.add("Recovered ${alignedRefs.size} cue(s) in source language (${effectiveRefLang.uppercase()}); ${draft.targetLanguage} translation still required")
+                } else {
+                    notes.add("Recovered ${alignedRefs.size} cue(s) missed by Scout 1 from reference captions")
+                }
                 val recovered = alignedRefs.map { ref ->
+                    val clampedStart = ref.startMs.coerceIn(draft.startMs, draft.endMs)
+                    val clampedEnd = ref.endMs.coerceIn(
+                        clampedStart + 350L,
+                        maxOf(draft.endMs, clampedStart + 350L),
+                    )
                     DialogueEvent(
                         id = "sc2_${ref.cueId}",
-                        startTimeMs = ref.startMs.coerceIn(draft.startMs, draft.endMs),
-                        endTimeMs = ref.endMs.coerceIn(
-                            ref.startMs.coerceIn(draft.startMs, draft.endMs) + 350L,
-                            maxOf(draft.endMs, ref.startMs + 350L),
-                        ),
+                        startTimeMs = clampedStart,
+                        endTimeMs = clampedEnd,
                         sourceText = ref.text,
-                        translatedText = ref.text,
+                        // NEVER copy foreign-language captions into translatedText when target translation is requested!
+                        translatedText = if (missingTranslation) "" else ref.text,
                         speakerId = null,
                         speakerConfidence = 0.35f,
                         faceTrackId = null,
@@ -209,28 +284,51 @@ class Scout2IndependentReviewer {
                         placementMode = PlacementMode.NEUTRAL_FALLBACK,
                         attributionSummary = "Unidentified speaker",
                         stableCueKey = ref.cueId,
+                        needsTranslation = missingTranslation,
+                    )
+                }
+                val cueReviews = recovered.map { evt ->
+                    CueReviewRecord(
+                        eventId = evt.id,
+                        stableCueKey = evt.stableCueKey,
+                        status = if (missingTranslation || !refOriginIsHighTrust) {
+                            DialogueReviewStatus.FALLBACK_UNVERIFIED
+                        } else {
+                            DialogueReviewStatus.REPAIRED_FROM_REFERENCE
+                        },
+                        isSourceVerified = refOriginIsHighTrust,
+                        isTranslationVerified = !missingTranslation && refOriginIsHighTrust,
+                        needsTranslation = missingTranslation,
+                        note = if (missingTranslation) "Source recovered; translation pending" else "Recovered from reference",
                     )
                 }
                 val (placedEvents, placementStatus, placementStable) = validatePresentation(
                     events = recovered,
                     layoutEngine = layoutEngine,
                     projectTemplate = projectTemplate,
-                    liveFaces = liveFaces,
+                    liveFaces = intervalLiveFaces,
                     styleSettings = styleSettings,
                     displayMode = displayMode,
+                    measuredNormalizedSizes = measuredNormalizedSizes,
                     notes = notes,
                 )
                 return IntervalReviewOutcome(
                     dialogueStatus = DialogueReviewStatus.REPAIRED_FROM_REFERENCE,
                     attributionStatus = AttributionReviewStatus.NEUTRAL_UNCERTAIN,
                     placementStatus = placementStatus,
-                    dialogueConfidence = if (referenceTrack?.originKind == CaptionOriginKind.AUTOMATIC_ASR) 0.72f else 0.90f,
+                    dialogueConfidence = if (refOriginIsHighTrust) 0.90f else 0.72f,
                     attributionConfidence = 0.35f,
                     placementStable = placementStable,
-                    isIndependentlyVerified = referenceTrack?.originKind != CaptionOriginKind.AUTOMATIC_ASR,
-                    needsModelEscalation = false,
+                    isIndependentlyVerified = refOriginIsHighTrust && !missingTranslation,
+                    needsModelEscalation = missingTranslation,
                     notes = notes,
                     repairedEvents = placedEvents,
+                    perCueReviews = cueReviews,
+                    draftRevision = draft.draftRevision,
+                    sourceRevision = draft.sourceRevision,
+                    referenceTrackId = draft.referenceTrackId,
+                    isTranslationVerified = !missingTranslation && refOriginIsHighTrust,
+                    isApproximatePreviewOnly = isApproximatePreview,
                 )
             }
             if (draft.isConfirmedSilence && draft.hasIndependentAudioOrFrameEvidence) {
@@ -246,6 +344,12 @@ class Scout2IndependentReviewer {
                     needsModelEscalation = false,
                     notes = notes,
                     repairedEvents = emptyList(),
+                    perCueReviews = emptyList(),
+                    draftRevision = draft.draftRevision,
+                    sourceRevision = draft.sourceRevision,
+                    referenceTrackId = draft.referenceTrackId,
+                    isTranslationVerified = true,
+                    isApproximatePreviewOnly = isApproximatePreview,
                 )
             }
             // Empty interval without confirmed silence is NOT automatically silence!
@@ -261,113 +365,260 @@ class Scout2IndependentReviewer {
                 needsModelEscalation = draft.hasIndependentAudioOrFrameEvidence,
                 notes = notes,
                 repairedEvents = emptyList(),
+                perCueReviews = emptyList(),
+                draftRevision = draft.draftRevision,
+                sourceRevision = draft.sourceRevision,
+                referenceTrackId = draft.referenceTrackId,
+                isTranslationVerified = false,
+                isApproximatePreviewOnly = isApproximatePreview,
             )
         }
 
         // 3. Rolling-caption normalization & persistent identity preservation
         val deduplicated = normalizeRollingCaptionsPreservingIdentity(draft.events, notes)
 
-        // 4. Language-aware text & timing comparison against original reference captions
-        val targetLangNorm = normalizeLanguageTag(draft.targetLanguage)
-        val sourceLangNorm = normalizeLanguageTag(draft.sourceLanguage)
-        val refLangNorm = normalizeLanguageTag(referenceTrack?.languageCode.orEmpty())
-        val isTranslationRequested = targetLangNorm.isNotBlank() &&
-            sourceLangNorm.isNotBlank() &&
-            targetLangNorm != "auto" &&
-            sourceLangNorm != "auto" &&
-            targetLangNorm != sourceLangNorm
-        val refMatchesTarget = refLangNorm.isNotBlank() && targetLangNorm.isNotBlank() && refLangNorm == targetLangNorm
-        val refMatchesSource = refLangNorm.isNotBlank() && sourceLangNorm.isNotBlank() && refLangNorm == sourceLangNorm
-
+        // 4. Per-cue, language-aware, semantic comparison against immutable reference captions
+        val refOriginIsHighTrust = referenceTrack != null &&
+            (referenceTrack.originKind == CaptionOriginKind.AUTHORED ||
+                referenceTrack.originKind == CaptionOriginKind.USER_IMPORTED)
         var repairedDialogueCount = 0
-        var matchedReferenceCount = 0
+        var verifiedCueCount = 0
+        var unverifiedCueCount = 0
+        var allTranslationsVerified = true
         var escalatedForAmbiguity = false
+        val cueReviews = mutableListOf<CueReviewRecord>()
+
         val textReviewed = deduplicated.map { evt ->
             val stableKey = evt.stableCueKey.ifBlank { evt.id }
             val overlappingRefs = alignedRefs.filter { ref ->
-                ref.endMs >= evt.startTimeMs - 900L && ref.startMs <= evt.endTimeMs + 900L
+                val overlapStart = maxOf(ref.startMs, evt.startTimeMs)
+                val overlapEnd = minOf(ref.endMs, evt.endTimeMs)
+                val directOverlap = overlapEnd > overlapStart
+                val closeProximity = abs(ref.startMs - evt.startTimeMs) <= 800L
+                directOverlap || closeProximity
             }
+            val cueNeedsTranslation = isTranslationRequested &&
+                evt.translatedText.isBlank() &&
+                evt.sourceText.isNotBlank()
+
             if (overlappingRefs.isEmpty()) {
-                evt.copy(stableCueKey = stableKey)
+                // No overlapping reference cue for THIS cue -> keep this cue explicitly unverified unless backed by audio!
+                if (draft.hasIndependentAudioOrFrameEvidence && !cueNeedsTranslation) {
+                    verifiedCueCount++
+                    cueReviews.add(
+                        CueReviewRecord(
+                            eventId = evt.id,
+                            stableCueKey = stableKey,
+                            status = DialogueReviewStatus.VERIFIED_MATCH,
+                            isSourceVerified = true,
+                            isTranslationVerified = !isTranslationRequested || evt.translatedText.isNotBlank(),
+                            needsTranslation = cueNeedsTranslation,
+                            note = "Backed by audio/media evidence",
+                        )
+                    )
+                } else {
+                    unverifiedCueCount++
+                    if (isTranslationRequested && !refMatchesTarget) allTranslationsVerified = false
+                    cueReviews.add(
+                        CueReviewRecord(
+                            eventId = evt.id,
+                            stableCueKey = stableKey,
+                            status = DialogueReviewStatus.FALLBACK_UNVERIFIED,
+                            isSourceVerified = false,
+                            isTranslationVerified = false,
+                            needsTranslation = cueNeedsTranslation,
+                            note = "No overlapping reference cue",
+                        )
+                    )
+                }
+                evt.copy(stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
             } else {
                 val combinedRefText = overlappingRefs.joinToString(" ") { it.text.trim() }.trim()
-                val refTokens = tokenizeNormalized(combinedRefText)
-                val canCompareAgainstTranslated = !isTranslationRequested || refMatchesTarget
-                val compareTargetText = if (canCompareAgainstTranslated) {
-                    evt.translatedText.ifBlank { evt.sourceText }
-                } else {
-                    // Translation is active and reference is in source language:
-                    // compare ONLY against sourceText and NEVER overwrite translatedText with source strings!
-                    evt.sourceText
+                val cueRefLang = if (effectiveRefLang != "auto") effectiveRefLang else detectDominantScriptLanguage(combinedRefText)
+                val cueRefMatchesTarget = hasConcreteTarget && cueRefLang == targetLangNorm
+                val cueRefMatchesSource = when {
+                    sourceLangNorm != "auto" && cueRefLang.isNotBlank() && cueRefLang != "auto" -> cueRefLang == sourceLangNorm
+                    sourceLangNorm == "auto" && cueRefLang.isNotBlank() && cueRefLang != "auto" && !cueRefMatchesTarget -> true
+                    else -> false
                 }
-                val draftTokens = tokenizeNormalized(compareTargetText)
-                val overlapScore = tokenOverlapScore(draftTokens, refTokens)
+                val cueRequiresTranslation = hasConcreteTarget && (
+                    (sourceLangNorm != "auto" && sourceLangNorm != targetLangNorm) ||
+                        (cueRefLang.isNotBlank() && cueRefLang != "auto" && cueRefLang != targetLangNorm)
+                    )
+                val canCompareAgainstTranslated = !cueRequiresTranslation || cueRefMatchesTarget
+                val refIsUnrelatedLanguage = !canCompareAgainstTranslated && !cueRefMatchesSource
 
-                when {
-                    overlapScore >= EQUIVALENT_TEXT_THRESHOLD -> {
-                        matchedReferenceCount++
-                        evt.copy(stableCueKey = stableKey)
+                if (refIsUnrelatedLanguage) {
+                    // Unrelated-language reference MUST NEVER increment repairedDialogueCount or verify this cue!
+                    unverifiedCueCount++
+                    allTranslationsVerified = false
+                    notes.add("Ignored unrelated-language reference ($cueRefLang) for ${evt.id}")
+                    cueReviews.add(
+                        CueReviewRecord(
+                            eventId = evt.id,
+                            stableCueKey = stableKey,
+                            status = DialogueReviewStatus.FALLBACK_UNVERIFIED,
+                            isSourceVerified = false,
+                            isTranslationVerified = false,
+                            needsTranslation = cueNeedsTranslation,
+                            note = "Reference language ($cueRefLang) unrelated to source/target",
+                        )
+                    )
+                    evt.copy(stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
+                } else {
+                    val compareTargetText = if (canCompareAgainstTranslated) {
+                        evt.translatedText.ifBlank { evt.sourceText }
+                    } else {
+                        // Translation active and reference is in source language:
+                        // compare ONLY against sourceText and NEVER overwrite translatedText!
+                        evt.sourceText
                     }
-                    // When reference is authored or user-imported and draft diverges materially
-                    referenceTrack != null &&
-                        (referenceTrack.originKind == CaptionOriginKind.AUTHORED ||
-                            referenceTrack.originKind == CaptionOriginKind.USER_IMPORTED) &&
-                        overlapScore < MATERIAL_MISMATCH_THRESHOLD -> {
-                        repairedDialogueCount++
-                        if (canCompareAgainstTranslated) {
-                            notes.add("Repaired mismatched draft text for ${evt.id} using ${referenceTrack.originKind.label} reference")
-                            evt.copy(
-                                sourceText = combinedRefText,
-                                translatedText = combinedRefText,
-                                stableCueKey = stableKey,
+                    val semantic = evaluateSemanticEquivalence(compareTargetText, combinedRefText)
+
+                    when {
+                        semantic.isEquivalent -> {
+                            val translationChecked = canCompareAgainstTranslated
+                            val sourceVerified = refOriginIsHighTrust || draft.hasIndependentAudioOrFrameEvidence
+                            val cueVerified = sourceVerified && (!cueRequiresTranslation || translationChecked)
+                            if (cueVerified) {
+                                verifiedCueCount++
+                            } else {
+                                unverifiedCueCount++
+                                if (cueRequiresTranslation && !translationChecked) {
+                                    allTranslationsVerified = false
+                                }
+                            }
+                            cueReviews.add(
+                                CueReviewRecord(
+                                    eventId = evt.id,
+                                    stableCueKey = stableKey,
+                                    status = if (cueVerified) DialogueReviewStatus.VERIFIED_MATCH else DialogueReviewStatus.FALLBACK_UNVERIFIED,
+                                    isSourceVerified = sourceVerified,
+                                    isTranslationVerified = translationChecked && sourceVerified,
+                                    needsTranslation = cueNeedsTranslation,
+                                    note = if (cueRequiresTranslation && !translationChecked) {
+                                        "Source matched reference; translation unverified"
+                                    } else {
+                                        "Matched reference (${(semantic.score * 100).toInt()}%)"
+                                    },
+                                )
                             )
-                        } else if (refMatchesSource) {
-                            notes.add("Repaired sourceText for ${evt.id} while preserving ${draft.targetLanguage} translation")
-                            evt.copy(
-                                sourceText = combinedRefText,
-                                stableCueKey = stableKey,
+                            evt.copy(stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
+                        }
+                        // Authored/user-imported reference materially disagrees (including negation/number/entity flip)
+                        refOriginIsHighTrust && (semantic.hasCriticalDivergence || semantic.score < EQUIVALENT_TEXT_THRESHOLD) -> {
+                            if (canCompareAgainstTranslated) {
+                                repairedDialogueCount++
+                                verifiedCueCount++
+                                notes.add("Repaired cue ${evt.id} using ${referenceTrack?.originKind?.label} reference (${semantic.reason})")
+                                cueReviews.add(
+                                    CueReviewRecord(
+                                        eventId = evt.id,
+                                        stableCueKey = stableKey,
+                                        status = DialogueReviewStatus.REPAIRED_FROM_REFERENCE,
+                                        isSourceVerified = true,
+                                        isTranslationVerified = true,
+                                        needsTranslation = false,
+                                        note = "Repaired from ${referenceTrack?.originKind?.label} (${semantic.reason})",
+                                    )
+                                )
+                                evt.copy(
+                                    sourceText = combinedRefText,
+                                    translatedText = combinedRefText,
+                                    stableCueKey = stableKey,
+                                    needsTranslation = false,
+                                )
+                            } else {
+                                // Reference matches source language ONLY: repair sourceText, preserve existing target
+                                // translation, and DO NOT claim translation is verified!
+                                repairedDialogueCount++
+                                unverifiedCueCount++
+                                allTranslationsVerified = false
+                                val stillMissingTrans = evt.translatedText.isBlank()
+                                notes.add("Repaired sourceText for ${evt.id} (${semantic.reason}); ${draft.targetLanguage} translation remains unverified")
+                                cueReviews.add(
+                                    CueReviewRecord(
+                                        eventId = evt.id,
+                                        stableCueKey = stableKey,
+                                        status = DialogueReviewStatus.REPAIRED_FROM_REFERENCE,
+                                        isSourceVerified = true,
+                                        isTranslationVerified = false,
+                                        needsTranslation = stillMissingTrans,
+                                        note = "Source repaired; translation unverified",
+                                    )
+                                )
+                                evt.copy(
+                                    sourceText = combinedRefText,
+                                    stableCueKey = stableKey,
+                                    needsTranslation = stillMissingTrans,
+                                )
+                            }
+                        }
+                        else -> {
+                            unverifiedCueCount++
+                            allTranslationsVerified = false
+                            if ((semantic.hasCriticalDivergence || semantic.score < MATERIAL_MISMATCH_THRESHOLD) &&
+                                draft.hasIndependentAudioOrFrameEvidence
+                            ) {
+                                escalatedForAmbiguity = true
+                            }
+                            cueReviews.add(
+                                CueReviewRecord(
+                                    eventId = evt.id,
+                                    stableCueKey = stableKey,
+                                    status = DialogueReviewStatus.FALLBACK_UNVERIFIED,
+                                    isSourceVerified = false,
+                                    isTranslationVerified = false,
+                                    needsTranslation = cueNeedsTranslation,
+                                    note = "Unverified divergence (${semantic.reason})",
+                                )
                             )
-                        } else {
-                            // Different language reference — preserve requested display translation
-                            evt.copy(stableCueKey = stableKey)
+                            evt.copy(stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
                         }
-                    }
-                    else -> {
-                        if (overlapScore < MATERIAL_MISMATCH_THRESHOLD && draft.hasIndependentAudioOrFrameEvidence) {
-                            escalatedForAmbiguity = true
-                        }
-                        evt.copy(stableCueKey = stableKey)
                     }
                 }
             }
         }
 
+        // Strict interval verification invariant:
+        // ONE matching or repaired cue can NEVER verify an entire interval when other cues remain unverified!
+        val totalCues = textReviewed.size
+        val allCuesIndependentlyVerified = totalCues > 0 &&
+            unverifiedCueCount == 0 &&
+            verifiedCueCount == totalCues &&
+            allTranslationsVerified
+
         val dialogueStatus: DialogueReviewStatus
         val dialogueConf: Float
         val independentlyVerified: Boolean
         when {
-            repairedDialogueCount > 0 -> {
+            allCuesIndependentlyVerified && repairedDialogueCount > 0 -> {
                 dialogueStatus = DialogueReviewStatus.REPAIRED_FROM_REFERENCE
                 dialogueConf = 0.90f
-                independentlyVerified = referenceTrack?.originKind != CaptionOriginKind.AUTOMATIC_ASR
-            }
-            matchedReferenceCount > 0 -> {
-                dialogueStatus = DialogueReviewStatus.VERIFIED_MATCH
-                dialogueConf = if (referenceTrack?.originKind == CaptionOriginKind.AUTOMATIC_ASR) 0.78f else 0.94f
-                independentlyVerified = referenceTrack?.originKind != CaptionOriginKind.AUTOMATIC_ASR ||
-                    draft.hasIndependentAudioOrFrameEvidence
-            }
-            draft.hasIndependentAudioOrFrameEvidence -> {
-                dialogueStatus = DialogueReviewStatus.VERIFIED_MATCH
-                dialogueConf = 0.85f
                 independentlyVerified = true
             }
+            allCuesIndependentlyVerified -> {
+                dialogueStatus = DialogueReviewStatus.VERIFIED_MATCH
+                dialogueConf = if (refOriginIsHighTrust) 0.94f else 0.85f
+                independentlyVerified = true
+            }
+            repairedDialogueCount > 0 -> {
+                dialogueStatus = DialogueReviewStatus.REPAIRED_FROM_REFERENCE
+                dialogueConf = 0.76f
+                independentlyVerified = false
+                notes.add("Partially repaired ($repairedDialogueCount repaired, $unverifiedCueCount cue(s) remain unverified)")
+            }
+            verifiedCueCount > 0 -> {
+                dialogueStatus = DialogueReviewStatus.FALLBACK_UNVERIFIED
+                dialogueConf = 0.72f
+                independentlyVerified = false
+                notes.add("Partial verification ($verifiedCueCount/$totalCues cues verified; interval kept unverified)")
+            }
             else -> {
-                // No independent reference or audio evidence -> NEVER falsely claim independently verified!
                 dialogueStatus = DialogueReviewStatus.FALLBACK_UNVERIFIED
                 dialogueConf = 0.65f
                 independentlyVerified = false
-                notes.add("No independent caption/audio corroboration; released as unverified fallback")
+                notes.add("No complete independent verification; released as unverified fallback")
             }
         }
 
@@ -382,7 +633,6 @@ class Scout2IndependentReviewer {
 
             if (!isOffScreenOrNonSpoken && hasUncertainSpeaker) {
                 neutralizedAttributionCount++
-                // Release dependable dialogue with neutral presentation rather than guessing from a visible listener face
                 evt.copy(
                     speakerId = if (evt.speakerConfidence < 0.35f) null else evt.speakerId,
                     speakerConfidence = evt.speakerConfidence.coerceAtMost(0.45f),
@@ -393,7 +643,6 @@ class Scout2IndependentReviewer {
                     attributionSummary = "Unidentified speaker",
                 )
             } else if (isOffScreenOrNonSpoken) {
-                // Off-screen speaker must never be attached to a visible listener face
                 evt.copy(
                     faceTrackId = null,
                     faceConfidence = 0f,
@@ -423,9 +672,10 @@ class Scout2IndependentReviewer {
             events = attributionReviewed,
             layoutEngine = layoutEngine,
             projectTemplate = projectTemplate,
-            liveFaces = liveFaces,
+            liveFaces = intervalLiveFaces,
             styleSettings = styleSettings,
             displayMode = displayMode,
+            measuredNormalizedSizes = measuredNormalizedSizes,
             notes = notes,
         )
 
@@ -440,6 +690,12 @@ class Scout2IndependentReviewer {
             needsModelEscalation = escalatedForAmbiguity,
             notes = notes,
             repairedEvents = placementReviewed,
+            perCueReviews = cueReviews,
+            draftRevision = draft.draftRevision,
+            sourceRevision = draft.sourceRevision,
+            referenceTrackId = draft.referenceTrackId,
+            isTranslationVerified = allTranslationsVerified && independentlyVerified,
+            isApproximatePreviewOnly = isApproximatePreview,
         )
     }
 
@@ -494,11 +750,13 @@ class Scout2IndependentReviewer {
         liveFaces: List<LiveFaceObservation>,
         styleSettings: BalloonStyleSettings,
         displayMode: CaptionDisplayMode,
+        measuredNormalizedSizes: Map<String, Pair<Float, Float>> = emptyMap(),
         notes: MutableList<String>,
     ): Triple<List<DialogueEvent>, PlacementReviewStatus, Boolean> {
         if (events.isEmpty()) return Triple(events, PlacementReviewStatus.STABLE, true)
         val previewProject = projectTemplate.copy(dialogueEvents = events)
         var fixedCount = 0
+        var allStable = true
         val checked = events.map { evt ->
             if (evt.lockedByUser) return@map evt
             val stability = layoutEngine.evaluateCuePlacementStability(
@@ -507,14 +765,34 @@ class Scout2IndependentReviewer {
                 styleSettings = styleSettings,
                 liveFaces = liveFaces,
                 fixedZoneTaillessMode = displayMode == CaptionDisplayMode.FIXED_ZONES,
+                measuredNormalizedSizes = measuredNormalizedSizes,
             )
             if (!stability.isWithinBounds || stability.hasSevereFaceCollision || stability.maxDriftNorm > MAX_ALLOWED_PREVIEW_DRIFT) {
                 fixedCount++
-                notes.add("Stabilized placement for ${evt.id} to conservative fixed position (${stability.reason})")
-                evt.copy(
+                notes.add("Stabilized placement for ${evt.id} to conservative neutral fallback (${stability.reason})")
+                // Clear BOTH anchorPosition AND faceTrackId so BalloonLayoutEngine respects NEUTRAL_FALLBACK
+                val fallbackEvt = evt.copy(
                     placementMode = PlacementMode.NEUTRAL_FALLBACK,
                     anchorPosition = null,
+                    faceTrackId = null,
+                    faceConfidence = 0f,
                 )
+                // Re-evaluate the repaired fallback before claiming placementStable!
+                val recheck = layoutEngine.evaluateCuePlacementStability(
+                    project = previewProject.copy(
+                        dialogueEvents = previewProject.dialogueEvents.map { if (it.id == evt.id) fallbackEvt else it }
+                    ),
+                    event = fallbackEvt,
+                    styleSettings = styleSettings,
+                    liveFaces = liveFaces,
+                    fixedZoneTaillessMode = displayMode == CaptionDisplayMode.FIXED_ZONES,
+                    measuredNormalizedSizes = measuredNormalizedSizes,
+                )
+                if (!recheck.isWithinBounds || recheck.hasSevereFaceCollision || recheck.maxDriftNorm > MAX_ALLOWED_PREVIEW_DRIFT) {
+                    allStable = false
+                    notes.add("Fallback placement for ${evt.id} still constrained (${recheck.reason})")
+                }
+                fallbackEvt
             } else {
                 evt
             }
@@ -524,16 +802,142 @@ class Scout2IndependentReviewer {
             fixedCount == checked.size -> PlacementReviewStatus.FIXED_CONSERVATIVE
             else -> PlacementReviewStatus.REPAIRED
         }
-        return Triple(checked, status, true)
+        return Triple(checked, status, allStable)
     }
+
+    data class SemanticEquivalenceResult(
+        val isEquivalent: Boolean,
+        val score: Float,
+        val hasCriticalDivergence: Boolean,
+        val reason: String,
+    )
 
     companion object {
         private const val TIME_ALIGN_SLACK_MS = 1_500L
         private const val ROLLING_CAPTION_GAP_MS = 2_400L
-        private const val EQUIVALENT_TEXT_THRESHOLD = 0.58f
-        private const val MATERIAL_MISMATCH_THRESHOLD = 0.34f
+        private const val EQUIVALENT_TEXT_THRESHOLD = 0.64f
+        private const val MATERIAL_MISMATCH_THRESHOLD = 0.40f
         private const val ATTRIBUTION_CONFIRM_THRESHOLD = 0.55f
         private const val MAX_ALLOWED_PREVIEW_DRIFT = 0.16f
+
+        private val NEGATION_WORDS = setOf(
+            "not", "no", "never", "none", "neither", "nor", "without", "nobody", "nothing", "nowhere",
+            "cannot", "cant", "wont", "dont", "doesnt", "didnt", "isnt", "arent", "wasnt", "werent",
+            "havent", "hasnt", "hadnt", "wouldnt", "couldnt", "shouldnt", "mustnt",
+            "nunca", "ninguno", "jamais", "nicht", "kein", "keine", "ない", "ません", "じゃない", "ではない",
+        )
+
+        private val NUMBER_WORD_MAP = mapOf(
+            "zero" to "0", "one" to "1", "two" to "2", "three" to "3", "four" to "4",
+            "five" to "5", "six" to "6", "seven" to "7", "eight" to "8", "nine" to "9",
+            "ten" to "10", "eleven" to "11", "twelve" to "12", "twenty" to "20",
+            "thirty" to "30", "forty" to "40", "fifty" to "50", "hundred" to "100",
+            "thousand" to "1000", "million" to "1000000", "billion" to "1000000000",
+        )
+
+        fun evaluateSemanticEquivalence(draftText: String, refText: String): SemanticEquivalenceResult {
+            val draftNeg = countNegations(draftText)
+            val refNeg = countNegations(refText)
+            if (draftNeg != refNeg) {
+                return SemanticEquivalenceResult(
+                    isEquivalent = false,
+                    score = 0f,
+                    hasCriticalDivergence = true,
+                    reason = "negation polarity mismatch",
+                )
+            }
+            val draftNums = extractQuantities(draftText)
+            val refNums = extractQuantities(refText)
+            if (draftNums != refNums && (draftNums.isNotEmpty() || refNums.isNotEmpty())) {
+                return SemanticEquivalenceResult(
+                    isEquivalent = false,
+                    score = 0.2f,
+                    hasCriticalDivergence = true,
+                    reason = "numeric/quantity mismatch",
+                )
+            }
+            val draftEntities = extractInternalProperEntities(draftText)
+            val refEntities = extractInternalProperEntities(refText)
+            if (draftEntities.isNotEmpty() && refEntities.isNotEmpty() && draftEntities.intersect(refEntities).isEmpty()) {
+                return SemanticEquivalenceResult(
+                    isEquivalent = false,
+                    score = 0.25f,
+                    hasCriticalDivergence = true,
+                    reason = "entity/name mismatch",
+                )
+            }
+            val draftTokens = tokenizeNormalized(draftText)
+            val refTokens = tokenizeNormalized(refText)
+            val f1 = tokenOverlapScore(draftTokens, refTokens)
+            val equivalent = f1 >= EQUIVALENT_TEXT_THRESHOLD
+            return SemanticEquivalenceResult(
+                isEquivalent = equivalent,
+                score = f1,
+                hasCriticalDivergence = f1 < MATERIAL_MISMATCH_THRESHOLD,
+                reason = if (equivalent) "token F1 ${(f1 * 100).toInt()}%" else "low similarity ${(f1 * 100).toInt()}%",
+            )
+        }
+
+        private fun countNegations(text: String): Int {
+            val lowered = text.lowercase()
+                .replace("’", "'")
+                .replace("n't", " nt")
+                .replace(Regex("[\\p{Punct}“”‘’—–…♪♫]"), " ")
+            val words = lowered.split(Regex("\\s+")).filter { it.isNotBlank() }
+            var count = 0
+            for (w in words) {
+                if (w == "nt" || w in NEGATION_WORDS) count++
+            }
+            return count
+        }
+
+        private fun extractQuantities(text: String): Set<String> {
+            val out = mutableSetOf<String>()
+            Regex("\\d+(?:[.,]\\d+)?").findAll(text).forEach { out.add(it.value.replace(",", "")) }
+            normalizeTextForCompare(text).split(' ').forEach { token ->
+                NUMBER_WORD_MAP[token]?.let { out.add(it) }
+            }
+            return out
+        }
+
+        private fun extractInternalProperEntities(text: String): Set<String> {
+            val rawTokens = text.trim().split(Regex("\\s+"))
+            if (rawTokens.size <= 1) return emptySet()
+            return rawTokens.drop(1)
+                .map { it.trim { ch -> !ch.isLetter() } }
+                .filter { tok -> tok.length >= 3 && tok[0].isUpperCase() && tok.drop(1).any { it.isLowerCase() } }
+                .map { it.lowercase() }
+                .toSet()
+        }
+
+        fun detectDominantScriptLanguage(text: String): String {
+            if (text.isBlank()) return ""
+            var jaKana = 0
+            var koHangul = 0
+            var cjkHan = 0
+            var cyrillic = 0
+            var arabic = 0
+            var devanagari = 0
+            for (ch in text) {
+                when (ch.code) {
+                    in 0x3040..0x30FF -> jaKana++
+                    in 0xAC00..0xD7AF, in 0x1100..0x11FF -> koHangul++
+                    in 0x4E00..0x9FFF -> cjkHan++
+                    in 0x0400..0x04FF -> cyrillic++
+                    in 0x0600..0x06FF -> arabic++
+                    in 0x0900..0x097F -> devanagari++
+                }
+            }
+            return when {
+                jaKana >= 2 -> "ja"
+                koHangul >= 2 -> "ko"
+                cjkHan >= 2 -> "zh"
+                cyrillic >= 3 -> "ru"
+                arabic >= 3 -> "ar"
+                devanagari >= 3 -> "hi"
+                else -> ""
+            }
+        }
 
         fun normalizeLanguageTag(raw: String): String {
             val clean = raw.trim().lowercase()
@@ -566,12 +970,15 @@ class Scout2IndependentReviewer {
             .filter { it.length >= 2 }
             .toSet()
 
+        /**
+         * Balanced F1 token similarity (replaces asymmetric intersection/minSize which let
+         * strict subsets like "I did send it" vs "I did not send it" score 1.0).
+         */
         fun tokenOverlapScore(a: Set<String>, b: Set<String>): Float {
             if (a.isEmpty() && b.isEmpty()) return 1f
             if (a.isEmpty() || b.isEmpty()) return 0f
             val shared = a.intersect(b).size.toFloat()
-            val denom = minOf(a.size, b.size).coerceAtLeast(1).toFloat()
-            return (shared / denom).coerceIn(0f, 1f)
+            return ((2f * shared) / (a.size + b.size).toFloat()).coerceIn(0f, 1f)
         }
     }
 }
@@ -599,6 +1006,7 @@ class ReleasedTimelineStore {
 
     private val workingDrafts = linkedMapOf<String, DraftInterval>()
     private val releasedByIntervalId = linkedMapOf<String, ReleasedInterval>()
+    private val highestReleasedDraftRevByInterval = mutableMapOf<String, Long>()
     private val releasedEventsById = linkedMapOf<String, DialogueEvent>()
     private val releasedSpeakersById = linkedMapOf<String, Speaker>()
     private var referenceTrack: ReferenceCaptionTrack? = null
@@ -626,6 +1034,7 @@ class ReleasedTimelineStore {
         layoutCacheRevision = 0L
         workingDrafts.clear()
         releasedByIntervalId.clear()
+        highestReleasedDraftRevByInterval.clear()
         releasedEventsById.clear()
         releasedSpeakersById.clear()
         referenceTrack = null
@@ -701,19 +1110,34 @@ class ReleasedTimelineStore {
 
     /**
      * Stages a Scout 1 draft without exposing it to playback yet.
+     * Rejects stale revisions relative to BOTH pending drafts and already-released revisions.
      */
     fun stageDraft(draft: DraftInterval): Boolean = synchronized(lock) {
         if (!isValidContextLocked(draft.mediaId, draft.sessionToken, draft.seekGeneration, draft.configFingerprint)) {
             staleCallbacksRejected++
             return@synchronized false
         }
-        val existing = workingDrafts[draft.intervalId]
-        if (existing != null && draft.draftRevision < existing.draftRevision) {
+        val existingPending = workingDrafts[draft.intervalId]
+        if (existingPending != null && draft.draftRevision <= existingPending.draftRevision) {
+            staleCallbacksRejected++
+            return@synchronized false
+        }
+        val highestReleased = highestReleasedDraftRevByInterval[draft.intervalId] ?: 0L
+        if (draft.draftRevision <= highestReleased) {
+            staleCallbacksRejected++
+            return@synchronized false
+        }
+        val currentRef = referenceTrack
+        if (currentRef != null && draft.referenceTrackId == currentRef.trackId && draft.sourceRevision < currentRef.sourceRevision) {
             staleCallbacksRejected++
             return@synchronized false
         }
         workingDrafts[draft.intervalId] = draft
         true
+    }
+
+    fun pendingDraft(intervalId: String): DraftInterval? = synchronized(lock) {
+        workingDrafts[intervalId]
     }
 
     fun pendingDraftsSnapshot(): List<DraftInterval> = synchronized(lock) {
@@ -723,6 +1147,8 @@ class ReleasedTimelineStore {
     /**
      * Atomically publishes a Scout 2 reviewed interval (text + timing + attribution + placement)
      * into the released playback timeline as one consistent revision.
+     * Strictly requires an exact staged pending draft and rejects stale draft or evidence revisions
+     * even after a newer revision has already been released.
      */
     fun commitReviewedRelease(
         draft: DraftInterval,
@@ -733,8 +1159,30 @@ class ReleasedTimelineStore {
             staleCallbacksRejected++
             return@synchronized null
         }
+        // Reject if a newer revision for this interval was already released
+        val highestReleased = highestReleasedDraftRevByInterval[draft.intervalId] ?: 0L
+        if (draft.draftRevision <= highestReleased) {
+            staleCallbacksRejected++
+            return@synchronized null
+        }
+        // Require the exact matching staged pending draft
         val currentDraft = workingDrafts[draft.intervalId]
-        if (currentDraft != null && draft.draftRevision < currentDraft.draftRevision) {
+        if (currentDraft == null ||
+            currentDraft.draftRevision != draft.draftRevision ||
+            currentDraft.sourceRevision != draft.sourceRevision ||
+            currentDraft.referenceTrackId != draft.referenceTrackId
+        ) {
+            staleCallbacksRejected++
+            return@synchronized null
+        }
+        // Verify outcome matches the exact draft revision reviewed
+        if (outcome.draftRevision > 0L && outcome.draftRevision != draft.draftRevision) {
+            staleCallbacksRejected++
+            return@synchronized null
+        }
+        // Verify evidence revision matches the active reference track revision
+        val currentRef = referenceTrack
+        if (currentRef != null && draft.referenceTrackId == currentRef.trackId && draft.sourceRevision != currentRef.sourceRevision) {
             staleCallbacksRejected++
             return@synchronized null
         }
@@ -747,6 +1195,7 @@ class ReleasedTimelineStore {
         }
 
         releaseRevision++
+        highestReleasedDraftRevByInterval[draft.intervalId] = draft.draftRevision
         val isFallback = !outcome.isIndependentlyVerified
         if (outcome.dialogueStatus == DialogueReviewStatus.REPAIRED_FROM_REFERENCE ||
             outcome.attributionStatus == AttributionReviewStatus.REPAIRED ||
@@ -843,6 +1292,8 @@ class ReleasedTimelineStore {
                     evt.copy(
                         speakerId = null,
                         speakerConfidence = evt.speakerConfidence.coerceAtMost(0.45f),
+                        faceTrackId = null,
+                        faceConfidence = 0f,
                         anchorPosition = null,
                         placementMode = PlacementMode.NEUTRAL_FALLBACK,
                         attributionSummary = "Unidentified speaker",
@@ -851,6 +1302,8 @@ class ReleasedTimelineStore {
                 } else if (!evt.lockedByUser) {
                     evt.copy(
                         placementMode = PlacementMode.NEUTRAL_FALLBACK,
+                        faceTrackId = null,
+                        faceConfidence = 0f,
                         anchorPosition = null,
                         stableCueKey = stableKey,
                     )
@@ -868,8 +1321,15 @@ class ReleasedTimelineStore {
                 isIndependentlyVerified = false,
                 notes = listOf("Released at review deadline as unverified fallback with conservative placement"),
                 repairedEvents = safeFallbackEvents,
+                draftRevision = draft.draftRevision,
+                sourceRevision = draft.sourceRevision,
+                referenceTrackId = draft.referenceTrackId,
             )
             releaseRevision++
+            highestReleasedDraftRevByInterval[draft.intervalId] = maxOf(
+                highestReleasedDraftRevByInterval[draft.intervalId] ?: 0L,
+                draft.draftRevision,
+            )
             fallbackReleaseCount++
             val rel = ReleasedInterval(
                 intervalId = draft.intervalId,

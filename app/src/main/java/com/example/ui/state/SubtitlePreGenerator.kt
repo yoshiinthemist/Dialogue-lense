@@ -997,23 +997,29 @@ class SubtitlePreGenerator(
             return
         }
 
+        val chunkStepMs = 45_000L
+        val plannedRanges = buildList {
+            var cursor = 0L
+            while (cursor < durationMs) {
+                val end = (cursor + chunkStepMs).coerceAtMost(durationMs)
+                add(cursor to end)
+                if (end >= durationMs) break
+                cursor = end
+            }
+        }.ifEmpty { listOf(0L to durationMs) }
+
         onProgress(
             SubtitlePrepState.Working(
                 title = cleanTitle,
                 sourceLabel = "Audio Extraction",
-                progress = 0.16f,
+                progress = 0.14f,
                 completedWindows = 0,
-                totalWindows = 1,
+                totalWindows = plannedRanges.size,
                 cueCount = 0,
                 speakerCount = 2,
-                statusText = "Decoding audio track chunks for transcription...",
+                statusText = "Preparing ${plannedRanges.size} progressive audio chunk(s) across full duration...",
             )
         )
-        val chunks = audioAnalyzer.extractChunkedWavForAsr(videoUri)
-        if (chunks.isEmpty()) {
-            onProgress(SubtitlePrepState.Error("No audible speech track found in this video file."))
-            return
-        }
 
         var activeTier = LookaheadWindowPlanner.initialExecutionTier(
             quotaSaverMode = quotaSaverMode,
@@ -1023,8 +1029,36 @@ class SubtitlePreGenerator(
         val collectedEvents = mutableListOf<DialogueEvent>()
         var currentSpeakers = defaultSpeakers()
         val shotList = listOf(Shot("shot_1", 0L, durationMs))
+        var failedChunkCount = 0
+        var decodedAnyChunk = false
 
-        for ((idx, chunk) in chunks.withIndex()) {
+        // Lazy fallback cache only if single-window seek extraction fails on an unindexed container
+        var sequentialFallbackChunks: List<com.example.domain.analysis.AudioWavChunk>? = null
+
+        for ((idx, range) in plannedRanges.withIndex()) {
+            val (rangeStartMs, rangeEndMs) = range
+            val chunk = audioAnalyzer.extractWavWindowForAsr(
+                uri = videoUri,
+                windowStartMs = rangeStartMs,
+                windowEndMs = rangeEndMs,
+            ) ?: run {
+                if (sequentialFallbackChunks == null) {
+                    sequentialFallbackChunks = audioAnalyzer.extractChunkedWavForAsr(
+                        uri = videoUri,
+                        chunkWindowMs = chunkStepMs,
+                        maxTotalMs = durationMs,
+                    )
+                }
+                sequentialFallbackChunks?.firstOrNull { c ->
+                    c.startMs < rangeEndMs && c.endMs > rangeStartMs
+                }
+            }
+            if (chunk == null) {
+                failedChunkCount++
+                continue
+            }
+            decodedAnyChunk = true
+
             val partialProjSnapshot = if (collectedEvents.isNotEmpty()) {
                 DialogueLensProject(
                     id = "local_prep_${System.currentTimeMillis()}",
@@ -1059,16 +1093,17 @@ class SubtitlePreGenerator(
                 SubtitlePrepState.Working(
                     title = cleanTitle,
                     sourceLabel = modelTag,
-                    progress = (0.20f + 0.72f * (idx.toFloat() / chunks.size.coerceAtLeast(1))).coerceIn(0.20f, 0.94f),
+                    progress = (0.18f + 0.76f * (idx.toFloat() / plannedRanges.size.coerceAtLeast(1))).coerceIn(0.18f, 0.94f),
                     completedWindows = idx,
-                    totalWindows = chunks.size,
+                    totalWindows = plannedRanges.size,
                     cueCount = collectedEvents.size,
                     speakerCount = currentSpeakers.size,
-                    statusText = "$modelTag transcribing audio chunk ${idx + 1}/${chunks.size}...",
+                    statusText = "$modelTag transcribing chunk ${idx + 1}/${plannedRanges.size} (${SubtitleParser.formatCompactTime(rangeStartMs)}–${SubtitleParser.formatCompactTime(rangeEndMs)})...",
                     partialProject = partialProjSnapshot,
                 )
             )
 
+            val chunkDurationMs = (chunk.endMs - chunk.startMs).coerceAtLeast(1_000L)
             var chunkRes = scoutHeartbeatService.executeWithBackoffRetry(
                 modelName = activeTier.modelId ?: "gemini-3.5-flash-lite",
                 maxRetries = 3,
@@ -1081,6 +1116,7 @@ class SubtitlePreGenerator(
                     targetLanguage = targetLanguage,
                     glossary = glossary,
                     preferLiteModel = activeTier.preferLite,
+                    chunkDurationMs = chunkDurationMs,
                 )
             }
 
@@ -1101,42 +1137,49 @@ class SubtitlePreGenerator(
                         targetLanguage = targetLanguage,
                         glossary = glossary,
                         preferLiteModel = true,
+                        chunkDurationMs = chunkDurationMs,
                     )
                 }
             }
 
             if (chunkRes.isFailure) {
                 val err = chunkRes.exceptionOrNull()
-                if (TranslationAiService.isQuotaOrCreditExhaustedError(err)) onQuotaTripped()
-                if (partialProjSnapshot != null) {
-                    onProgress(
-                        SubtitlePrepState.Ready(
-                            generatedProject = partialProjSnapshot,
-                            sourceLabel = "${activeTier.displayLabel} (Partial)",
-                            cueCount = partialProjSnapshot.dialogueEvents.size,
-                            speakerCount = partialProjSnapshot.speakers.size,
-                            isPartial = true,
-                            note = "Saved ${partialProjSnapshot.dialogueEvents.size} partial lines before interruption.",
+                if (TranslationAiService.isQuotaOrCreditExhaustedError(err)) {
+                    onQuotaTripped()
+                    if (partialProjSnapshot != null) {
+                        onProgress(
+                            SubtitlePrepState.Ready(
+                                generatedProject = partialProjSnapshot,
+                                sourceLabel = "${activeTier.displayLabel} (Partial)",
+                                cueCount = partialProjSnapshot.dialogueEvents.size,
+                                speakerCount = partialProjSnapshot.speakers.size,
+                                isPartial = true,
+                                note = "Saved ${partialProjSnapshot.dialogueEvents.size} partial lines before quota limit.",
+                            )
                         )
-                    )
-                } else {
-                    onProgress(
-                        SubtitlePrepState.Error(
-                            err?.localizedMessage?.take(120) ?: "Audio subtitle generation failed."
+                    } else {
+                        onProgress(
+                            SubtitlePrepState.Error(
+                                err?.localizedMessage?.take(120) ?: "Audio subtitle generation failed."
+                            )
                         )
-                    )
+                    }
+                    return
                 }
-                return
+                failedChunkCount++
+                continue
             }
 
             val audioResult = chunkRes.getOrThrow()
             audioResult.cues.forEach { c ->
+                val clampedStart = c.startMs.coerceIn(0L, durationMs)
+                val clampedEnd = c.endMs.coerceIn(clampedStart + 350L, durationMs.coerceAtLeast(clampedStart + 350L))
                 val id = SubtitleParser.newEventId()
                 collectedEvents.add(
                     DialogueEvent(
                         id = id,
-                        startTimeMs = c.startMs,
-                        endTimeMs = c.endMs,
+                        startTimeMs = clampedStart,
+                        endTimeMs = clampedEnd,
                         sourceText = c.sourceText,
                         translatedText = c.naturalTranslation,
                         literalText = c.literalTranslation,
@@ -1164,6 +1207,22 @@ class SubtitlePreGenerator(
                     culturalNote = c.culturalNote,
                 )
             }
+            // Progressively update speakers after each chunk so partial snapshots stay coherent
+            if (collectedEvents.isNotEmpty()) {
+                val (spkUpd, _) = attributionEngine.assignSpeakers(
+                    events = collectedEvents,
+                    shots = shotList,
+                    faceTracks = emptyList(),
+                    existingSpeakers = currentSpeakers,
+                    turnHints = hintMap,
+                    rememberedCharacterColors = characterColorMemory,
+                )
+                currentSpeakers = spkUpd
+            }
+        }
+        if (!decodedAnyChunk && collectedEvents.isEmpty()) {
+            onProgress(SubtitlePrepState.Error("No audible speech track found in this video file."))
+            return
         }
 
         if (collectedEvents.isEmpty()) {
@@ -1212,10 +1271,15 @@ class SubtitlePreGenerator(
         onProgress(
             SubtitlePrepState.Ready(
                 generatedProject = readyProj,
-                sourceLabel = "${activeTier.displayLabel} Audio",
+                sourceLabel = if (failedChunkCount > 0) "${activeTier.displayLabel} Audio (Partial)" else "${activeTier.displayLabel} Audio",
                 cueCount = attributed.size,
                 speakerCount = currentSpeakers.size,
-                note = "Generated subtitles & voice speaker splits ready for download.",
+                isPartial = failedChunkCount > 0,
+                note = if (failedChunkCount > 0) {
+                    "Generated subtitles across ${plannedRanges.size - failedChunkCount}/${plannedRanges.size} chunks ($failedChunkCount chunk(s) could not be transcribed)."
+                } else {
+                    "Generated subtitles & voice speaker splits across full duration ready for download."
+                },
             )
         )
     }
