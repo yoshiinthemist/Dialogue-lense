@@ -179,7 +179,7 @@ fun VideoPlayerStage(
     selectedEventId: String?,
     onTogglePlayPause: () -> Unit,
     onYouTubePlaybackState: (Long, Long, Boolean) -> Unit,
-    onYouTubeCaptionTrackStatus: (Int, String) -> Unit = { _, _ -> },
+    onYouTubeCaptionTrackStatus: (Int, String, Boolean, Boolean, Boolean) -> Unit = { _, _, _, _, _ -> },
     onYouTubeEmbedFallback: (Int) -> Unit = {},
     onYouTubeTimedTextCaptured: (String, String, String?, String?) -> Unit = { _, _, _, _ -> },
     onWebStreamPlaybackState: (Long, Long, Boolean) -> Unit = { _, _, _ -> },
@@ -1232,7 +1232,7 @@ fun VideoPlayerStage(
                 }
             }
 
-            // 6. Calm DialogueLens 2.0 Intelligent Buffering Overlay (no fake timers or internal jargon)
+            // 6. Calm DialogueLens 2.0 Intelligent Buffering Overlay (single consistent presentation)
             val showUnifiedBufferingOverlay = isCinemaIntroActive ||
                 ((readinessSnapshot?.isBufferingHoldActive == true || readinessSnapshot?.waitTimedOut == true) && !isEditMode)
             CinemaIntroOverlay(
@@ -1250,7 +1250,7 @@ fun VideoPlayerStage(
                 onRetryBuffering = onRetryBuffering,
                 onOpenAttachCaptions = onOpenAttachCaptions,
                 onSkipIntro = {
-                    if (isScoutCatchUpBuffering && !isCinemaIntroActive) {
+                    if (readinessSnapshot?.isBufferingHoldActive == true && !isCinemaIntroActive) {
                         onDismissCatchUpBuffering()
                     } else {
                         onSkipIntro()
@@ -1258,61 +1258,6 @@ fun VideoPlayerStage(
                 },
                 modifier = Modifier.fillMaxSize(),
             )
-
-            // Sleek Catch-Up Buffering pill when live playback pauses mid-stream to sync upcoming dialogue
-            if (isScoutCatchUpBuffering && !showUnifiedBufferingOverlay && !isEditMode) {
-                Surface(
-                    color = CinemaObsidian.copy(alpha = 0.90f),
-                    shape = RoundedCornerShape(22.dp),
-                    border = BorderStroke(1.2.dp, LensSky.copy(alpha = 0.72f)),
-                    shadowElevation = 8.dp,
-                    modifier = Modifier
-                        .align(Alignment.Center)
-                        .padding(16.dp)
-                        .testTag("scout_catchup_buffer_card"),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = LensSky,
-                            strokeWidth = 2.5.dp,
-                        )
-                        Column(modifier = Modifier.widthIn(max = 195.dp)) {
-                            Text(
-                                text = "Preparing upcoming dialogue",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                                color = Color.White,
-                            )
-                            Text(
-                                text = "Playback resumes automatically once synced.",
-                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                                color = LensMint,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        Surface(
-                            color = LensSky,
-                            shape = RoundedCornerShape(14.dp),
-                            onClick = onDismissCatchUpBuffering,
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("catch_up_watch_anyway_button"),
-                        ) {
-                            Text(
-                                text = "Watch Now",
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                color = CinemaObsidian,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                            )
-                        }
-                    }
-                }
-            }
 
             // Sleek centered Play CTA when paused awaiting initial dialogue preparation
             if (hasPendingPlayIntro &&

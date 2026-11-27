@@ -143,21 +143,27 @@ class ScoutHeartbeatService(
         }
     }
 
+    class ScoutExecutionGatedException(message: String) : IllegalStateException(message)
+
     /**
      * Runs a Flash-Lite stream operation with automatic exponential backoff retries
-     * (`baseDelayMs * 2^(attempt-1)` capped at `maxDelayMs`), stopping immediately on quota exhaustion
-     * or coroutine cancellation.
+     * (`baseDelayMs * 2^(attempt-1)` capped at `maxDelayMs`), stopping immediately on quota exhaustion,
+     * policy halt (`shouldContinue == false`), or coroutine cancellation.
      */
     suspend fun <T> executeWithBackoffRetry(
         modelName: String = "gemini-3.5-flash-lite",
         maxRetries: Int = 3,
         onWarmToken: (suspend (attempt: Int) -> Unit)? = null,
         onRetryScheduled: (suspend (attempt: Int, maxRetries: Int, delayMs: Long, error: Throwable?) -> Unit)? = null,
+        shouldContinue: (() -> Boolean)? = null,
         block: suspend () -> Result<T>,
     ): Result<T> {
         var attempt = 0
         var lastResult: Result<T>
         while (true) {
+            if (shouldContinue?.invoke() == false) {
+                return Result.failure(ScoutExecutionGatedException("Halted by request policy before invocation"))
+            }
             val startedMs = clockMs()
             lastResult = try {
                 block()
@@ -177,9 +183,14 @@ class ScoutHeartbeatService(
 
             val err = lastResult.exceptionOrNull()
             if (err is CancellationException && err !is TimeoutCancellationException) throw err
+            if (err is ScoutExecutionGatedException) return lastResult
             if (TranslationAiService.isQuotaOrCreditExhaustedError(err)) {
                 recordFailure(err, retryAttempt = attempt, maxRetries = maxRetries, nextDelayMs = 0L)
                 return lastResult
+            }
+
+            if (shouldContinue?.invoke() == false) {
+                return Result.failure(ScoutExecutionGatedException("Halted by request policy before retry"))
             }
 
             if (attempt >= maxRetries) {
@@ -202,6 +213,9 @@ class ScoutHeartbeatService(
             )
             onRetryScheduled?.invoke(attempt, maxRetries, backoffMs, err)
             sleepFn(backoffMs)
+            if (shouldContinue?.invoke() == false) {
+                return Result.failure(ScoutExecutionGatedException("Halted by request policy after backoff delay"))
+            }
 
             if (TranslationAiService.isAppCheckTransientError(err)) {
                 onWarmToken?.invoke(attempt)

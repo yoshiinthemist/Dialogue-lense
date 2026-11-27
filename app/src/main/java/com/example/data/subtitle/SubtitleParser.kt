@@ -234,7 +234,7 @@ object SubtitleParser {
             val readingTargetMs = (text.length * 54L).coerceIn(1_050L, 6_500L)
             val maxGentleExtendEnd = maxOf(evt.endTimeMs + 1_800L, evt.startTimeMs + 1_050L)
             val desiredEnd = minOf(evt.startTimeMs + readingTargetMs, maxGentleExtendEnd)
-            val adjustedEnd = maxOf(evt.endTimeMs, minOf(desiredEnd, maxAllowedEnd))
+            val adjustedEnd = maxOf(evt.endTimeMs, evt.startTimeMs + 350L, minOf(desiredEnd, maxAllowedEnd))
             evt.copy(endTimeMs = adjustedEnd)
         }
 
@@ -253,34 +253,40 @@ object SubtitleParser {
                             val ratio = (firstDisp.length.toDouble() / (firstDisp.length + secondDisp.length).toDouble())
                                 .coerceIn(0.32, 0.68)
                             val midMs = evt.startTimeMs + (durMs * ratio).toLong()
-                            val srcSame = evt.sourceText.trim() == evt.translatedText.trim()
-                            val srcSplit = if (srcSame) {
-                                firstDisp to secondDisp
-                            } else {
-                                val srcIdx = findNaturalClauseSplitIndex(evt.sourceText.trim())
-                                if (srcIdx != null) {
-                                    evt.sourceText.trim().substring(0, srcIdx).trim() to
-                                        evt.sourceText.trim().substring(srcIdx).trim()
+                            val maxPart1End = evt.endTimeMs - 480L
+                            val part1End = (midMs - 30L).coerceIn(evt.startTimeMs + 450L, maxOf(evt.startTimeMs + 450L, maxPart1End))
+                            val part2Start = maxOf(midMs, part1End + 20L)
+                            if (part1End > evt.startTimeMs + 350L && evt.endTimeMs - part2Start >= 450L && part2Start > part1End) {
+                                val srcSame = evt.sourceText.trim() == evt.translatedText.trim()
+                                val srcSplit = if (srcSame) {
+                                    firstDisp to secondDisp
                                 } else {
-                                    evt.sourceText to ""
+                                    val srcIdx = findNaturalClauseSplitIndex(evt.sourceText.trim())
+                                    if (srcIdx != null) {
+                                        evt.sourceText.trim().substring(0, srcIdx).trim() to
+                                            evt.sourceText.trim().substring(srcIdx).trim()
+                                    } else {
+                                        evt.sourceText to ""
+                                    }
                                 }
+                                add(
+                                    evt.copy(
+                                        endTimeMs = part1End,
+                                        sourceText = srcSplit.first.ifBlank { firstDisp },
+                                        translatedText = firstDisp,
+                                    )
+                                )
+                                add(
+                                    evt.copy(
+                                        id = "${evt.id}_p2",
+                                        startTimeMs = part2Start,
+                                        endTimeMs = evt.endTimeMs,
+                                        sourceText = srcSplit.second.ifBlank { secondDisp },
+                                        translatedText = secondDisp,
+                                    )
+                                )
+                                continue
                             }
-                            add(
-                                evt.copy(
-                                    endTimeMs = (midMs - 30L).coerceAtLeast(evt.startTimeMs + 700L),
-                                    sourceText = srcSplit.first.ifBlank { firstDisp },
-                                    translatedText = firstDisp,
-                                )
-                            )
-                            add(
-                                evt.copy(
-                                    id = "${evt.id}_p2",
-                                    startTimeMs = midMs,
-                                    sourceText = srcSplit.second.ifBlank { secondDisp },
-                                    translatedText = secondDisp,
-                                )
-                            )
-                            continue
                         }
                     }
                 }

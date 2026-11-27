@@ -340,14 +340,11 @@ class AudioAnalyzer(private val context: Context) {
                     break
                 }
             }
-            val finalEndMs = if (lastDecodedPtsMs > currentChunkStartMs) {
-                lastDecodedPtsMs
-            } else if (maxTotalMs < Long.MAX_VALUE) {
-                maxTotalMs
-            } else {
-                currentChunkStartMs + chunkWindowMs
+            val decodedTailMs = currentChunkStartMs + ((pcmOut.size() / 2L) * 1000L) / outputRate
+            val finalEndMs = maxOf(lastDecodedPtsMs, decodedTailMs)
+            if (finalEndMs > currentChunkStartMs && pcmOut.size() > 3200) {
+                flushChunk(finalEndMs)
             }
-            flushChunk(finalEndMs)
         } catch (e: Exception) {
             Log.e(TAG, "WAV export for ASR failed", e)
         } finally {
@@ -531,6 +528,7 @@ class AudioAnalyzer(private val context: Context) {
             var inDone = false
             var outDone = false
 
+            var lastDecodedPtsMs = 0L
             while (!outDone) {
                 if (!inDone) {
                     val inIdx = codec.dequeueInputBuffer(5_000L)
@@ -563,6 +561,8 @@ class AudioAnalyzer(private val context: Context) {
                     val ptsMs = (info.presentationTimeUs / 1000L).coerceAtLeast(0L)
                     if (outBuf != null && info.size > 0 && ptsMs in padStartMs..padEndMs) {
                         if (actualStartMs == null) actualStartMs = timeOffsetBaseMs + ptsMs
+                        val absPts = timeOffsetBaseMs + ptsMs
+                        if (absPts > lastDecodedPtsMs) lastDecodedPtsMs = absPts
                         outBuf.position(info.offset)
                         outBuf.limit(info.offset + info.size)
                         val shorts = outBuf.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
@@ -592,15 +592,36 @@ class AudioAnalyzer(private val context: Context) {
             val pcm = pcmOut.toByteArray()
             if (pcm.size <= 3200) return null
             val resolvedStart = actualStartMs ?: windowStartMs
+            val actualEndMs = computeActualDecodedExtentMs(
+                requestedEndMs = windowEndMs,
+                resolvedStartMs = resolvedStart,
+                sampleCount = pcm.size / 2L,
+                sampleRateHz = outputRate,
+                lastDecodedPtsMs = lastDecodedPtsMs,
+            )
             AudioWavChunk(
                 startMs = resolvedStart,
-                endMs = windowEndMs.coerceAtLeast(resolvedStart + 500L),
+                endMs = actualEndMs,
                 wavBytes = wrapPcmAsWav(pcm, outputRate),
             )
         } finally {
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
         }
+    }
+
+    internal fun computeActualDecodedExtentMs(
+        requestedEndMs: Long,
+        resolvedStartMs: Long,
+        sampleCount: Long,
+        sampleRateHz: Int,
+        lastDecodedPtsMs: Long = 0L,
+    ): Long {
+        val safeRate = sampleRateHz.coerceAtLeast(1)
+        val decodedSpanMs = ((sampleCount.coerceAtLeast(0L) * 1000L) / safeRate.toLong()).coerceAtLeast(1L)
+        val sampleEndMs = resolvedStartMs + decodedSpanMs
+        val observedTailMs = maxOf(sampleEndMs, lastDecodedPtsMs)
+        return minOf(requestedEndMs, observedTailMs).coerceAtLeast(resolvedStartMs + minOf(500L, decodedSpanMs))
     }
 
     private fun resolveHlsMediaIndex(

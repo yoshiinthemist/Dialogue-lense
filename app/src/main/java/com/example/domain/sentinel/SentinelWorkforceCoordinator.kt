@@ -584,7 +584,10 @@ class SentinelWorkforceCoordinator {
         val maxRawEndMs = (roundedCapMs - safeOverlap).coerceAtLeast(0L)
         val clippedEnd = minOf(endMs, maxRawEndMs)
         val spanMs = clippedEnd - safeStart
-        val reachesActualEnd = durationMs > 0L && clippedEnd >= durationMs && spanMs > 0L
+        val reachesActualEnd = durationMs > 0L && spanMs > 0L && (
+            clippedEnd >= durationMs ||
+                (roundingUpToSec && safeOverlap == 0L && clippedEnd >= (durationMs / 1_000L) * 1_000L && capMs >= durationMs)
+            )
         if (spanMs <= 0L || (!reachesActualEnd && spanMs < minSliceMs)) {
             return@synchronized BoundarySubmissionDecision.DeferredOutsideBoundary(
                 reason = "Clipped span ${spanMs}ms below minimum slice ${minSliceMs}ms at boundary ${capMs}ms",
@@ -1158,13 +1161,16 @@ class SentinelWorkforceCoordinator {
         playheadMs: Long,
         draftRevision: Long = 0L,
         nowEpochMs: Long = System.currentTimeMillis(),
+        schedulingGeneration: Long = this.schedulingGeneration,
     ): Boolean = synchronized(lock) {
         // Supersede any older queued review task for the same intervalId so stale drafts are never claimed
         val existingForInterval = queue.firstOrNull {
             it.kind == SentinelTaskKind.SCOUT2_REQUIRED_REVIEW && it.beaconId == intervalId
         }
         if (existingForInterval != null) {
-            if (draftRevision > 0L && draftRevision <= existingForInterval.draftRevision) {
+            if (draftRevision > 0L && draftRevision <= existingForInterval.draftRevision &&
+                existingForInterval.schedulingGeneration == schedulingGeneration
+            ) {
                 return@synchronized false
             }
             queue.remove(existingForInterval)
@@ -1184,6 +1190,7 @@ class SentinelWorkforceCoordinator {
             chapterTitle = "Review ${startMs / 1000L}s–${endMs / 1000L}s",
             draftRevision = draftRevision,
             createdAtEpochMs = distanceAhead.coerceAtLeast(0L),
+            schedulingGeneration = schedulingGeneration,
         )
         enqueueLocked(item)
     }
@@ -1191,7 +1198,8 @@ class SentinelWorkforceCoordinator {
     /**
      * Claims the nearest unresolved [SentinelTaskKind.SCOUT2_REQUIRED_REVIEW] interval ahead of
      * [playheadMs] (or an exact [targetIntervalId] if requested). Deliberately bypasses
-     * [isPatrolSuspendedLocked] because Scout 2 review is a required stage in Prepare -> Review -> Release.
+     * [isPatrolSuspendedLocked] because Scout 2 review is a required stage in Prepare -> Review -> Release,
+     * while strictly enforcing scrubber-preview, boundary, and scheduling-generation validity.
      */
     fun claimRequiredReviewWork(
         workerId: String = WORKER_2_ID,
@@ -1199,16 +1207,25 @@ class SentinelWorkforceCoordinator {
         nowEpochMs: Long = System.currentTimeMillis(),
         targetIntervalId: String? = null,
     ): Pair<SentinelWorkItem, IntervalReservation>? = synchronized(lock) {
+        if (isScrubberPreviewActive) return@synchronized null
         val activeCount = workers.values.count { it.isActive }
         val isWorkerAlreadyActive = workers[workerId]?.isActive == true
         if (!isWorkerAlreadyActive && activeCount >= maxAllowedWorkersLocked()) {
             return@synchronized null
         }
 
+        // Prune stale-generation required reviews so obsolete seek/project items cannot be claimed
+        queue.removeAll { item ->
+            item.kind == SentinelTaskKind.SCOUT2_REQUIRED_REVIEW &&
+                item.schedulingGeneration > 0L &&
+                item.schedulingGeneration != schedulingGeneration
+        }
+
         val reviewCandidates = queue
             .filter {
                 it.kind == SentinelTaskKind.SCOUT2_REQUIRED_REVIEW &&
-                    (targetIntervalId == null || it.beaconId == targetIntervalId)
+                    (targetIntervalId == null || it.beaconId == targetIntervalId) &&
+                    isWithinActiveBoundaryLocked(it)
             }
             .sortedWith(
                 compareBy<SentinelWorkItem> { item ->

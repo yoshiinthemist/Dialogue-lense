@@ -115,6 +115,7 @@ import com.example.data.model.QuotaSaverMode
 import com.example.data.model.SpeakerLabelMode
 import com.example.data.model.TranslationMode
 import com.example.data.model.VideoSourceKind
+import com.example.data.model.YouTubeNativeCcState
 import com.example.data.model.isBubbleSpeakerUnknown
 import com.example.data.model.isNonSpeakerSpecificEvent
 import com.example.data.subtitle.SubtitleParser
@@ -1048,6 +1049,7 @@ fun DialogueLensScreen(
                                             currentTimeMs = state.currentTimeMs,
                                             isPlaying = state.isPlaying,
                                             isIntentionallyPausedByUser = state.readinessSnapshot.isIntentionallyPausedByUser,
+                                            willAutoResumeWhenReady = state.readinessSnapshot.willAutoResumeWhenReady,
                                             isMuted = state.isMuted,
                                             playbackSpeed = state.playbackSpeed,
                                             isFullscreenTheater = state.isFullscreenTheater,
@@ -1259,6 +1261,7 @@ fun DialogueLensScreen(
                                         currentTimeMs = state.currentTimeMs,
                                         isPlaying = state.isPlaying,
                                         isIntentionallyPausedByUser = state.readinessSnapshot.isIntentionallyPausedByUser,
+                                        willAutoResumeWhenReady = state.readinessSnapshot.willAutoResumeWhenReady,
                                         isMuted = state.isMuted,
                                         playbackSpeed = state.playbackSpeed,
                                         isFullscreenTheater = state.isFullscreenTheater,
@@ -2028,10 +2031,29 @@ private fun ToolsQuickSettingsHeader(
                     }
 
                     if (expandScoutDiag || isError) {
-                        val ccSummary = when (val ccCount = state.youtubeNativeCcTrackCount) {
-                            null -> if (state.project.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT) "YouTube CC: checking..." else "Native track: local/web"
-                            0 -> "YouTube CC: 0 embeddable tracks (AI Scout listening directly)"
-                            else -> "YouTube CC: $ccCount track(s) ${state.youtubeNativeCcLang.ifBlank { "" }}".trim()
+                        val ccSummary = if (state.project.videoSource.kind != VideoSourceKind.YOUTUBE_COMPLIANT) {
+                            "Native track: local/web"
+                        } else {
+                            val langSuffix = state.youtubeNativeCcLang.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: ""
+                            when (state.youtubeNativeCcState) {
+                                YouTubeNativeCcState.LOADING -> "YouTube CC: loading..."
+                                YouTubeNativeCcState.OFF -> {
+                                    val countNote = state.youtubeNativeCcTrackCount?.let { "$it track(s)" } ?: "inactive"
+                                    "YouTube CC: off ($countNote)$langSuffix"
+                                }
+                                YouTubeNativeCcState.UNAVAILABLE_OR_BLOCKED ->
+                                    if (state.youtubeNativeCcProbeBlocked) {
+                                        "YouTube CC: probe blocked / inaccessible"
+                                    } else {
+                                        "YouTube CC: 0 embeddable tracks (AI Scout listening directly)"
+                                    }
+                                YouTubeNativeCcState.ENABLED_INACCESSIBLE ->
+                                    "YouTube CC: enabled (${state.youtubeNativeCcTrackCount ?: 1} track)$langSuffix · cues protected/inaccessible"
+                                YouTubeNativeCcState.ENABLED_NO_CURRENT_CUE ->
+                                    "YouTube CC: enabled$langSuffix · standby (no current cue)"
+                                YouTubeNativeCcState.ENABLED_ACTIVE_CUES ->
+                                    "YouTube CC: active$langSuffix (${state.youtubeNativeCcTrackCount ?: 1} track(s))"
+                            }
                         }
                         val diagLine = state.scoutDiagnosticDetail.ifBlank { AppCheckDiagnostics.summaryLine() }
                         val hbBadge = state.scoutHeartbeat.summaryBadge()

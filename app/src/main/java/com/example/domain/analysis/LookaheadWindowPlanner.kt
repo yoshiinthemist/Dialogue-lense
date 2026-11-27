@@ -330,6 +330,7 @@ object LookaheadWindowPlanner {
         completedWindowStarts: Set<Long>,
         horizonMs: Long = ROLLING_BOUNDARY_HORIZON_MS,
         enforceHardHorizon: Boolean = true,
+        completedExtents: List<TimeWindowRange> = emptyList(),
     ): TimeWindowRange? {
         if (durationMs <= 0L) return null
         val safeViewer = viewerPosMs.coerceIn(0L, durationMs)
@@ -339,27 +340,42 @@ object LookaheadWindowPlanner {
         } else {
             minOf(durationMs, anchorStart + MAX_PREFETCH_HORIZON_MS)
         }
+        val coalescedCompleted = if (completedExtents.isNotEmpty()) {
+            coalesceBufferedRanges(completedExtents, bridgeGapMs = 1L)
+        } else {
+            emptyList()
+        }
+
+        fun firstUncoveredSlice(winStart: Long, winEnd: Long): TimeWindowRange? {
+            if (winEnd <= winStart + 250L) return null
+            if (coalescedCompleted.isNotEmpty()) {
+                val remaining = subtractFailedSlices(
+                    completedRanges = listOf(TimeWindowRange(winStart, winEnd)),
+                    failedSlices = coalescedCompleted,
+                )
+                return remaining.firstOrNull { seg ->
+                    val segDur = seg.endMs - seg.startMs
+                    segDur > 250L || (seg.endMs >= durationMs && segDur > 0L)
+                }
+            }
+            if (winStart !in completedWindowStarts) {
+                return TimeWindowRange(startMs = winStart, endMs = winEnd)
+            }
+            return null
+        }
 
         var candidate = anchorStart
         while (candidate < effectiveHorizonEnd) {
-            if (candidate !in completedWindowStarts) {
-                val end = minOf(effectiveHorizonEnd, candidate + WINDOW_STEP_MS)
-                if (end > candidate + 250L) {
-                    return TimeWindowRange(startMs = candidate, endMs = end)
-                }
-            }
+            val end = minOf(effectiveHorizonEnd, candidate + WINDOW_STEP_MS)
+            firstUncoveredSlice(candidate, end)?.let { return it }
             candidate += WINDOW_STEP_MS
         }
 
         if (!enforceHardHorizon) {
             var tail = effectiveHorizonEnd - (effectiveHorizonEnd % WINDOW_STEP_MS)
             while (tail < durationMs) {
-                if (tail !in completedWindowStarts) {
-                    val end = minOf(durationMs, tail + WINDOW_STEP_MS)
-                    if (end > tail + 250L) {
-                        return TimeWindowRange(startMs = tail, endMs = end)
-                    }
-                }
+                val end = minOf(durationMs, tail + WINDOW_STEP_MS)
+                firstUncoveredSlice(tail, end)?.let { return it }
                 tail += WINDOW_STEP_MS
             }
         }

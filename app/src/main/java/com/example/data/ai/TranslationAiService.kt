@@ -535,7 +535,7 @@ class TranslationAiService {
             return Result.failure(IllegalArgumentException("Invalid YouTube video ID."))
         }
         return try {
-            val isSameLanguage = sourceLanguage.equals("Auto-Detect", ignoreCase = true) ||
+            val isSameLanguage = !sourceLanguage.equals("Auto-Detect", ignoreCase = true) &&
                 sourceLanguage.equals(targetLanguage, ignoreCase = true)
             val rosterBlock = if (knownSpeakers.isNotEmpty()) {
                 buildString {
@@ -570,8 +570,10 @@ class TranslationAiService {
 
             val taskInstruction = if (isSameLanguage) {
                 "Watch and listen carefully to this YouTube video from ${windowStartSec}s to ${windowEndSec}s (total length ~${totalDurationSec}s). Absorb every spoken word, who said it, where their mouth is on screen, shot cutaways, and notable sound/music cues in $targetLanguage for spatial speech balloons."
+            } else if (sourceLanguage.equals("Auto-Detect", ignoreCase = true)) {
+                "Watch and listen carefully to this YouTube video from ${windowStartSec}s to ${windowEndSec}s (total length ~${totalDurationSec}s). Detect the spoken language, transcribe every spoken word in the original language into sourceText, and translate naturally into $targetLanguage in naturalTranslation (never copy untranslated non-$targetLanguage text into naturalTranslation), identifying who is speaking, mouth coordinates, and cutaways."
             } else {
-                "Watch and listen carefully to this YouTube video from ${windowStartSec}s to ${windowEndSec}s (total length ~${totalDurationSec}s). Absorb every spoken word (source hint: $sourceLanguage), translate naturally into $targetLanguage, identify who is speaking, where their mouth is on screen, and shot cutaways for spatial speech balloons."
+                "Watch and listen carefully to this YouTube video from ${windowStartSec}s to ${windowEndSec}s (total length ~${totalDurationSec}s). Absorb every spoken word (source hint: $sourceLanguage), transcribe into sourceText, translate naturally into $targetLanguage in naturalTranslation, identify who is speaking, where their mouth is on screen, and shot cutaways for spatial speech balloons."
             }
 
             val promptText = buildString {
@@ -614,6 +616,8 @@ class TranslationAiService {
                     windowStartSec = windowStartSec,
                     windowEndSec = windowEndSec,
                     priorWindowNormalizedTexts = priorWindowNormalizedTexts,
+                    sourceLanguage = sourceLanguage,
+                    targetLanguage = targetLanguage,
                 )
             )
         } catch (e: TimeoutCancellationException) {
@@ -816,11 +820,12 @@ class TranslationAiService {
                 }
             } else ""
 
-            val isSameLanguageEnhancement = sourceLanguage.equals(targetLanguage, ignoreCase = true)
+            val isSameLanguageEnhancement = !sourceLanguage.equals("Auto-Detect", ignoreCase = true) &&
+                sourceLanguage.equals(targetLanguage, ignoreCase = true)
             val taskLine = if (isSameLanguageEnhancement) {
                 "Refine, tighten, and annotate all spoken dialogue and ambient sound cues cleanly in $targetLanguage for Deaf/hard-of-hearing viewers."
             } else {
-                "Transcribe all spoken dialogue and significant sound effects from this audio clip and translate into $targetLanguage."
+                "Transcribe all spoken dialogue and significant sound effects from this audio clip in its spoken language (into sourceText) and translate into $targetLanguage (into naturalTranslation)."
             }
             val promptText = """
                 $taskLine
@@ -854,6 +859,8 @@ class TranslationAiService {
                     rawJson = rawJson,
                     chunkStartMs = chunkStartMs,
                     chunkDurationMs = chunkDurationMs,
+                    sourceLanguage = sourceLanguage,
+                    targetLanguage = targetLanguage,
                 )
             )
         } catch (e: TimeoutCancellationException) {
@@ -880,7 +887,8 @@ class TranslationAiService {
     ): Result<List<AiTranslatedLine>> {
         if (events.isEmpty()) return Result.success(emptyList())
         return try {
-            val isSameLanguage = sourceLanguage.equals(targetLanguage, ignoreCase = true)
+            val isSameLanguage = !sourceLanguage.equals("Auto-Detect", ignoreCase = true) &&
+                sourceLanguage.equals(targetLanguage, ignoreCase = true)
             val payload = buildString {
                 if (isSameLanguage) {
                     appendLine("You are refining and enriching $targetLanguage film/video subtitles into crisp, Deaf-friendly spatial manga speech balloons with speaker attribution, off-screen flags, and [SFX / music] cues.")
@@ -940,17 +948,28 @@ class TranslationAiService {
             if (updates.isNotEmpty()) {
                 onDiscoveredSpeakerUpdates(updates)
             }
+            val expectedIds = events.map { it.id }.toSet()
             val linesJson = root.getJSONArray("lines")
             val parsed = buildList {
                 for (i in 0 until linesJson.length()) {
                     val obj = linesJson.getJSONObject(i)
+                    val id = obj.optString("id", "").trim()
+                    if (id.isBlank() || id !in expectedIds) continue
+                    val rawNatural = obj.optString("naturalTranslation", "").trim()
+                    val matchedEvent = events.firstOrNull { it.id == id }
+                    val sanitizedNatural = sanitizeParsedTranslation(
+                        sourceText = matchedEvent?.sourceText.orEmpty(),
+                        rawNaturalTranslation = rawNatural,
+                        sourceLanguage = sourceLanguage,
+                        targetLanguage = targetLanguage,
+                    )
                     val typeName = obj.optString("dialogueType", "SPOKEN")
                     val dialogueType = DialogueType.entries.firstOrNull { it.name == typeName }
                         ?: DialogueType.SPOKEN
                     add(
                         AiTranslatedLine(
-                            id = obj.getString("id"),
-                            naturalTranslation = obj.getString("naturalTranslation"),
+                            id = id,
+                            naturalTranslation = sanitizedNatural,
                             literalTranslation = obj.optString("literalTranslation", ""),
                             romanization = obj.optString("romanization", ""),
                             dialogueTypeHint = dialogueType,
@@ -1187,6 +1206,8 @@ class TranslationAiService {
             windowStartSec: Int,
             windowEndSec: Int,
             priorWindowNormalizedTexts: Set<String> = emptySet(),
+            sourceLanguage: String = "Auto-Detect",
+            targetLanguage: String = "",
         ): AiYouTubeTranscriptionResult {
             val root = runCatching { parseJsonMapLenientStatic(rawJson) }.getOrNull()
                 ?: return AiYouTubeTranscriptionResult(
@@ -1358,7 +1379,13 @@ class TranslationAiService {
                         }
                     }
                 }
-                val natural = obj.jsonString("naturalTranslation", src).trim().ifBlank { src }
+                val rawNatural = obj.jsonString("naturalTranslation", "").trim()
+                val natural = sanitizeParsedTranslation(
+                    sourceText = src,
+                    rawNaturalTranslation = rawNatural,
+                    sourceLanguage = sourceLanguage,
+                    targetLanguage = targetLanguage,
+                )
                 acceptedCues.add(
                     AiTranscribedCue(
                         startMs = startMs,
@@ -1413,6 +1440,8 @@ class TranslationAiService {
             rawJson: String,
             chunkStartMs: Long,
             chunkDurationMs: Long = 0L,
+            sourceLanguage: String = "Auto-Detect",
+            targetLanguage: String = "",
         ): AiAudioTranscriptionResult {
             val root = runCatching { parseJsonMapLenientStatic(rawJson) }.getOrNull()
                 ?: return AiAudioTranscriptionResult(
@@ -1426,7 +1455,7 @@ class TranslationAiService {
                     diagnosticNote = "Missing cues array in audio transcript JSON",
                 )
 
-            val maxAllowedOffsetMs = if (chunkDurationMs > 0L) chunkDurationMs + 3_000L else Long.MAX_VALUE
+            val maxAllowedOffsetMs = if (chunkDurationMs > 0L) chunkDurationMs + 1_500L else Long.MAX_VALUE
             var invalidCueCount = 0
             val parsed = buildList {
                 for (item in cuesList) {
@@ -1451,18 +1480,25 @@ class TranslationAiService {
                     val safeEndOffset = if (rawEndOffset.isNaN() || rawEndOffset < startOffsetSec) startOffsetSec + 1.5 else rawEndOffset
                     val rawEndMs = (chunkStartMs + (safeEndOffset * 1000.0).toLong()).coerceAtLeast(sMs + 950L)
                     val eMs = if (chunkDurationMs > 0L) {
-                        rawEndMs.coerceAtMost((chunkStartMs + chunkDurationMs + 2_000L).coerceAtLeast(sMs + 450L))
+                        rawEndMs.coerceAtMost((chunkStartMs + chunkDurationMs + 1_500L).coerceAtLeast(sMs + 450L))
                     } else {
                         rawEndMs
                     }
                     val typeName = obj.jsonString("dialogueType", "SPOKEN")
                     val dialogueType = DialogueType.entries.firstOrNull { it.name == typeName } ?: DialogueType.SPOKEN
+                    val rawNatural = obj.jsonString("naturalTranslation", "").trim()
+                    val natural = sanitizeParsedTranslation(
+                        sourceText = src,
+                        rawNaturalTranslation = rawNatural,
+                        sourceLanguage = sourceLanguage,
+                        targetLanguage = targetLanguage,
+                    )
                     add(
                         AiTranscribedCue(
                             startMs = sMs,
                             endMs = eMs,
                             sourceText = src,
-                            naturalTranslation = obj.jsonString("naturalTranslation", src).ifBlank { src },
+                            naturalTranslation = natural,
                             literalTranslation = obj.jsonString("literalTranslation", ""),
                             romanization = obj.jsonString("romanization", ""),
                             dialogueType = dialogueType,
@@ -1650,6 +1686,35 @@ class TranslationAiService {
             } else {
                 0.0
             }
+        }
+
+        internal fun sanitizeParsedTranslation(
+            sourceText: String,
+            rawNaturalTranslation: String,
+            sourceLanguage: String,
+            targetLanguage: String,
+        ): String {
+            val trimmedSrc = sourceText.trim()
+            val trimmedNat = rawNaturalTranslation.trim()
+            val srcNorm = com.example.domain.pipeline.Scout2IndependentReviewer.normalizeLanguageTag(sourceLanguage)
+            val tgtNorm = com.example.domain.pipeline.Scout2IndependentReviewer.normalizeLanguageTag(targetLanguage)
+            val isExplicitSameLang = srcNorm.isNotBlank() && srcNorm != "auto" &&
+                tgtNorm.isNotBlank() && tgtNorm != "auto" && srcNorm == tgtNorm
+
+            if (trimmedNat.isBlank()) {
+                return if (isExplicitSameLang || tgtNorm.isBlank() || tgtNorm == "auto") trimmedSrc else ""
+            }
+            if (tgtNorm.isNotBlank() && tgtNorm != "auto") {
+                val trScript = com.example.domain.pipeline.Scout2IndependentReviewer.detectDominantScriptLanguage(trimmedNat)
+                if (trScript.isNotBlank() && trScript != tgtNorm) {
+                    return ""
+                }
+                val srcScript = com.example.domain.pipeline.Scout2IndependentReviewer.detectDominantScriptLanguage(trimmedSrc)
+                if (srcScript.isNotBlank() && srcScript != tgtNorm && trimmedNat.equals(trimmedSrc, ignoreCase = true)) {
+                    return ""
+                }
+            }
+            return trimmedNat
         }
     }
 }

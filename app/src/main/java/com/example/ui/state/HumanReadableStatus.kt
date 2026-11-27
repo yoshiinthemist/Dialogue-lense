@@ -122,15 +122,39 @@ object HumanReadableStatus {
         if (schedState != null) {
             when (schedState.outcomeState) {
                 SchedulerOutcomeState.WINDOW_READY_IDLE -> {
+                    val currentPlayheadReady = if (readinessSnapshot != null) {
+                        !readinessSnapshot.isBufferingHoldActive && readinessSnapshot.contiguousReleasedLeadMs > 0L
+                    } else {
+                        true
+                    }
+                    if (!currentPlayheadReady && schedState.continuousVerifiedLeadMs <= 0L) {
+                        return HumanReadableReadiness(
+                            label = "Preparing captions",
+                            detail = "Dialogue exists elsewhere, but the current window is not yet prepared.",
+                            tone = ReadinessTone.ACTIVE,
+                            isInProgress = true,
+                        )
+                    }
+                    val spanSec = ((schedState.boundaryEndMs - schedState.acknowledgedViewerPosMs) / 1000L).coerceAtLeast(0L)
+                    val leadSec = (maxOf(schedState.continuousVerifiedLeadMs, readinessSnapshot?.contiguousReleasedLeadMs ?: 0L) / 1000L)
+                        .coerceAtLeast(0L)
                     val reserveSec = (schedState.viewingTimeReserveMs / 1000L).coerceAtLeast(0L)
                     val speedSuffix = if (kotlin.math.abs(schedState.playbackSpeed - 1.0f) >= 0.05f && reserveSec > 0L) {
                         " (~${reserveSec}s at ${schedState.playbackSpeed}x)"
                     } else {
                         ""
                     }
+                    val spanDesc = when {
+                        schedState.boundaryEndMs > 0L && spanSec in 1L..174L ->
+                            "Next ${spanSec}s prepared to end$speedSuffix."
+                        leadSec > 0L ->
+                            "Prepared ${leadSec}s ahead (up to 3-minute window)$speedSuffix."
+                        else ->
+                            "Upcoming 3-minute window prepared$speedSuffix."
+                    }
                     return HumanReadableReadiness(
                         label = "Current window ready",
-                        detail = "Upcoming 3-minute window prepared$speedSuffix. More loads automatically as you watch.",
+                        detail = "$spanDesc More loads automatically as you watch.",
                         tone = ReadinessTone.READY,
                         isInProgress = false,
                     )
@@ -234,12 +258,33 @@ object HumanReadableStatus {
             project.subtitleSource == SubtitleSourceKind.UPLOADED_FILE ||
             project.subtitleSource == SubtitleSourceKind.EMBEDDED_TRACK
 
+        val currentWindowReady = when {
+            readinessSnapshot != null -> !readinessSnapshot.isBufferingHoldActive && readinessSnapshot.contiguousReleasedLeadMs > 0L
+            schedState != null -> schedState.continuousVerifiedLeadMs > 0L
+            else -> false
+        }
         if (!isComplete && project.dialogueEvents.isNotEmpty()) {
-            return HumanReadableReadiness(
-                label = "Current window ready",
-                detail = "Captions are ready here and prepare ahead as you watch.",
-                tone = ReadinessTone.READY,
-            )
+            return if (currentWindowReady) {
+                val leadSec = ((readinessSnapshot?.contiguousReleasedLeadMs ?: schedState?.continuousVerifiedLeadMs ?: 0L) / 1000L)
+                    .coerceAtLeast(0L)
+                val detail = if (leadSec > 0L) {
+                    "Captions are ready ${leadSec}s ahead and prepare as you watch."
+                } else {
+                    "Captions are ready here and prepare ahead as you watch."
+                }
+                HumanReadableReadiness(
+                    label = "Current window ready",
+                    detail = detail,
+                    tone = ReadinessTone.READY,
+                )
+            } else {
+                HumanReadableReadiness(
+                    label = "Preparing captions",
+                    detail = "Dialogue exists elsewhere in the project, but the current window is not yet prepared.",
+                    tone = ReadinessTone.ACTIVE,
+                    isInProgress = true,
+                )
+            }
         }
 
         if (project.dialogueEvents.isEmpty()) {

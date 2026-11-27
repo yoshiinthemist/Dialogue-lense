@@ -52,6 +52,7 @@ class WebStreamSessionHolder {
     internal var lastHandledNavSeq: Int = 0
     internal var isolateVideoInViewport: Boolean = true
     internal var lastSniffedMediaUrl: String = ""
+    internal var lastSniffedHeaderCount: Int = 0
 
     internal val temporarilyAllowedHosts = mutableMapOf<String, Long>()
     internal var navState: WebNavigationState = WebNavigationState()
@@ -249,6 +250,7 @@ fun WebStreamPlayer(
             if (holder.loadedSeedUrl != webUrl && webUrl.isNotBlank()) {
                 holder.loadedSeedUrl = webUrl
                 holder.lastSniffedMediaUrl = ""
+                holder.lastSniffedHeaderCount = 0
                 holder.bridgeReady = false
                 holder.navState = WebNavigationState(
                     currentUrl = webUrl,
@@ -321,43 +323,67 @@ private fun createGuardedWebView(
             }
         }
 
+        fun isAuthorizedPageOrigin(pageUrl: String): Boolean {
+            val seedDomain = WebNavigationGuard.registrableDomain(
+                WebNavigationGuard.extractHost(seedUrlProvider())
+            )
+            val curHost = WebNavigationGuard.extractHost(pageUrl)
+            val curDomain = WebNavigationGuard.registrableDomain(curHost)
+            val allowedNow = holder.activeAllowedHostsSnapshot()
+            if (seedDomain.isEmpty()) return curDomain.isNotEmpty()
+            return curDomain.isNotEmpty() && (
+                curDomain == seedDomain ||
+                    allowedNow.any { curHost == it || curHost.endsWith(".$it") }
+                )
+        }
+
         val bridge = object {
             @JavascriptInterface
             fun onProgress(posMs: Long, durMs: Long, playing: Boolean) {
+                if (posMs < 0L || durMs < 0L) return
                 mainHandler.post { holder.playbackCallback(posMs, durMs, playing) }
             }
 
             @JavascriptInterface
             fun onCapturedTracks(cuesJson: String) {
-                mainHandler.post { holder.captionsCallback(cuesJson) }
+                if (cuesJson.isBlank() || cuesJson.length > 512_000) return
+                mainHandler.post {
+                    val pageUrl = url.orEmpty().ifBlank { holder.navState.currentUrl }
+                    if (!isAuthorizedPageOrigin(pageUrl)) return@post
+                    holder.captionsCallback(cuesJson)
+                }
             }
 
             @JavascriptInterface
             fun onDirectMediaUrl(mediaUrl: String) {
                 val clean = mediaUrl.trim()
-                if (clean.startsWith("http", ignoreCase = true) &&
+                if (clean.length <= 2048 &&
+                    clean.startsWith("http", ignoreCase = true) &&
                     WebNavigationGuard.isLikelyPlayableMediaUrl(clean)
                 ) {
                     mainHandler.post {
+                        val pageUrl = holder.navState.currentUrl.ifBlank { url.orEmpty() }.ifBlank { seedUrlProvider() }
+                        if (!isAuthorizedPageOrigin(pageUrl)) return@post
                         holder.mediaUrlCallback(clean)
-                        if (clean != holder.lastSniffedMediaUrl) {
+                        val origin = runCatching {
+                            val u = java.net.URI(pageUrl)
+                            if (u.scheme != null && u.host != null) "${u.scheme}://${u.host}" else ""
+                        }.getOrDefault("")
+                        val cookie = runCatching { CookieManager.getInstance().getCookie(clean) }.getOrNull().orEmpty()
+                        val sniffed = SniffedWebMediaStream(
+                            url = clean,
+                            referer = pageUrl,
+                            cookieHeader = cookie,
+                            userAgent = settings.userAgentString.orEmpty(),
+                            origin = origin,
+                            isHlsPlaylist = WebNavigationGuard.isHlsPlaylistUrl(clean),
+                        )
+                        val headersCount = sniffed.toRequestHeaders().size
+                        val isNewUrl = !clean.equals(holder.lastSniffedMediaUrl, ignoreCase = true)
+                        if (isNewUrl || headersCount > holder.lastSniffedHeaderCount) {
                             holder.lastSniffedMediaUrl = clean
-                            val pageUrl = holder.navState.currentUrl.ifBlank { seedUrlProvider() }
-                            val origin = runCatching {
-                                val u = java.net.URI(pageUrl)
-                                if (u.scheme != null && u.host != null) "${u.scheme}://${u.host}" else ""
-                            }.getOrDefault("")
-                            val cookie = runCatching { CookieManager.getInstance().getCookie(clean) }.getOrNull().orEmpty()
-                            holder.sniffedMediaCallback(
-                                SniffedWebMediaStream(
-                                    url = clean,
-                                    referer = pageUrl,
-                                    cookieHeader = cookie,
-                                    userAgent = settings.userAgentString.orEmpty(),
-                                    origin = origin,
-                                    isHlsPlaylist = WebNavigationGuard.isHlsPlaylistUrl(clean),
-                                )
-                            )
+                            holder.lastSniffedHeaderCount = headersCount
+                            holder.sniffedMediaCallback(sniffed)
                         }
                     }
                 }
@@ -365,28 +391,25 @@ private fun createGuardedWebView(
 
             @JavascriptInterface
             fun onCapturedAudioChunk(startMs: Long, base64Audio: String, mimeType: String) {
-                if (base64Audio.isBlank()) return
+                if (startMs < 0L) return
+                val cleanMime = mimeType.trim().lowercase().substringBefore(';')
+                if (cleanMime !in ALLOWED_AUDIO_MIME_TYPES) return
+                if (base64Audio.length !in 64..6_000_000) return
                 mainHandler.post {
-                    val currentPageUrl = url.orEmpty()
-                    val seedDomain = WebNavigationGuard.registrableDomain(
-                        WebNavigationGuard.extractHost(seedUrlProvider())
-                    )
-                    val curHost = WebNavigationGuard.extractHost(currentPageUrl)
-                    val curDomain = WebNavigationGuard.registrableDomain(curHost)
-                    val allowedNow = holder.activeAllowedHostsSnapshot()
-                    val originAuthorized = seedDomain.isEmpty() ||
-                        curDomain.isEmpty() ||
-                        curDomain == seedDomain ||
-                        allowedNow.any { curHost == it || curHost.endsWith(".$it") }
-                    if (!originAuthorized) return@post
-                    holder.audioSliceCallback(startMs.coerceAtLeast(0L), base64Audio, mimeType)
+                    val currentPageUrl = url.orEmpty().ifBlank { holder.navState.currentUrl }
+                    if (!isAuthorizedPageOrigin(currentPageUrl)) return@post
+                    holder.audioSliceCallback(startMs.coerceAtLeast(0L), base64Audio, cleanMime)
                 }
             }
 
             @JavascriptInterface
             fun onPageMetadata(title: String, author: String, description: String) {
                 if (title.isNotBlank() || author.isNotBlank() || description.isNotBlank()) {
-                    mainHandler.post { holder.metadataCallback(title, author, description) }
+                    mainHandler.post {
+                        val pageUrl = url.orEmpty().ifBlank { holder.navState.currentUrl }
+                        if (!isAuthorizedPageOrigin(pageUrl)) return@post
+                        holder.metadataCallback(title.take(180), author.take(120), description.take(1_200))
+                    }
                 }
             }
 
@@ -572,31 +595,35 @@ private fun createGuardedWebView(
                 val fetchDest = reqHeaders["Sec-Fetch-Dest"].orEmpty()
                 if (WebNavigationGuard.isLikelyPlayableMediaUrl(targetUrl, acceptHeader, fetchDest)) {
                     val isHls = WebNavigationGuard.isHlsPlaylistUrl(targetUrl)
+                    val pageReferer = reqHeaders["Referer"]
+                        ?.takeIf { it.isNotBlank() }
+                        ?: holder.navState.currentUrl.ifBlank { seed }
+                    val reqOrigin = reqHeaders["Origin"].orEmpty().ifBlank {
+                        runCatching {
+                            val u = java.net.URI(pageReferer)
+                            if (u.scheme != null && u.host != null) "${u.scheme}://${u.host}" else ""
+                        }.getOrDefault("")
+                    }
+                    val reqUa = reqHeaders["User-Agent"]?.takeIf { it.isNotBlank() }
+                        ?: settings.userAgentString.orEmpty()
+                    val cookie = runCatching { CookieManager.getInstance().getCookie(targetUrl) }.getOrNull().orEmpty()
+                    val sniffed = SniffedWebMediaStream(
+                        url = targetUrl,
+                        referer = pageReferer,
+                        cookieHeader = cookie,
+                        userAgent = reqUa,
+                        origin = reqOrigin,
+                        isHlsPlaylist = isHls,
+                    )
+                    val headersCount = sniffed.toRequestHeaders().size
+                    val isSameUrl = targetUrl.equals(holder.lastSniffedMediaUrl, ignoreCase = true)
                     val shouldEmit = holder.lastSniffedMediaUrl.isBlank() ||
                         (isHls && !WebNavigationGuard.isHlsPlaylistUrl(holder.lastSniffedMediaUrl)) ||
-                        (!targetUrl.equals(holder.lastSniffedMediaUrl, ignoreCase = true) && isHls && targetUrl.contains("master", ignoreCase = true))
+                        (!isSameUrl && isHls && targetUrl.contains("master", ignoreCase = true)) ||
+                        (isSameUrl && headersCount > holder.lastSniffedHeaderCount)
                     if (shouldEmit) {
                         holder.lastSniffedMediaUrl = targetUrl
-                        val pageReferer = reqHeaders["Referer"]
-                            ?.takeIf { it.isNotBlank() }
-                            ?: holder.navState.currentUrl.ifBlank { seed }
-                        val reqOrigin = reqHeaders["Origin"].orEmpty().ifBlank {
-                            runCatching {
-                                val u = java.net.URI(pageReferer)
-                                if (u.scheme != null && u.host != null) "${u.scheme}://${u.host}" else ""
-                            }.getOrDefault("")
-                        }
-                        val reqUa = reqHeaders["User-Agent"]?.takeIf { it.isNotBlank() }
-                            ?: settings.userAgentString.orEmpty()
-                        val cookie = runCatching { CookieManager.getInstance().getCookie(targetUrl) }.getOrNull().orEmpty()
-                        val sniffed = SniffedWebMediaStream(
-                            url = targetUrl,
-                            referer = pageReferer,
-                            cookieHeader = cookie,
-                            userAgent = reqUa,
-                            origin = reqOrigin,
-                            isHlsPlaylist = isHls,
-                        )
+                        holder.lastSniffedHeaderCount = headersCount
                         mainHandler.post {
                             holder.mediaUrlCallback(targetUrl)
                             holder.sniffedMediaCallback(sniffed)
@@ -1315,3 +1342,12 @@ private fun buildWebStreamHookScript(
 })();
 """.trimIndent()
 }
+
+private val ALLOWED_AUDIO_MIME_TYPES = setOf(
+    "audio/webm",
+    "audio/mp4",
+    "audio/ogg",
+    "audio/wav",
+    "audio/mpeg",
+    "audio/aac",
+)

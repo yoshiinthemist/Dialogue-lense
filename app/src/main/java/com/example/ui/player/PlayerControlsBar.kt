@@ -120,6 +120,7 @@ fun PlayerControlsBar(
     onInspectHealBeacon: (String) -> Unit = {},
     activeChapterTitle: String? = null,
     isIntentionallyPausedByUser: Boolean = !isPlaying,
+    willAutoResumeWhenReady: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val duration = project.videoSource.durationMs.coerceAtLeast(1000L)
@@ -522,9 +523,10 @@ fun PlayerControlsBar(
                         .testTag("play_pause_button"),
                 ) {
                     Box(contentAlignment = Alignment.Center) {
+                        val showPauseIcon = isPlaying || willAutoResumeWhenReady
                         Icon(
-                            imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                            contentDescription = if (isPlaying) "Pause" else "Play",
+                            imageVector = if (showPauseIcon) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            contentDescription = if (showPauseIcon) "Pause" else "Play",
                             tint = CinemaObsidian,
                             modifier = Modifier.size(30.dp),
                         )

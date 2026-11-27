@@ -11,6 +11,7 @@ import com.example.data.model.PlacementMode
 import com.example.data.model.ReferenceCaptionCue
 import com.example.data.model.ReferenceCaptionTrack
 import com.example.data.model.Speaker
+import com.example.data.model.SubtitleSourceKind
 import com.example.domain.analysis.LiveFaceObservation
 import com.example.domain.layout.BalloonLayoutEngine
 import kotlin.math.abs
@@ -36,6 +37,13 @@ enum class PlacementReviewStatus {
     REPAIRED,
 }
 
+enum class WordingVerificationMethod {
+    NONE,
+    CAPTION_ALIGNMENT,
+    AUDIO_ASR_INDEPENDENT,
+    DETERMINISTIC_SELF,
+}
+
 data class CueReviewRecord(
     val eventId: String,
     val stableCueKey: String,
@@ -43,6 +51,7 @@ data class CueReviewRecord(
     val isSourceVerified: Boolean,
     val isTranslationVerified: Boolean,
     val needsTranslation: Boolean = false,
+    val wordingMethod: WordingVerificationMethod = WordingVerificationMethod.NONE,
     val note: String = "",
 )
 
@@ -63,6 +72,7 @@ data class IntervalReviewOutcome(
     val referenceTrackId: String? = null,
     val isTranslationVerified: Boolean = true,
     val isApproximatePreviewOnly: Boolean = false,
+    val wordingVerificationMethod: WordingVerificationMethod = WordingVerificationMethod.NONE,
 ) {
     val coverageStatus: CoverageStatus
         get() = when (dialogueStatus) {
@@ -209,16 +219,22 @@ class Scout2IndependentReviewer {
             else -> "auto"
         }
 
-        // Language check applies identically to explicit sourceLanguage, Auto-Detect, AND empty-draft recovery
+        val sampleDraftSrcLang = detectDominantScriptLanguage(
+            draft.events.take(4).joinToString(" ") { it.sourceText }
+        )
         val hasConcreteTarget = targetLangNorm.isNotBlank() && targetLangNorm != "auto"
         val refMatchesTarget = hasConcreteTarget && effectiveRefLang == targetLangNorm
         val refDiffersFromTarget = hasConcreteTarget &&
             effectiveRefLang.isNotBlank() &&
             effectiveRefLang != "auto" &&
             effectiveRefLang != targetLangNorm
+        val draftSrcDiffersFromTarget = hasConcreteTarget &&
+            sampleDraftSrcLang.isNotBlank() &&
+            sampleDraftSrcLang != targetLangNorm
         val isTranslationRequested = hasConcreteTarget && (
             (sourceLangNorm.isNotBlank() && sourceLangNorm != "auto" && sourceLangNorm != targetLangNorm) ||
-                refDiffersFromTarget
+                refDiffersFromTarget ||
+                draftSrcDiffersFromTarget
             )
         val refMatchesSource = when {
             sourceLangNorm.isNotBlank() && sourceLangNorm != "auto" && effectiveRefLang != "auto" ->
@@ -329,6 +345,11 @@ class Scout2IndependentReviewer {
                     referenceTrackId = draft.referenceTrackId,
                     isTranslationVerified = !missingTranslation && refOriginIsHighTrust,
                     isApproximatePreviewOnly = isApproximatePreview,
+                    wordingVerificationMethod = if (refOriginIsHighTrust) {
+                        WordingVerificationMethod.CAPTION_ALIGNMENT
+                    } else {
+                        WordingVerificationMethod.NONE
+                    },
                 )
             }
             if (draft.isConfirmedSilence && draft.hasIndependentAudioOrFrameEvidence) {
@@ -350,6 +371,7 @@ class Scout2IndependentReviewer {
                     referenceTrackId = draft.referenceTrackId,
                     isTranslationVerified = true,
                     isApproximatePreviewOnly = isApproximatePreview,
+                    wordingVerificationMethod = WordingVerificationMethod.AUDIO_ASR_INDEPENDENT,
                 )
             }
             // Empty interval without confirmed silence is NOT automatically silence!
@@ -386,9 +408,17 @@ class Scout2IndependentReviewer {
         var unverifiedCueCount = 0
         var allTranslationsVerified = true
         var escalatedForAmbiguity = false
+        var usedCaptionAlignment = false
+        var usedIndependentAudio = false
         val cueReviews = mutableListOf<CueReviewRecord>()
+        val coveredRefIds = mutableSetOf<String>()
+        val draftEvidenceIsAudio = draft.hasIndependentAudioOrFrameEvidence && (
+            draft.evidenceProvenance.contains("AUDIO", ignoreCase = true) ||
+                draft.evidenceProvenance.contains("ASR", ignoreCase = true) ||
+                draft.evidenceProvenance == SubtitleSourceKind.AI_DRAFT.name
+            )
 
-        val textReviewed = deduplicated.map { evt ->
+        val reviewedExisting = deduplicated.map { evt ->
             val stableKey = evt.stableCueKey.ifBlank { evt.id }
             val overlappingRefs = alignedRefs.filter { ref ->
                 val overlapStart = maxOf(ref.startMs, evt.startTimeMs)
@@ -397,28 +427,51 @@ class Scout2IndependentReviewer {
                 val closeProximity = abs(ref.startMs - evt.startTimeMs) <= 800L
                 directOverlap || closeProximity
             }
-            val cueNeedsTranslation = isTranslationRequested &&
-                evt.translatedText.isBlank() &&
+            overlappingRefs.forEach { coveredRefIds.add(it.cueId) }
+
+            val cueRequiresTransByText = isTranslationRequested ||
+                (hasConcreteTarget && detectDominantScriptLanguage(evt.sourceText).let { s ->
+                    s.isNotBlank() && s != targetLangNorm
+                })
+            val hasValidTranslation = isTranslationValidForTarget(
+                sourceText = evt.sourceText,
+                translatedText = evt.translatedText,
+                sourceLangNorm = sourceLangNorm,
+                targetLangNorm = targetLangNorm,
+                requiresTranslation = cueRequiresTransByText,
+            )
+            val sanitizedTranslated = if (!hasValidTranslation && cueRequiresTransByText) {
+                ""
+            } else {
+                evt.translatedText
+            }
+            val cueNeedsTranslation = cueRequiresTransByText &&
+                !hasValidTranslation &&
                 evt.sourceText.isNotBlank()
+            if (cueNeedsTranslation) {
+                allTranslationsVerified = false
+                escalatedForAmbiguity = true
+            }
 
             if (overlappingRefs.isEmpty()) {
-                // No overlapping reference cue for THIS cue -> keep this cue explicitly unverified unless backed by audio!
-                if (draft.hasIndependentAudioOrFrameEvidence && !cueNeedsTranslation) {
+                // No overlapping reference cue for THIS cue -> keep unverified unless backed by real audio + valid translation!
+                if (draftEvidenceIsAudio && !cueNeedsTranslation) {
                     verifiedCueCount++
+                    usedIndependentAudio = true
                     cueReviews.add(
                         CueReviewRecord(
                             eventId = evt.id,
                             stableCueKey = stableKey,
                             status = DialogueReviewStatus.VERIFIED_MATCH,
                             isSourceVerified = true,
-                            isTranslationVerified = !isTranslationRequested || evt.translatedText.isNotBlank(),
-                            needsTranslation = cueNeedsTranslation,
-                            note = "Backed by audio/media evidence",
+                            isTranslationVerified = true,
+                            needsTranslation = false,
+                            wordingMethod = WordingVerificationMethod.AUDIO_ASR_INDEPENDENT,
+                            note = "Backed by independent audio/ASR evidence",
                         )
                     )
                 } else {
                     unverifiedCueCount++
-                    if (isTranslationRequested && !refMatchesTarget) allTranslationsVerified = false
                     cueReviews.add(
                         CueReviewRecord(
                             eventId = evt.id,
@@ -427,11 +480,12 @@ class Scout2IndependentReviewer {
                             isSourceVerified = false,
                             isTranslationVerified = false,
                             needsTranslation = cueNeedsTranslation,
-                            note = "No overlapping reference cue",
+                            wordingMethod = WordingVerificationMethod.NONE,
+                            note = if (cueNeedsTranslation) "Translation missing or echoed source text" else "No independent verification evidence",
                         )
                     )
                 }
-                evt.copy(stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
+                evt.copy(translatedText = sanitizedTranslated, stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
             } else {
                 val combinedRefText = overlappingRefs.joinToString(" ") { it.text.trim() }.trim()
                 val cueRefLang = if (effectiveRefLang != "auto") effectiveRefLang else detectDominantScriptLanguage(combinedRefText)
@@ -443,13 +497,13 @@ class Scout2IndependentReviewer {
                 }
                 val cueRequiresTranslation = hasConcreteTarget && (
                     (sourceLangNorm != "auto" && sourceLangNorm != targetLangNorm) ||
-                        (cueRefLang.isNotBlank() && cueRefLang != "auto" && cueRefLang != targetLangNorm)
+                        (cueRefLang.isNotBlank() && cueRefLang != "auto" && cueRefLang != targetLangNorm) ||
+                        cueRequiresTransByText
                     )
                 val canCompareAgainstTranslated = !cueRequiresTranslation || cueRefMatchesTarget
                 val refIsUnrelatedLanguage = !canCompareAgainstTranslated && !cueRefMatchesSource
 
                 if (refIsUnrelatedLanguage) {
-                    // Unrelated-language reference MUST NEVER increment repairedDialogueCount or verify this cue!
                     unverifiedCueCount++
                     allTranslationsVerified = false
                     notes.add("Ignored unrelated-language reference ($cueRefLang) for ${evt.id}")
@@ -461,25 +515,26 @@ class Scout2IndependentReviewer {
                             isSourceVerified = false,
                             isTranslationVerified = false,
                             needsTranslation = cueNeedsTranslation,
+                            wordingMethod = WordingVerificationMethod.NONE,
                             note = "Reference language ($cueRefLang) unrelated to source/target",
                         )
                     )
-                    evt.copy(stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
+                    evt.copy(translatedText = sanitizedTranslated, stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
                 } else {
                     val compareTargetText = if (canCompareAgainstTranslated) {
-                        evt.translatedText.ifBlank { evt.sourceText }
+                        sanitizedTranslated.ifBlank { evt.sourceText }
                     } else {
-                        // Translation active and reference is in source language:
-                        // compare ONLY against sourceText and NEVER overwrite translatedText!
                         evt.sourceText
                     }
                     val semantic = evaluateSemanticEquivalence(compareTargetText, combinedRefText)
 
                     when {
                         semantic.isEquivalent -> {
-                            val translationChecked = canCompareAgainstTranslated
-                            val sourceVerified = refOriginIsHighTrust || draft.hasIndependentAudioOrFrameEvidence
+                            val translationChecked = canCompareAgainstTranslated && !cueNeedsTranslation
+                            val sourceVerified = refOriginIsHighTrust || draftEvidenceIsAudio
                             val cueVerified = sourceVerified && (!cueRequiresTranslation || translationChecked)
+                            if (refOriginIsHighTrust) usedCaptionAlignment = true
+                            if (draftEvidenceIsAudio) usedIndependentAudio = true
                             if (cueVerified) {
                                 verifiedCueCount++
                             } else {
@@ -496,6 +551,11 @@ class Scout2IndependentReviewer {
                                     isSourceVerified = sourceVerified,
                                     isTranslationVerified = translationChecked && sourceVerified,
                                     needsTranslation = cueNeedsTranslation,
+                                    wordingMethod = when {
+                                        usedCaptionAlignment -> WordingVerificationMethod.CAPTION_ALIGNMENT
+                                        usedIndependentAudio -> WordingVerificationMethod.AUDIO_ASR_INDEPENDENT
+                                        else -> WordingVerificationMethod.NONE
+                                    },
                                     note = if (cueRequiresTranslation && !translationChecked) {
                                         "Source matched reference; translation unverified"
                                     } else {
@@ -503,10 +563,10 @@ class Scout2IndependentReviewer {
                                     },
                                 )
                             )
-                            evt.copy(stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
+                            evt.copy(translatedText = sanitizedTranslated, stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
                         }
-                        // Authored/user-imported reference materially disagrees (including negation/number/entity flip)
                         refOriginIsHighTrust && (semantic.hasCriticalDivergence || semantic.score < EQUIVALENT_TEXT_THRESHOLD) -> {
+                            usedCaptionAlignment = true
                             if (canCompareAgainstTranslated) {
                                 repairedDialogueCount++
                                 verifiedCueCount++
@@ -519,6 +579,7 @@ class Scout2IndependentReviewer {
                                         isSourceVerified = true,
                                         isTranslationVerified = true,
                                         needsTranslation = false,
+                                        wordingMethod = WordingVerificationMethod.CAPTION_ALIGNMENT,
                                         note = "Repaired from ${referenceTrack?.originKind?.label} (${semantic.reason})",
                                     )
                                 )
@@ -529,12 +590,10 @@ class Scout2IndependentReviewer {
                                     needsTranslation = false,
                                 )
                             } else {
-                                // Reference matches source language ONLY: repair sourceText, preserve existing target
-                                // translation, and DO NOT claim translation is verified!
                                 repairedDialogueCount++
                                 unverifiedCueCount++
                                 allTranslationsVerified = false
-                                val stillMissingTrans = evt.translatedText.isBlank()
+                                val stillMissingTrans = sanitizedTranslated.isBlank()
                                 notes.add("Repaired sourceText for ${evt.id} (${semantic.reason}); ${draft.targetLanguage} translation remains unverified")
                                 cueReviews.add(
                                     CueReviewRecord(
@@ -544,11 +603,13 @@ class Scout2IndependentReviewer {
                                         isSourceVerified = true,
                                         isTranslationVerified = false,
                                         needsTranslation = stillMissingTrans,
+                                        wordingMethod = WordingVerificationMethod.CAPTION_ALIGNMENT,
                                         note = "Source repaired; translation unverified",
                                     )
                                 )
                                 evt.copy(
                                     sourceText = combinedRefText,
+                                    translatedText = sanitizedTranslated,
                                     stableCueKey = stableKey,
                                     needsTranslation = stillMissingTrans,
                                 )
@@ -570,18 +631,94 @@ class Scout2IndependentReviewer {
                                     isSourceVerified = false,
                                     isTranslationVerified = false,
                                     needsTranslation = cueNeedsTranslation,
+                                    wordingMethod = WordingVerificationMethod.NONE,
                                     note = "Unverified divergence (${semantic.reason})",
                                 )
                             )
-                            evt.copy(stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
+                            evt.copy(translatedText = sanitizedTranslated, stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
                         }
                     }
                 }
             }
         }
 
-        // Strict interval verification invariant:
-        // ONE matching or repaired cue can NEVER verify an entire interval when other cues remain unverified!
+        // Recover omitted dialogue present in alignedRefs strictly inside [draft.startMs, draft.endMs)
+        val uncoveredRefs = alignedRefs.filter { ref ->
+            ref.cueId !in coveredRefIds && ref.endMs > draft.startMs && ref.startMs < draft.endMs
+        }
+        val recoveredOmitted = mutableListOf<DialogueEvent>()
+        for (ref in uncoveredRefs) {
+            val cueRefLang = if (effectiveRefLang != "auto") effectiveRefLang else detectDominantScriptLanguage(ref.text)
+            val cueRefMatchesTarget = hasConcreteTarget && cueRefLang == targetLangNorm
+            val cueRefMatchesSource = when {
+                sourceLangNorm != "auto" && cueRefLang.isNotBlank() && cueRefLang != "auto" -> cueRefLang == sourceLangNorm
+                sourceLangNorm == "auto" && cueRefLang.isNotBlank() && cueRefLang != "auto" && !cueRefMatchesTarget -> true
+                else -> false
+            }
+            val cueRequiresTrans = hasConcreteTarget && (
+                (sourceLangNorm != "auto" && sourceLangNorm != targetLangNorm) ||
+                    (cueRefLang.isNotBlank() && cueRefLang != "auto" && cueRefLang != targetLangNorm)
+                )
+            val refUnrelated = !(!cueRequiresTrans || cueRefMatchesTarget) && !cueRefMatchesSource
+            if (refUnrelated) continue
+
+            val missingTranslation = cueRequiresTrans && !cueRefMatchesTarget
+            val clampedStart = ref.startMs.coerceIn(draft.startMs, draft.endMs)
+            val clampedEnd = ref.endMs.coerceIn(
+                clampedStart + 350L,
+                maxOf(draft.endMs, clampedStart + 350L),
+            )
+            val recoveredEvt = DialogueEvent(
+                id = "sc2_${ref.cueId}",
+                startTimeMs = clampedStart,
+                endTimeMs = clampedEnd,
+                sourceText = ref.text,
+                translatedText = if (missingTranslation) "" else ref.text,
+                speakerId = null,
+                speakerConfidence = 0.35f,
+                faceTrackId = null,
+                faceConfidence = 0f,
+                shotId = projectTemplate.shots.firstOrNull()?.id ?: "shot_1",
+                dialogueType = DialogueType.SPOKEN,
+                placementMode = PlacementMode.NEUTRAL_FALLBACK,
+                attributionSummary = "Unidentified speaker",
+                stableCueKey = ref.cueId,
+                needsTranslation = missingTranslation,
+            )
+            recoveredOmitted.add(recoveredEvt)
+            repairedDialogueCount++
+            usedCaptionAlignment = usedCaptionAlignment || refOriginIsHighTrust
+            if (missingTranslation || !refOriginIsHighTrust) {
+                unverifiedCueCount++
+                if (missingTranslation) {
+                    allTranslationsVerified = false
+                    escalatedForAmbiguity = true
+                }
+            } else {
+                verifiedCueCount++
+            }
+            cueReviews.add(
+                CueReviewRecord(
+                    eventId = recoveredEvt.id,
+                    stableCueKey = recoveredEvt.stableCueKey,
+                    status = if (missingTranslation || !refOriginIsHighTrust) {
+                        DialogueReviewStatus.FALLBACK_UNVERIFIED
+                    } else {
+                        DialogueReviewStatus.REPAIRED_FROM_REFERENCE
+                    },
+                    isSourceVerified = refOriginIsHighTrust,
+                    isTranslationVerified = refOriginIsHighTrust && !missingTranslation,
+                    needsTranslation = missingTranslation,
+                    wordingMethod = if (refOriginIsHighTrust) WordingVerificationMethod.CAPTION_ALIGNMENT else WordingVerificationMethod.NONE,
+                    note = "Recovered omitted reference cue ${ref.cueId}",
+                )
+            )
+        }
+        if (recoveredOmitted.isNotEmpty()) {
+            notes.add("Recovered ${recoveredOmitted.size} omitted cue(s) inside draft from reference captions")
+        }
+        val textReviewed = (reviewedExisting + recoveredOmitted).sortedBy { it.startTimeMs }
+
         val totalCues = textReviewed.size
         val allCuesIndependentlyVerified = totalCues > 0 &&
             unverifiedCueCount == 0 &&
@@ -590,34 +727,34 @@ class Scout2IndependentReviewer {
 
         val dialogueStatus: DialogueReviewStatus
         val dialogueConf: Float
-        val independentlyVerified: Boolean
+        val wordingVerified: Boolean
         when {
             allCuesIndependentlyVerified && repairedDialogueCount > 0 -> {
                 dialogueStatus = DialogueReviewStatus.REPAIRED_FROM_REFERENCE
                 dialogueConf = 0.90f
-                independentlyVerified = true
+                wordingVerified = true
             }
             allCuesIndependentlyVerified -> {
                 dialogueStatus = DialogueReviewStatus.VERIFIED_MATCH
                 dialogueConf = if (refOriginIsHighTrust) 0.94f else 0.85f
-                independentlyVerified = true
+                wordingVerified = true
             }
             repairedDialogueCount > 0 -> {
                 dialogueStatus = DialogueReviewStatus.REPAIRED_FROM_REFERENCE
                 dialogueConf = 0.76f
-                independentlyVerified = false
+                wordingVerified = false
                 notes.add("Partially repaired ($repairedDialogueCount repaired, $unverifiedCueCount cue(s) remain unverified)")
             }
             verifiedCueCount > 0 -> {
                 dialogueStatus = DialogueReviewStatus.FALLBACK_UNVERIFIED
                 dialogueConf = 0.72f
-                independentlyVerified = false
+                wordingVerified = false
                 notes.add("Partial verification ($verifiedCueCount/$totalCues cues verified; interval kept unverified)")
             }
             else -> {
                 dialogueStatus = DialogueReviewStatus.FALLBACK_UNVERIFIED
                 dialogueConf = 0.65f
-                independentlyVerified = false
+                wordingVerified = false
                 notes.add("No complete independent verification; released as unverified fallback")
             }
         }
@@ -666,6 +803,17 @@ class Scout2IndependentReviewer {
             .toFloat()
             .takeIf { !it.isNaN() }
             ?: 0f
+        val hasUnsupportedSpokenAttribution = attributionReviewed.any { evt ->
+            evt.dialogueType == DialogueType.SPOKEN &&
+                !evt.lockedByUser &&
+                (evt.speakerId.isNullOrBlank() || evt.speakerConfidence < ATTRIBUTION_CONFIRM_THRESHOLD)
+        }
+        val independentlyVerified = wordingVerified && !hasUnsupportedSpokenAttribution
+        val resolvedWordingMethod = when {
+            usedCaptionAlignment -> WordingVerificationMethod.CAPTION_ALIGNMENT
+            usedIndependentAudio -> WordingVerificationMethod.AUDIO_ASR_INDEPENDENT
+            else -> WordingVerificationMethod.NONE
+        }
 
         // 6. Presentation & layout review using the EXACT SAME BalloonLayoutEngine used during playback
         val (placementReviewed, placementStatus, placementStable) = validatePresentation(
@@ -694,9 +842,37 @@ class Scout2IndependentReviewer {
             draftRevision = draft.draftRevision,
             sourceRevision = draft.sourceRevision,
             referenceTrackId = draft.referenceTrackId,
-            isTranslationVerified = allTranslationsVerified && independentlyVerified,
+            isTranslationVerified = allTranslationsVerified && wordingVerified,
             isApproximatePreviewOnly = isApproximatePreview,
+            wordingVerificationMethod = resolvedWordingMethod,
         )
+    }
+
+    private fun isTranslationValidForTarget(
+        sourceText: String,
+        translatedText: String,
+        sourceLangNorm: String,
+        targetLangNorm: String,
+        requiresTranslation: Boolean,
+    ): Boolean {
+        if (translatedText.isBlank()) return !requiresTranslation
+        if (!requiresTranslation || targetLangNorm == "auto" || targetLangNorm.isBlank()) return true
+        val srcScript = detectDominantScriptLanguage(sourceText)
+        val trScript = detectDominantScriptLanguage(translatedText)
+        if (trScript.isNotBlank() && trScript != targetLangNorm) return false
+        if (srcScript.isNotBlank() && srcScript != targetLangNorm &&
+            translatedText.trim().equals(sourceText.trim(), ignoreCase = true)
+        ) {
+            return false
+        }
+        if (sourceLangNorm != "auto" && sourceLangNorm.isNotBlank() &&
+            sourceLangNorm != targetLangNorm &&
+            translatedText.trim().equals(sourceText.trim(), ignoreCase = true) &&
+            sourceText.trim().length >= 8
+        ) {
+            return false
+        }
+        return true
     }
 
     private fun normalizeRollingCaptionsPreservingIdentity(
@@ -1080,6 +1256,56 @@ class ReleasedTimelineStore {
      */
     fun invalidateLayoutCacheOnly(): ReleasedPlaybackSnapshot = synchronized(lock) {
         layoutCacheRevision++
+        buildSnapshotLocked()
+    }
+
+    /**
+     * Synchronizes an in-place user edit into the released store, rejecting any obsolete pending
+     * drafts overlapping the edited cue so older background work cannot overwrite user edits.
+     */
+    fun syncEditedEvent(
+        updatedEvent: DialogueEvent,
+        invalidateOverlappingDrafts: Boolean = true,
+    ): ReleasedPlaybackSnapshot = synchronized(lock) {
+        val stableKey = updatedEvent.stableCueKey.ifBlank { updatedEvent.id }
+        val existing = releasedEventsById[updatedEvent.id]
+        releasedEventsById[updatedEvent.id] = updatedEvent.copy(stableCueKey = stableKey)
+        releaseRevision++
+        if (invalidateOverlappingDrafts) {
+            workingDrafts.entries.removeAll { (_, draft) ->
+                updatedEvent.startTimeMs < draft.endMs && updatedEvent.endTimeMs > draft.startMs
+            }
+        }
+        if (existing != null) {
+            lastReleaseSummary = "User edit synced on ${updatedEvent.id} (rev #$releaseRevision)"
+        }
+        buildSnapshotLocked()
+    }
+
+    /**
+     * Invalidates unlocked released target translations after a language reconfiguration while
+     * preserving committed anchors, speaker identity, timing, and user-locked translations.
+     */
+    fun invalidateTargetTranslations(
+        sameLanguageResolved: Boolean,
+    ): ReleasedPlaybackSnapshot = synchronized(lock) {
+        releaseRevision++
+        releasedEventsById.keys.toList().forEach { id ->
+            val evt = releasedEventsById[id] ?: return@forEach
+            if (evt.lockedByUser && !evt.needsTranslation) return@forEach
+            releasedEventsById[id] = if (sameLanguageResolved) {
+                evt.copy(
+                    translatedText = evt.sourceText,
+                    needsTranslation = false,
+                )
+            } else {
+                evt.copy(
+                    translatedText = "",
+                    needsTranslation = true,
+                )
+            }
+        }
+        lastReleaseSummary = "Language config updated (rev #$releaseRevision)"
         buildSnapshotLocked()
     }
 

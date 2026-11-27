@@ -187,6 +187,7 @@ class SubtitlePreGenerator(
         quotaCircuitBreakerTripped: Boolean,
         onQuotaTripped: () -> Unit,
         onProgress: (SubtitlePrepState) -> Unit,
+        canContinueCloud: () -> Boolean = { true },
     ) {
         val defaultTitle = "YouTube · $videoId"
         val cacheKey = ProjectStore.canonicalYouTubeCacheKey(videoId, targetLanguage)
@@ -433,6 +434,7 @@ class SubtitlePreGenerator(
             awaitWarmAppCheckToken(forceRefresh = false, timeoutMs = 4_000L)
 
             while (true) {
+                if (!canContinueCloud()) break
                 if (fastMetaDeferred.isCompleted) {
                     val resolvedMeta = runCatching { fastMetaDeferred.getCompleted() }.getOrNull()
                     if (resolvedMeta != null) {
@@ -521,6 +523,7 @@ class SubtitlePreGenerator(
                     onDowngradedToLite = {
                         activeTier = ScoutExecutionTier.LITE_AI
                     },
+                    canInvokeProvider = { _, _, _ -> canContinueCloud() },
                 ) { sliceStart, sliceEnd, preferLite, clarifyTimestamps ->
                     translationAiService.transcribeYouTubeVideoWindow(
                         videoId = videoId,
@@ -587,6 +590,7 @@ class SubtitlePreGenerator(
                             project = ccProj,
                             quotaSaverMode = QuotaSaverMode.ZERO_CLOUD,
                             quotaCircuitBreakerTripped = true,
+                            canContinueCloud = canContinueCloud,
                             onQuotaTripped = onQuotaTripped,
                             onStatus = { msg ->
                                 onProgress(
@@ -820,6 +824,20 @@ class SubtitlePreGenerator(
                         incrementRetry = true,
                     )
                 }
+                completed.abortedRanges.forEach { (asSec, aeSec) ->
+                    ledger.recordOutcome(
+                        startMs = asSec * 1000L,
+                        endMs = minOf(workingProj.videoSource.durationMs, aeSec * 1000L),
+                        status = CoverageStatus.PENDING,
+                        source = SubtitleSourceKind.AI_DRAFT,
+                        failureReason = "HALTED_BY_POLICY",
+                        incrementRetry = false,
+                    )
+                }
+                if (completed.abortedByPolicy || !canContinueCloud()) {
+                    saveCacheEntry(workingProj, ledger.continuousVerifiedUpToMs(), ledger.intervalsSnapshot())
+                    break
+                }
                 ledger.intervalsSnapshot()
                     .filter { interval ->
                         interval.status == CoverageStatus.IN_PROGRESS &&
@@ -915,6 +933,7 @@ class SubtitlePreGenerator(
         quotaCircuitBreakerTripped: Boolean,
         onQuotaTripped: () -> Unit,
         onProgress: (SubtitlePrepState) -> Unit,
+        canContinueCloud: () -> Boolean = { true },
     ) {
         val cleanTitle = videoTitle.ifBlank { "Local Video" }
         onProgress(
@@ -956,6 +975,7 @@ class SubtitlePreGenerator(
                 project = embProj,
                 quotaSaverMode = quotaSaverMode,
                 quotaCircuitBreakerTripped = quotaCircuitBreakerTripped,
+                canContinueCloud = canContinueCloud,
                 onStatus = { msg ->
                     onProgress(
                         SubtitlePrepState.Working(
@@ -1036,6 +1056,7 @@ class SubtitlePreGenerator(
         var sequentialFallbackChunks: List<com.example.domain.analysis.AudioWavChunk>? = null
 
         for ((idx, range) in plannedRanges.withIndex()) {
+            if (!canContinueCloud()) break
             val (rangeStartMs, rangeEndMs) = range
             val chunk = audioAnalyzer.extractWavWindowForAsr(
                 uri = videoUri,
@@ -1108,6 +1129,7 @@ class SubtitlePreGenerator(
                 modelName = activeTier.modelId ?: "gemini-3.5-flash-lite",
                 maxRetries = 3,
                 onWarmToken = { awaitWarmAppCheckToken(forceRefresh = true, timeoutMs = 4_000L) },
+                shouldContinue = { canContinueCloud() },
             ) {
                 translationAiService.transcribeAndTranslateAudioDetailed(
                     wavBytes = chunk.wavBytes,
@@ -1129,6 +1151,7 @@ class SubtitlePreGenerator(
                     modelName = activeTier.modelId ?: "gemini-3.5-flash-lite",
                     maxRetries = 2,
                     onWarmToken = { awaitWarmAppCheckToken(forceRefresh = true, timeoutMs = 4_000L) },
+                    shouldContinue = { canContinueCloud() },
                 ) {
                     translationAiService.transcribeAndTranslateAudioDetailed(
                         wavBytes = chunk.wavBytes,
@@ -1144,6 +1167,9 @@ class SubtitlePreGenerator(
 
             if (chunkRes.isFailure) {
                 val err = chunkRes.exceptionOrNull()
+                if (err is ScoutHeartbeatService.ScoutExecutionGatedException) {
+                    break
+                }
                 if (TranslationAiService.isQuotaOrCreditExhaustedError(err)) {
                     onQuotaTripped()
                     if (partialProjSnapshot != null) {
@@ -1288,6 +1314,7 @@ class SubtitlePreGenerator(
         project: DialogueLensProject,
         quotaSaverMode: QuotaSaverMode,
         quotaCircuitBreakerTripped: Boolean,
+        canContinueCloud: () -> Boolean = { true },
         onQuotaTripped: () -> Unit = {},
         onStatus: (String) -> Unit,
     ): DialogueLensProject {
@@ -1312,7 +1339,7 @@ class SubtitlePreGenerator(
             }
         }
 
-        val preferCloudBestModel = quotaSaverMode == QuotaSaverMode.PRO_ACCURACY && !quotaCircuitBreakerTripped
+        val preferCloudBestModel = quotaSaverMode == QuotaSaverMode.PRO_ACCURACY && !quotaCircuitBreakerTripped && canContinueCloud()
         if (uncached.isNotEmpty() && preferCloudBestModel) {
             onStatus("Translating ${uncached.size} lines into $tgt with Gemini 3.8 Flash...")
             var batchRes = translationAiService.translateBatch(
@@ -1323,7 +1350,7 @@ class SubtitlePreGenerator(
                 glossary = project.glossary,
                 preferLiteModel = false,
             )
-            if (batchRes.isFailure && TranslationAiService.isQuotaOrCreditExhaustedError(batchRes.exceptionOrNull())) {
+            if (batchRes.isFailure && TranslationAiService.isQuotaOrCreditExhaustedError(batchRes.exceptionOrNull()) && canContinueCloud()) {
                 onStatus("Gemini 3.8 Flash credits depleted — switching to Flash-Lite...")
                 batchRes = translationAiService.translateBatch(
                     events = uncached.take(45),
@@ -1364,7 +1391,8 @@ class SubtitlePreGenerator(
         } else if (stillUncached.isNotEmpty() &&
             quotaSaverMode != QuotaSaverMode.ZERO_CLOUD &&
             !quotaCircuitBreakerTripped &&
-            !preferCloudBestModel
+            !preferCloudBestModel &&
+            canContinueCloud()
         ) {
             onStatus("Translating ${stillUncached.size} lines into $tgt...")
             val batchRes = translationAiService.translateBatch(

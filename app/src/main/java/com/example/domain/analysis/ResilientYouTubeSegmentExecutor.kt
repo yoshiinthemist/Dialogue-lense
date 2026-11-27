@@ -34,6 +34,8 @@ sealed interface SegmentExecutionOutcome {
         val invalidTimestampCount: Int = 0,
         val retryCount: Int = 0,
         val quotaFallbackTransitions: Int = 0,
+        val abortedByPolicy: Boolean = false,
+        val abortedRanges: List<Pair<Int, Int>> = emptyList(),
     ) : SegmentExecutionOutcome
 
     data class QuotaExhausted(
@@ -64,6 +66,7 @@ class ResilientYouTubeSegmentExecutor(
         initialTier: ScoutExecutionTier,
         onStatusUpdate: (String) -> Unit = {},
         onDowngradedToLite: () -> Unit = {},
+        canInvokeProvider: (sliceStartSec: Int, sliceEndSec: Int, preferLite: Boolean) -> Boolean = { _, _, _ -> true },
         transcribeWindow: suspend (winStartSec: Int, winEndSec: Int, preferLite: Boolean) -> Result<AiYouTubeTranscriptionResult>,
     ): SegmentExecutionOutcome = executeSegmentDetailed(
         startSec = startSec,
@@ -71,6 +74,7 @@ class ResilientYouTubeSegmentExecutor(
         initialTier = initialTier,
         onStatusUpdate = onStatusUpdate,
         onDowngradedToLite = onDowngradedToLite,
+        canInvokeProvider = canInvokeProvider,
     ) { winStartSec, winEndSec, preferLite, _ ->
         transcribeWindow(winStartSec, winEndSec, preferLite)
     }
@@ -81,6 +85,7 @@ class ResilientYouTubeSegmentExecutor(
         initialTier: ScoutExecutionTier,
         onStatusUpdate: (String) -> Unit = {},
         onDowngradedToLite: () -> Unit = {},
+        canInvokeProvider: (sliceStartSec: Int, sliceEndSec: Int, preferLite: Boolean) -> Boolean = { _, _, _ -> true },
         transcribeWindow: suspend (
             winStartSec: Int,
             winEndSec: Int,
@@ -95,11 +100,13 @@ class ResilientYouTubeSegmentExecutor(
         val verifiedSilentRanges = mutableListOf<Pair<Int, Int>>()
         val partialRanges = mutableListOf<Pair<Int, Int>>()
         val failedDetails = mutableListOf<FailedSliceDetail>()
+        val abortedRanges = mutableListOf<Pair<Int, Int>>()
         var activeTier = initialTier
         var downgradedToLite = initialTier == ScoutExecutionTier.LITE_AI
         var usedBisection = false
         var quotaStopError: Throwable? = null
         var hitQuotaStop = false
+        var hitPolicyStop = false
         var invalidTimestampCount = 0
         var totalRetries = 0
         var quotaTransitions = 0
@@ -126,7 +133,12 @@ class ResilientYouTubeSegmentExecutor(
         }
 
         suspend fun runSlice(sliceStart: Int, sliceEnd: Int, depth: Int) {
-            if (hitQuotaStop || sliceEnd <= sliceStart) return
+            if (hitQuotaStop || hitPolicyStop || sliceEnd <= sliceStart) return
+            if (!canInvokeProvider(sliceStart, sliceEnd, activeTier.preferLite)) {
+                hitPolicyStop = true
+                abortedRanges.add(sliceStart to sliceEnd)
+                return
+            }
             val canBisect = (sliceEnd - sliceStart) >= 20 && depth < 2
             val primaryRetries = if (canBisect) 1 else 2
             var attemptsUsed = 0
@@ -134,6 +146,7 @@ class ResilientYouTubeSegmentExecutor(
             val firstAttempt = heartbeatService.executeWithBackoffRetry(
                 modelName = activeTier.modelId ?: "gemini-3.5-flash-lite",
                 maxRetries = primaryRetries,
+                shouldContinue = { !hitQuotaStop && !hitPolicyStop && canInvokeProvider(sliceStart, sliceEnd, activeTier.preferLite) },
                 onRetryScheduled = { attempt, maxRetries, delayMs, retryErr ->
                     totalRetries++
                     val delaySec = String.format(java.util.Locale.US, "%.1f", delayMs / 1000.0)
@@ -164,6 +177,12 @@ class ResilientYouTubeSegmentExecutor(
                     res.outcome == TranscriptionOutcome.EMPTY_UNCONFIRMED
 
                 if (needsClarificationRetry && !canBisect) {
+                    if (!canInvokeProvider(sliceStart, sliceEnd, activeTier.preferLite)) {
+                        absorbSuccessPayload(res)
+                        hitPolicyStop = true
+                        abortedRanges.add(sliceStart to sliceEnd)
+                        return
+                    }
                     totalRetries++
                     attemptsUsed++
                     onStatusUpdate("Clarifying ${sliceStart}s–${sliceEnd}s timestamps (${activeTier.displayLabel})...")
@@ -225,6 +244,11 @@ class ResilientYouTubeSegmentExecutor(
             } else {
                 val err = firstAttempt.exceptionOrNull()
                 if (err is CancellationException && err !is TimeoutCancellationException) throw err
+                if (err is ScoutHeartbeatService.ScoutExecutionGatedException) {
+                    hitPolicyStop = true
+                    abortedRanges.add(sliceStart to sliceEnd)
+                    return
+                }
 
                 // Quota exhaustion -> cascade stream permanently to Flash-Lite, then Free CC trigger
                 if (TranslationAiService.isQuotaOrCreditExhaustedError(err)) {
@@ -234,9 +258,15 @@ class ResilientYouTubeSegmentExecutor(
                         quotaTransitions++
                         onDowngradedToLite()
                         onStatusUpdate("Gemini 3.8 Flash credits depleted — switching to ${activeTier.displayLabel}...")
+                        if (!canInvokeProvider(sliceStart, sliceEnd, true)) {
+                            hitPolicyStop = true
+                            abortedRanges.add(sliceStart to sliceEnd)
+                            return
+                        }
                         val liteRetry = heartbeatService.executeWithBackoffRetry(
                             modelName = activeTier.modelId ?: "gemini-3.5-flash-lite",
                             maxRetries = 1,
+                            shouldContinue = { !hitQuotaStop && !hitPolicyStop && canInvokeProvider(sliceStart, sliceEnd, true) },
                         ) {
                             attemptsUsed++
                             transcribeWindow(sliceStart, sliceEnd, true, false)
@@ -275,6 +305,11 @@ class ResilientYouTubeSegmentExecutor(
                         } else {
                             val liteErr = liteRetry.exceptionOrNull()
                             if (liteErr is CancellationException && liteErr !is TimeoutCancellationException) throw liteErr
+                            if (liteErr is ScoutHeartbeatService.ScoutExecutionGatedException) {
+                                hitPolicyStop = true
+                                abortedRanges.add(sliceStart to sliceEnd)
+                                return
+                            }
                             if (TranslationAiService.isQuotaOrCreditExhaustedError(liteErr)) {
                                 hitQuotaStop = true
                                 quotaStopError = liteErr
@@ -312,18 +347,26 @@ class ResilientYouTubeSegmentExecutor(
                 val midSec = sliceStart + ((sliceEnd - sliceStart) / 2)
                 onStatusUpdate("${activeTier.displayLabel} splitting slice (${sliceStart}s–${midSec}s, ${midSec}s–${sliceEnd}s)...")
                 runSlice(sliceStart, midSec, depth + 1)
-                if (!hitQuotaStop) {
+                if (!hitQuotaStop && !hitPolicyStop) {
                     runSlice(midSec, sliceEnd, depth + 1)
+                } else if (hitPolicyStop) {
+                    abortedRanges.add(midSec to sliceEnd)
                 }
                 return
             }
 
             // Step 2: Leaf slice (10s..19s) still unresolved on BEST_AI -> cross-model rescue on Flash-Lite
             if (activeTier == ScoutExecutionTier.BEST_AI) {
+                if (!canInvokeProvider(sliceStart, sliceEnd, true)) {
+                    hitPolicyStop = true
+                    abortedRanges.add(sliceStart to sliceEnd)
+                    return
+                }
                 onStatusUpdate("Rescuing ${sliceStart}s–${sliceEnd}s slice with Flash-Lite...")
                 val rescueAttempt = heartbeatService.executeWithBackoffRetry(
                     modelName = ScoutExecutionTier.LITE_AI.modelId ?: "gemini-3.5-flash-lite",
                     maxRetries = 1,
+                    shouldContinue = { !hitQuotaStop && !hitPolicyStop && canInvokeProvider(sliceStart, sliceEnd, true) },
                 ) {
                     attemptsUsed++
                     transcribeWindow(sliceStart, sliceEnd, true, true)
@@ -358,6 +401,11 @@ class ResilientYouTubeSegmentExecutor(
                 } else {
                     val rescueErr = rescueAttempt.exceptionOrNull()
                     if (rescueErr is CancellationException && rescueErr !is TimeoutCancellationException) throw rescueErr
+                    if (rescueErr is ScoutHeartbeatService.ScoutExecutionGatedException) {
+                        hitPolicyStop = true
+                        abortedRanges.add(sliceStart to sliceEnd)
+                        return
+                    }
                     if (TranslationAiService.isQuotaOrCreditExhaustedError(rescueErr)) {
                         hitQuotaStop = true
                         quotaStopError = rescueErr
@@ -415,6 +463,8 @@ class ResilientYouTubeSegmentExecutor(
                 invalidTimestampCount = invalidTimestampCount,
                 retryCount = totalRetries,
                 quotaFallbackTransitions = quotaTransitions,
+                abortedByPolicy = hitPolicyStop || abortedRanges.isNotEmpty(),
+                abortedRanges = abortedRanges.distinct(),
             )
         }
     }

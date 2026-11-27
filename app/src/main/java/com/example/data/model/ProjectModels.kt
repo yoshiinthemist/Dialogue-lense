@@ -518,6 +518,15 @@ enum class CaptionOriginKind(val label: String) {
     UNKNOWN("Unknown Origin"),
 }
 
+enum class YouTubeNativeCcState(val label: String) {
+    OFF("Off"),
+    LOADING("Checking"),
+    UNAVAILABLE_OR_BLOCKED("Unavailable"),
+    ENABLED_INACCESSIBLE("Protected"),
+    ENABLED_NO_CURRENT_CUE("Standby"),
+    ENABLED_ACTIVE_CUES("Active"),
+}
+
 @JsonClass(generateAdapter = true)
 data class ReferenceCaptionCue(
     val cueId: String,

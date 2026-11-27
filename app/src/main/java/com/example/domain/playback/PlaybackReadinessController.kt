@@ -159,6 +159,7 @@ class PlaybackReadinessController(
         requiresCoverageGate: Boolean,
         initialIntent: UserPlaybackIntent = UserPlaybackIntent.PAUSE,
         playbackSpeed: Float = 1.0f,
+        initialSeekGeneration: Long = 0L,
     ): PlaybackReadinessSnapshot {
         this.requiresCoverageGate = requiresCoverageGate
         this.userIntent = initialIntent
@@ -166,8 +167,9 @@ class PlaybackReadinessController(
         this.currentPositionMs = initialPositionMs.coerceAtLeast(0L)
         this.targetPositionMs = initialPositionMs.coerceAtLeast(0L)
         this.knownDurationMs = durationMs.coerceAtLeast(0L)
-        this.seekGeneration = 0L
-        this.acknowledgedSeekGeneration = 0L
+        val safeGen = initialSeekGeneration.coerceAtLeast(0L)
+        this.seekGeneration = safeGen
+        this.acknowledgedSeekGeneration = safeGen
         this.bufferingEpisodeId = 0L
         this.bufferingStartedAtEpochMs = 0L
         this.lastBufferingDurationMs = 0L
@@ -353,9 +355,11 @@ class PlaybackReadinessController(
         lastContiguousLeadMs = lead
         lastVerifiedLeadMs = ledger.continuousVerifiedLeadFrom(currentPositionMs)
 
-        // If user chose Watch Now and playback has now re-entered verified coverage, clear the temporary bypass
+        // If user chose Watch Now and playback has now re-entered released/verified coverage, clear the temporary bypass
         val bypass = activeWatchNowBypass
-        if (bypass != null && lead >= requiredInitialOrSeekLeadMs(currentPositionMs)) {
+        if (bypass != null &&
+            (lead >= requiredInitialOrSeekLeadMs(currentPositionMs) || isAtOrPastVerifiedTail(currentPositionMs, lead))
+        ) {
             activeWatchNowBypass = null
             if (state == PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE && userIntent == UserPlaybackIntent.PLAY) {
                 state = PlaybackReadinessState.PLAYING
@@ -417,6 +421,26 @@ class PlaybackReadinessController(
         lastContiguousLeadMs = lead
         lastVerifiedLeadMs = ledger.continuousVerifiedLeadFrom(evalPos)
 
+        if (state == PlaybackReadinessState.READY_TO_AUTO_RESUME && userIntent == UserPlaybackIntent.PAUSE) {
+            pendingAutoResume = null
+            state = PlaybackReadinessState.PAUSED_BY_USER
+            return snapshot()
+        }
+
+        val bypass = activeWatchNowBypass
+        if (bypass != null &&
+            (lead >= requiredInitialOrSeekLeadMs(evalPos) || isAtOrPastVerifiedTail(evalPos, lead))
+        ) {
+            activeWatchNowBypass = null
+            if (state == PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE) {
+                state = if (userIntent == UserPlaybackIntent.PLAY) {
+                    PlaybackReadinessState.PLAYING
+                } else {
+                    PlaybackReadinessState.PAUSED_BY_USER
+                }
+            }
+        }
+
         if (isBufferingState(state)) {
             val required = requiredLeadForState(state, evalPos)
             if (lead >= required || isAtOrPastVerifiedTail(evalPos, lead)) {
@@ -431,7 +455,8 @@ class PlaybackReadinessController(
                     emitAutoResumeDirective("Verified lead ready (${lead / 1000L}s)")
                     state = PlaybackReadinessState.READY_TO_AUTO_RESUME
                 } else {
-                    state = PlaybackReadinessState.READY_PAUSED
+                    pendingAutoResume = null
+                    state = PlaybackReadinessState.PAUSED_BY_USER
                 }
                 return snapshot()
             }

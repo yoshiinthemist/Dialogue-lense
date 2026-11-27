@@ -47,7 +47,7 @@ fun YouTubeEmbeddedPlayer(
     isScoutInstance: Boolean = false,
     suppressNativeCaptions: Boolean = false,
     preferredCaptionLang: String = "en",
-    onCaptionTrackStatus: (trackCount: Int, activeLang: String) -> Unit = { _, _ -> },
+    onCaptionTrackStatus: (trackCount: Int, activeLang: String, trackEnabled: Boolean, activeCuePresent: Boolean, probeBlocked: Boolean) -> Unit = { _, _, _, _, _ -> },
     onEmbedFallback: (errorCode: Int) -> Unit = {},
     onCapturedTimedTextBody: (url: String, body: String, cookies: String?, userAgent: String?) -> Unit = { _, _, _, _ -> },
     modifier: Modifier = Modifier,
@@ -255,8 +255,23 @@ fun YouTubeEmbeddedPlayer(
 
                     @JavascriptInterface
                     fun onCaptionTrackInfo(trackCount: Int, activeLang: String?) {
+                        val lang = activeLang.orEmpty()
                         mainHandler.post {
-                            latestTrackStatusCallback(trackCount, activeLang.orEmpty())
+                            latestTrackStatusCallback(trackCount, lang, trackCount > 0 && lang.isNotBlank(), false, false)
+                        }
+                    }
+
+                    @JavascriptInterface
+                    fun onCaptionTrackState(
+                        trackCount: Int,
+                        activeLang: String?,
+                        trackEnabled: Boolean,
+                        activeCuePresent: Boolean,
+                        probeBlocked: Boolean,
+                    ) {
+                        val lang = activeLang.orEmpty()
+                        mainHandler.post {
+                            latestTrackStatusCallback(trackCount, lang, trackEnabled, activeCuePresent, probeBlocked)
                         }
                     }
 
@@ -435,29 +450,59 @@ private fun buildYouTubeIframeHtml(
             var hasAppliedSoftMute = false;
             var switchedToWatchFallback = false;
 
-            var lastReportedTrackCount = -1;
+            var lastReportedTrackSig = '';
+            var hasEnsuredCaptionModule = false;
+            var pollTick = 0;
 
-            function reportNativeCaptionTracks() {
+            function reportNativeCaptionTracks(isBlocked) {
               try {
                 if (!ytPlayer || typeof ytPlayer.getOption !== 'function' || !window.DialogueLensYt) return;
                 var list = ytPlayer.getOption('captions', 'tracklist');
                 var active = ytPlayer.getOption('captions', 'track');
-                var count = Array.isArray(list) ? list.length : 0;
-                var lang = (active && active.languageCode) ? String(active.languageCode) :
-                  (Array.isArray(list) && list.length > 0 && list[0].languageCode ? String(list[0].languageCode) : '');
-                if (count !== lastReportedTrackCount) {
-                  lastReportedTrackCount = count;
-                  window.DialogueLensYt.onCaptionTrackInfo(count, lang);
+                var hasList = Array.isArray(list);
+                var count = hasList ? list.length : 0;
+                var trackEnabled = !!(active && active.languageCode);
+                var lang = trackEnabled ? String(active.languageCode) :
+                  (hasList && count > 0 && list[0].languageCode ? String(list[0].languageCode) : '');
+                var sig = (hasList ? count : -1) + '|' + lang + '|' + (trackEnabled ? '1' : '0') + '|' + (isBlocked ? '1' : '0');
+                if (sig !== lastReportedTrackSig) {
+                  lastReportedTrackSig = sig;
+                  if (typeof window.DialogueLensYt.onCaptionTrackState === 'function') {
+                    window.DialogueLensYt.onCaptionTrackState(count, lang, trackEnabled, false, !!isBlocked);
+                  } else {
+                    window.DialogueLensYt.onCaptionTrackInfo(count, lang);
+                  }
+                }
+              } catch (e) {}
+            }
+
+            function ensurePreferredCaptionTrackOnce() {
+              if (hasEnsuredCaptionModule || !ytPlayer) return;
+              hasEnsuredCaptionModule = true;
+              try {
+                if (typeof ytPlayer.loadModule === 'function') ytPlayer.loadModule('captions');
+                var list = (typeof ytPlayer.getOption === 'function') ? ytPlayer.getOption('captions', 'tracklist') : null;
+                var active = (typeof ytPlayer.getOption === 'function') ? ytPlayer.getOption('captions', 'track') : null;
+                if ((!active || !active.languageCode) && typeof ytPlayer.setOption === 'function') {
+                  var pick = '$safeLang';
+                  if (Array.isArray(list) && list.length > 0) {
+                    var exact = list.find(function(t) { return t && t.languageCode && String(t.languageCode).toLowerCase().indexOf('$safeLang') === 0; });
+                    pick = (exact && exact.languageCode) ? String(exact.languageCode) : (list[0].languageCode ? String(list[0].languageCode) : pick);
+                  }
+                  if (!suppressCc || forceScoutMute) {
+                    ytPlayer.setOption('captions', 'track', { languageCode: pick });
+                  }
                 }
               } catch (e) {}
             }
 
             function applySoftCaptionMuteOnce() {
-              if (!suppressCc || !ytPlayer || hasAppliedSoftMute) return;
+              if (!suppressCc || forceScoutMute || !ytPlayer || hasAppliedSoftMute) return;
               hasAppliedSoftMute = true;
               try {
-                // Softly clear active track so DialogueLens bubbles don't double up with YouTube captions,
-                // WITHOUT unloading the captions module so the user's CC toggle always remains functional.
+                // Report available tracks BEFORE softly clearing viewer double-caption display,
+                // so Scout telemetry never sees an artificially empty CC state.
+                reportNativeCaptionTracks(false);
                 if (typeof ytPlayer.setOption === 'function') {
                   ytPlayer.setOption('captions', 'track', {});
                 }
@@ -474,18 +519,12 @@ private fun buildYouTubeIframeHtml(
                     if (forceScoutMute && ytPlayer.getCurrentTime && ytPlayer.getCurrentTime() > 4 && ytPlayer.seekTo) {
                       ytPlayer.seekTo(0, true);
                     }
-                    if (forceScoutMute) {
-                      try {
-                        if (typeof ytPlayer.loadModule === 'function') ytPlayer.loadModule('captions');
-                        if (typeof ytPlayer.setOption === 'function') {
-                          ytPlayer.setOption('captions', 'track', { languageCode: '$safeLang' });
-                        }
-                      } catch (e) {}
-                    } else if (suppressCc) {
-                      applySoftCaptionMuteOnce();
+                    ensurePreferredCaptionTrackOnce();
+                    if (suppressCc && !forceScoutMute) {
+                      setTimeout(applySoftCaptionMuteOnce, 450);
                     }
                     if (window.DialogueLensYt) window.DialogueLensYt.onReady();
-                    setTimeout(reportNativeCaptionTracks, 900);
+                    setTimeout(function() { reportNativeCaptionTracks(false); }, 650);
                     if (pendingDesiredPlay === true && ytPlayer.playVideo) {
                       playGraceUntilMs = Date.now() + 2500;
                       ytPlayer.playVideo();
@@ -497,16 +536,21 @@ private fun buildYouTubeIframeHtml(
                     }
                     startPolling();
                   },
+                  onApiChange: function() {
+                    ensurePreferredCaptionTrackOnce();
+                    reportNativeCaptionTracks(false);
+                  },
                   onStateChange: function(ev) {
                     if (forceScoutMute && ytPlayer && ytPlayer.mute) ytPlayer.mute();
-                    if (suppressCc && !hasAppliedSoftMute) {
+                    if (suppressCc && !forceScoutMute && !hasAppliedSoftMute) {
                       applySoftCaptionMuteOnce();
                     }
-                    reportNativeCaptionTracks();
+                    reportNativeCaptionTracks(false);
                     pushState();
                   },
                   onError: function(e) {
                     var code = (e && typeof e.data === 'number' ? e.data : 0);
+                    reportNativeCaptionTracks(true);
                     if ((code === 101 || code === 150 || code === 152 || code === 153) &&
                         !switchedToWatchFallback &&
                         window.DialogueLensYt &&
@@ -551,6 +595,10 @@ private fun buildYouTubeIframeHtml(
 
             function pushState() {
               if (switchedToWatchFallback || !ytPlayer || !ytPlayer.getCurrentTime || !window.DialogueLensYt) return;
+              pollTick++;
+              if (pollTick % 20 === 0) {
+                reportNativeCaptionTracks(false);
+              }
               var curMs = Math.round((ytPlayer.getCurrentTime() || 0) * 1000);
               var durMs = Math.round((ytPlayer.getDuration ? (ytPlayer.getDuration() || 0) : 0) * 1000);
               var st = ytPlayer.getPlayerState ? ytPlayer.getPlayerState() : -1;
@@ -654,7 +702,8 @@ private fun buildYouTubeMobileWatchHookScript(
   var playGraceUntilMs = 0;
   var pendingPlay = false;
   var pendingSeekSec = null;
-  var lastReportedTracks = -1;
+  var lastReportedTrackSig = '';
+  var hasAutoEnabledMobileTrack = false;
 
   function ensureStageCss() {
     if (document.getElementById('dl-ytm-stage-css')) return;
@@ -768,6 +817,16 @@ private fun buildYouTubeMobileWatchHookScript(
     } catch (e) {}
   }
 
+  function hasVisibleDomCueText() {
+    try {
+      var segs = document.querySelectorAll('.ytp-caption-segment, .captions-text span');
+      for (var i = 0; i < segs.length; i++) {
+        if ((segs[i].textContent || '').trim().length > 0) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
   function reportTrackInfo() {
     try {
       if (!window.DialogueLensYt || !window.DialogueLensYt.onCaptionTrackInfo) return;
@@ -776,16 +835,27 @@ private fun buildYouTubeMobileWatchHookScript(
         var list = mp.getOption('captions', 'tracklist');
         var active = mp.getOption('captions', 'track');
         var count = Array.isArray(list) ? list.length : 0;
-        var lang = (active && active.languageCode) ? String(active.languageCode) :
-          (Array.isArray(list) && list.length > 0 && list[0].languageCode ? String(list[0].languageCode) : '');
-        if (count !== lastReportedTracks) {
-          lastReportedTracks = count;
-          window.DialogueLensYt.onCaptionTrackInfo(count, lang);
-        }
-        if (count > 0 && !sentTimedTextBody && typeof mp.setOption === 'function' && (!active || !active.languageCode)) {
+        var trackEnabled = !!(active && active.languageCode);
+        if (count > 0 && !trackEnabled && !hasAutoEnabledMobileTrack && typeof mp.setOption === 'function') {
+          hasAutoEnabledMobileTrack = true;
+          var fallbackLang = (list[0] && list[0].languageCode) ? String(list[0].languageCode) : 'en';
           try {
-            mp.setOption('captions', 'track', { languageCode: lang || 'en' });
+            mp.setOption('captions', 'track', { languageCode: fallbackLang });
+            active = mp.getOption('captions', 'track');
+            trackEnabled = !!(active && active.languageCode);
           } catch (e) {}
+        }
+        var lang = trackEnabled ? String(active.languageCode) :
+          (Array.isArray(list) && list.length > 0 && list[0].languageCode ? String(list[0].languageCode) : '');
+        var activeCue = hasVisibleDomCueText();
+        var sig = count + '|' + lang + '|' + (trackEnabled ? '1' : '0') + '|' + (activeCue ? '1' : '0');
+        if (sig !== lastReportedTrackSig) {
+          lastReportedTrackSig = sig;
+          if (typeof window.DialogueLensYt.onCaptionTrackState === 'function') {
+            window.DialogueLensYt.onCaptionTrackState(count, lang, trackEnabled, activeCue, false);
+          } else {
+            window.DialogueLensYt.onCaptionTrackInfo(count, lang);
+          }
         }
       }
       tryHarvestInitialPlayerCaptions();
