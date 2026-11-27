@@ -1519,6 +1519,7 @@ class SentinelWorkforceCoordinator {
     fun claimNextWork(
         workerId: String,
         nowEpochMs: Long = System.currentTimeMillis(),
+        allowedKinds: Set<SentinelTaskKind>? = null,
     ): Pair<SentinelWorkItem, IntervalReservation>? = synchronized(lock) {
         val activeCount = workers.values.count { it.isActive }
         val isWorkerAlreadyActive = workers[workerId]?.isActive == true
@@ -1533,6 +1534,9 @@ class SentinelWorkforceCoordinator {
             val item = iterator.next()
             if (item.schedulingGeneration > 0L && item.schedulingGeneration < schedulingGeneration) {
                 iterator.remove()
+                continue
+            }
+            if (allowedKinds != null && item.kind !in allowedKinds) {
                 continue
             }
             if (!isWithinActiveBoundaryLocked(item)) {

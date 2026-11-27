@@ -70,7 +70,46 @@ data class ResolvedMediaSource(
     val capabilities: MediaCapabilities,
     val isSupported: Boolean = !capabilities.isDrmRestricted && capabilities.supportsPlayback,
     val userNotice: String = capabilities.limitationSummary,
-)
+) {
+    val validYoutubeVideoId: String?
+        get() = youtubeVideoId.takeIf {
+            providerKind == MediaProviderKind.YOUTUBE_EMBED && YouTubeMediaAdapter.isValidVideoId(it)
+        }
+}
+
+sealed interface MediaActivationDecision {
+    data class Rejected(
+        val reason: String,
+        val providerName: String = "",
+        val isDrm: Boolean = false,
+    ) : MediaActivationDecision
+
+    data class YouTube(
+        val normalizedUrl: String,
+        val videoId: String,
+        val resolved: ResolvedMediaSource,
+    ) : MediaActivationDecision
+
+    data class DirectStream(
+        val normalizedUrl: String,
+        val resolved: ResolvedMediaSource,
+    ) : MediaActivationDecision
+
+    data class WebStream(
+        val normalizedUrl: String,
+        val resolved: ResolvedMediaSource,
+    ) : MediaActivationDecision
+
+    data class LocalFile(
+        val normalizedUri: String,
+        val resolved: ResolvedMediaSource,
+    ) : MediaActivationDecision
+
+    data class Demo(
+        val normalizedUri: String,
+        val resolved: ResolvedMediaSource,
+    ) : MediaActivationDecision
+}
 
 /**
  * Platform-specific media ingestion contract.
@@ -226,20 +265,64 @@ class YouTubeMediaAdapter : MediaSourceAdapter {
 
     fun extractVideoId(rawInput: String): String? {
         val trimmed = rawInput.trim()
-        if (trimmed.isBlank()) return null
-        if (trimmed.matches(Regex("^[A-Za-z0-9_-]{11}$"))) return trimmed
-        val patterns = listOf(
-            Regex("(?:youtube\\.com/watch\\?(?:[^#\\s]*&)?v=)([A-Za-z0-9_-]{11})"),
-            Regex("(?:youtu\\.be/)([A-Za-z0-9_-]{11})"),
-            Regex("(?:youtube\\.com/embed/)([A-Za-z0-9_-]{11})"),
-            Regex("(?:youtube\\.com/shorts/)([A-Za-z0-9_-]{11})"),
-            Regex("(?:youtube\\.com/live/)([A-Za-z0-9_-]{11})"),
-        )
-        for (regex in patterns) {
-            val id = regex.find(trimmed)?.groupValues?.getOrNull(1)
-            if (!id.isNullOrBlank()) return id
+        if (trimmed.isBlank() || trimmed.contains(' ')) return null
+        val lowerScheme = trimmed.lowercase(Locale.US)
+        if (lowerScheme.startsWith("content://") || lowerScheme.startsWith("file://") || lowerScheme.startsWith("demo://")) {
+            return null
         }
-        return null
+        val withScheme = if (lowerScheme.startsWith("http://") || lowerScheme.startsWith("https://")) {
+            trimmed
+        } else if (trimmed.contains('.')) {
+            "https://$trimmed"
+        } else {
+            return null
+        }
+        val uri = runCatching { URI(withScheme) }.getOrNull() ?: return null
+        val scheme = uri.scheme?.lowercase(Locale.US) ?: return null
+        if (scheme != "http" && scheme != "https") return null
+        val host = uri.host.orEmpty().lowercase(Locale.US)
+            .removePrefix("www.")
+            .removePrefix("m.")
+            .removePrefix("music.")
+            .removePrefix("gaming.")
+            .removePrefix("kids.")
+        val path = uri.path.orEmpty()
+        val segments = path.split('/').filter { it.isNotBlank() }
+
+        val candidateId = when {
+            host == "youtu.be" -> segments.firstOrNull()
+            host == "youtube.com" || host == "youtube-nocookie.com" -> {
+                val first = segments.firstOrNull()?.lowercase(Locale.US)
+                when (first) {
+                    "watch", "", null -> {
+                        val queryParamV = uri.rawQuery.orEmpty()
+                            .split('&')
+                            .firstNotNullOfOrNull { pair ->
+                                val idx = pair.indexOf('=')
+                                if (idx > 0 && pair.substring(0, idx).equals("v", ignoreCase = true)) {
+                                    pair.substring(idx + 1)
+                                } else {
+                                    null
+                                }
+                            }
+                        queryParamV ?: if (first == "watch") segments.getOrNull(1) else null
+                    }
+                    "embed", "shorts", "live", "v" -> segments.getOrNull(1)
+                    else -> null
+                }
+            }
+            else -> null
+        }
+        return candidateId?.takeIf { isValidVideoId(it) }
+    }
+
+    companion object {
+        private val VIDEO_ID_REGEX = Regex("^[A-Za-z0-9_-]{11}$")
+
+        fun isValidVideoId(candidate: String?): Boolean {
+            val clean = candidate?.trim().orEmpty()
+            return clean.length == 11 && VIDEO_ID_REGEX.matches(clean)
+        }
     }
 
     override fun canHandleInput(rawInput: String): Boolean = extractVideoId(rawInput) != null
@@ -560,6 +643,59 @@ class MediaSourceAdapterRegistry(
             }
         }
         return null
+    }
+
+    fun extractValidYouTubeId(rawInput: String): String? {
+        val resolved = resolveInput(rawInput) ?: return null
+        return resolved.validYoutubeVideoId
+    }
+
+    fun resolveForActivation(rawInput: String): MediaActivationDecision {
+        val trimmed = rawInput.trim()
+        if (trimmed.isBlank()) {
+            return MediaActivationDecision.Rejected("Enter a valid video URL or local media path.")
+        }
+        val resolved = resolveInput(trimmed)
+            ?: return MediaActivationDecision.Rejected("Enter a valid YouTube, direct stream (.mp4/.m3u8), or http(s) web video link.")
+        if (!resolved.isSupported) {
+            return MediaActivationDecision.Rejected(
+                reason = resolved.userNotice.ifBlank { "${resolved.providerName} is not supported." },
+                providerName = resolved.providerName,
+                isDrm = resolved.capabilities.isDrmRestricted,
+            )
+        }
+        return when (resolved.providerKind) {
+            MediaProviderKind.YOUTUBE_EMBED -> {
+                val vid = resolved.validYoutubeVideoId
+                    ?: return MediaActivationDecision.Rejected("Could not extract a valid YouTube video ID from that link.")
+                MediaActivationDecision.YouTube(
+                    normalizedUrl = resolved.normalizedUri,
+                    videoId = vid,
+                    resolved = resolved,
+                )
+            }
+            MediaProviderKind.DIRECT_MEDIA_URL -> MediaActivationDecision.DirectStream(
+                normalizedUrl = resolved.normalizedUri,
+                resolved = resolved,
+            )
+            MediaProviderKind.HTML5_WEB_EMBED -> MediaActivationDecision.WebStream(
+                normalizedUrl = resolved.normalizedUri,
+                resolved = resolved,
+            )
+            MediaProviderKind.LOCAL_FILE -> MediaActivationDecision.LocalFile(
+                normalizedUri = resolved.normalizedUri,
+                resolved = resolved,
+            )
+            MediaProviderKind.DEMO_SCENARIO -> MediaActivationDecision.Demo(
+                normalizedUri = resolved.normalizedUri,
+                resolved = resolved,
+            )
+            MediaProviderKind.UNSUPPORTED_DRM_PLATFORM -> MediaActivationDecision.Rejected(
+                reason = resolved.userNotice,
+                providerName = resolved.providerName,
+                isDrm = true,
+            )
+        }
     }
 
     fun adapterFor(source: VideoSource): MediaSourceAdapter {

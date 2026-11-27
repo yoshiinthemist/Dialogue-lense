@@ -51,6 +51,7 @@ fun YouTubeEmbeddedPlayer(
     onEmbedFallback: (errorCode: Int) -> Unit = {},
     onPlayerError: (errorCode: Int) -> Unit = {},
     onCapturedTimedTextBody: (url: String, body: String, cookies: String?, userAgent: String?) -> Unit = { _, _, _, _ -> },
+    onPlayCommandResult: (seq: Int, playing: Boolean, rejected: Boolean, reason: String) -> Unit = { _, _, _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     val latestCallback by rememberUpdatedState(onPlaybackState)
@@ -59,6 +60,7 @@ fun YouTubeEmbeddedPlayer(
     val latestPlayerErrorCallback by rememberUpdatedState(onPlayerError)
     val latestPreferredLang by rememberUpdatedState(preferredCaptionLang)
     val latestCapturedTimedTextCallback by rememberUpdatedState(onCapturedTimedTextBody)
+    val latestPlayCommandResultCallback by rememberUpdatedState(onPlayCommandResult)
     val seenTimedTextUrls = remember(videoId) { mutableSetOf<String>() }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var loadedVideoId by remember { mutableStateOf<String?>(null) }
@@ -89,12 +91,12 @@ fun YouTubeEmbeddedPlayer(
         val req = playRequest ?: return@LaunchedEffect
         if (!playerReady || req.first == lastHandledPlaySeq) return@LaunchedEffect
         val js = if (req.second) {
-            "(window.dlPlay ? window.dlPlay() : 'pending')"
+            "(window.dlPlay ? window.dlPlay(${req.first}) : 'pending')"
         } else {
-            "(window.dlPause ? window.dlPause() : 'pending')"
+            "(window.dlPause ? window.dlPause(${req.first}) : 'pending')"
         }
         webViewRef?.evaluateJavascript(js) { res ->
-            if (res == "\"ok\"") {
+            if (res == "\"dispatched\"") {
                 lastHandledPlaySeq = req.first
             }
         }
@@ -263,6 +265,14 @@ fun YouTubeEmbeddedPlayer(
                     @JavascriptInterface
                     fun onProgress(posMs: Long, durMs: Long, playing: Boolean) {
                         mainHandler.post { latestCallback(posMs, durMs, playing) }
+                    }
+
+                    @JavascriptInterface
+                    fun onPlayCommandResult(seq: Int, playing: Boolean, rejected: Boolean, reason: String?) {
+                        val safeReason = reason.orEmpty()
+                        mainHandler.post {
+                            latestPlayCommandResultCallback(seq, playing, rejected, safeReason)
+                        }
                     }
 
                     @JavascriptInterface
@@ -464,6 +474,7 @@ private fun buildYouTubeIframeHtml(
             var ytReady = false;
             var pollTimer = null;
             var pendingDesiredPlay = null;
+            var pendingPlayCmd = null;
             var pendingSeekSec = null;
             var forceScoutMute = $forceMuteFlag;
             var suppressCc = $initialSuppressFlag;
@@ -637,26 +648,47 @@ private fun buildYouTubeIframeHtml(
               var durMs = Math.round((ytPlayer.getDuration ? (ytPlayer.getDuration() || 0) : 0) * 1000);
               var st = ytPlayer.getPlayerState ? ytPlayer.getPlayerState() : -1;
               var playing = (st === 1);
+              if (pendingPlayCmd && window.DialogueLensYt.onPlayCommandResult) {
+                if (pendingPlayCmd.targetPlaying && playing) {
+                  var ackSeq = pendingPlayCmd.seq;
+                  pendingPlayCmd = null;
+                  window.DialogueLensYt.onPlayCommandResult(ackSeq, true, false, 'yt_state_1');
+                } else if (!pendingPlayCmd.targetPlaying && !playing && (st === 2 || st === 0 || st === 5)) {
+                  var pauseSeq = pendingPlayCmd.seq;
+                  pendingPlayCmd = null;
+                  window.DialogueLensYt.onPlayCommandResult(pauseSeq, false, false, 'yt_paused_' + st);
+                } else if (Date.now() - pendingPlayCmd.issuedAt > 3500) {
+                  var failCmd = pendingPlayCmd;
+                  pendingPlayCmd = null;
+                  window.DialogueLensYt.onPlayCommandResult(failCmd.seq, playing, true, 'yt_state_timeout_' + st);
+                }
+              }
               window.DialogueLensYt.onProgress(curMs, durMs, playing);
             }
 
-            window.dlPlay = function() {
+            window.dlPlay = function(seq) {
+              if (typeof seq === 'number' && seq > 0) {
+                pendingPlayCmd = { seq: seq, targetPlaying: true, issuedAt: Date.now() };
+              }
               if (forceScoutMute && ytPlayer && typeof ytPlayer.mute === 'function') {
                 ytPlayer.mute();
               }
               if (ytReady && ytPlayer && typeof ytPlayer.playVideo === 'function') {
                 pendingDesiredPlay = null;
                 ytPlayer.playVideo();
-                return 'ok';
+                return 'dispatched';
               }
               pendingDesiredPlay = true;
               return 'pending';
             };
-            window.dlPause = function() {
+            window.dlPause = function(seq) {
+              if (typeof seq === 'number' && seq > 0) {
+                pendingPlayCmd = { seq: seq, targetPlaying: false, issuedAt: Date.now() };
+              }
               if (ytReady && ytPlayer && typeof ytPlayer.pauseVideo === 'function') {
                 pendingDesiredPlay = null;
                 ytPlayer.pauseVideo();
-                return 'ok';
+                return 'dispatched';
               }
               pendingDesiredPlay = false;
               return 'pending';
@@ -721,6 +753,7 @@ private fun buildYouTubeMobileWatchHookScript(
   window.__dlYtmHookInstalled = true;
   var notifiedReady = false;
   var pendingPlay = false;
+  var pendingPlayCmd = null;
   var pendingSeekSec = null;
   var lastReportedTrackSig = '';
   var hasAutoEnabledMobileTrack = false;
@@ -882,14 +915,27 @@ private fun buildYouTubeMobileWatchHookScript(
     } catch (e) {}
   }
 
-  function kickVideoPlay(v) {
+  function kickVideoPlay(v, seq) {
     if (!v) return;
     v.muted = forceScoutMute || desiredMuted;
     if (typeof v.play === 'function') {
       var pr = v.play();
-      if (pr && typeof pr.catch === 'function') {
-        pr.catch(function() {
-          // If browser required muted kickstart, retry muted briefly
+      if (pr && typeof pr.then === 'function') {
+        pr.then(function() {
+          if (pendingPlayCmd && pendingPlayCmd.targetPlaying && !v.paused && !v.ended && v.readyState >= 2 &&
+              window.DialogueLensYt && window.DialogueLensYt.onPlayCommandResult) {
+            var ackSeq = pendingPlayCmd.seq;
+            pendingPlayCmd = null;
+            window.DialogueLensYt.onPlayCommandResult(ackSeq, true, false, 'ytm_promise_resolved');
+          }
+        }).catch(function(err) {
+          var errName = String(err && err.name ? err.name : 'PlayRejected');
+          if (pendingPlayCmd && pendingPlayCmd.targetPlaying &&
+              window.DialogueLensYt && window.DialogueLensYt.onPlayCommandResult) {
+            var rejSeq = pendingPlayCmd.seq;
+            pendingPlayCmd = null;
+            window.DialogueLensYt.onPlayCommandResult(rejSeq, false, true, errName);
+          }
           try {
             var btn = document.querySelector('.ytp-large-play-button, .player-control-play-pause-icon, button[aria-label*="Play"]');
             if (btn) btn.click();
@@ -899,22 +945,33 @@ private fun buildYouTubeMobileWatchHookScript(
     }
   }
 
-  window.dlPlay = function() {
+  window.dlPlay = function(seq) {
+    if (typeof seq === 'number' && seq > 0) {
+      pendingPlayCmd = { seq: seq, targetPlaying: true, issuedAt: Date.now() };
+    }
     var v = findVideo();
     if (v) {
       pendingPlay = false;
-      kickVideoPlay(v);
-      return 'ok';
+      kickVideoPlay(v, seq);
+      return 'dispatched';
     }
     pendingPlay = true;
     return 'pending';
   };
-  window.dlPause = function() {
+  window.dlPause = function(seq) {
+    if (typeof seq === 'number' && seq > 0) {
+      pendingPlayCmd = { seq: seq, targetPlaying: false, issuedAt: Date.now() };
+    }
     pendingPlay = false;
     var v = findVideo();
     if (v && typeof v.pause === 'function') {
       v.pause();
-      return 'ok';
+      if (typeof seq === 'number' && seq > 0 && v.paused &&
+          window.DialogueLensYt && window.DialogueLensYt.onPlayCommandResult) {
+        pendingPlayCmd = null;
+        window.DialogueLensYt.onPlayCommandResult(seq, false, false, 'ytm_paused');
+      }
+      return 'dispatched';
     }
     return 'pending';
   };
@@ -986,6 +1043,21 @@ private fun buildYouTubeMobileWatchHookScript(
     var curMs = Math.round((v.currentTime || 0) * 1000);
     var durMs = (isFinite(v.duration) && v.duration > 0) ? Math.round(v.duration * 1000) : 0;
     var playing = (!v.paused && !v.ended && v.readyState >= 3);
+    if (pendingPlayCmd && window.DialogueLensYt.onPlayCommandResult) {
+      if (pendingPlayCmd.targetPlaying && playing) {
+        var ackSeq = pendingPlayCmd.seq;
+        pendingPlayCmd = null;
+        window.DialogueLensYt.onPlayCommandResult(ackSeq, true, false, 'ytm_playing');
+      } else if (!pendingPlayCmd.targetPlaying && v.paused) {
+        var pSeq = pendingPlayCmd.seq;
+        pendingPlayCmd = null;
+        window.DialogueLensYt.onPlayCommandResult(pSeq, false, false, 'ytm_paused');
+      } else if (Date.now() - pendingPlayCmd.issuedAt > 3500) {
+        var tout = pendingPlayCmd;
+        pendingPlayCmd = null;
+        window.DialogueLensYt.onPlayCommandResult(tout.seq, playing, true, 'ytm_timeout');
+      }
+    }
     window.DialogueLensYt.onProgress(curMs, durMs, playing);
   }, 50);
 })();

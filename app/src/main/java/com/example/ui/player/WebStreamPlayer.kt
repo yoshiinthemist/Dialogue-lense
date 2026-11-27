@@ -64,6 +64,7 @@ class WebStreamSessionHolder {
     internal var lastEarlyInjectAtMs: Long = 0L
 
     internal var playbackCallback: (Long, Long, Boolean) -> Unit = { _, _, _ -> }
+    internal var playResultCallback: (Int, Boolean, Boolean, String) -> Unit = { _, _, _, _ -> }
     internal var captionsCallback: (String) -> Unit = {}
     internal var mediaUrlCallback: (String) -> Unit = {}
     internal var sniffedMediaCallback: (SniffedWebMediaStream) -> Unit = {}
@@ -71,6 +72,7 @@ class WebStreamSessionHolder {
     internal var captureDiagnosticsCallback: (ScoutCaptureDiagnostics) -> Unit = {}
     internal var metadataCallback: (String, String, String) -> Unit = { _, _, _ -> }
     internal var navStateCallback: (WebNavigationState) -> Unit = {}
+    internal var activeDocGeneration: Long = 1L
 
     fun activeAllowedHostsSnapshot(nowMs: Long = SystemClock.elapsedRealtime()): Set<String> {
         temporarilyAllowedHosts.entries.removeAll { it.value < nowMs }
@@ -126,6 +128,7 @@ fun WebStreamPlayer(
     playRequest: Pair<Int, Boolean>? = null,
     seekRequest: Pair<Int, Long>?,
     onPlaybackState: (positionMs: Long, durationMs: Long, isPlaying: Boolean) -> Unit,
+    onPlayCommandResult: (seq: Int, playing: Boolean, rejected: Boolean, reason: String) -> Unit = { _, _, _, _ -> },
     onCapturedCaptions: (cuesJson: String) -> Unit,
     isScoutInstance: Boolean = false,
     isolateVideoInViewport: Boolean = true,
@@ -146,6 +149,7 @@ fun WebStreamPlayer(
     val latestSeedUrl by rememberUpdatedState(webUrl)
     holder.isolateVideoInViewport = isolateVideoInViewport
     holder.playbackCallback = onPlaybackState
+    holder.playResultCallback = onPlayCommandResult
     holder.captionsCallback = onCapturedCaptions
     holder.mediaUrlCallback = onDirectMediaUrl
     holder.sniffedMediaCallback = onSniffedMediaStream
@@ -174,9 +178,16 @@ fun WebStreamPlayer(
     LaunchedEffect(playRequest, holder.bridgeReady) {
         val req = playRequest ?: return@LaunchedEffect
         if (!holder.bridgeReady || req.first == holder.lastHandledPlaySeq) return@LaunchedEffect
-        holder.lastHandledPlaySeq = req.first
-        val js = if (req.second) "window.dlWebPlay && window.dlWebPlay();" else "window.dlWebPause && window.dlWebPause();"
-        holder.webView?.evaluateJavascript(js, null)
+        val js = if (req.second) {
+            "(window.dlWebPlay ? window.dlWebPlay(${req.first}) : 'pending')"
+        } else {
+            "(window.dlWebPause ? window.dlWebPause(${req.first}) : 'pending')"
+        }
+        holder.webView?.evaluateJavascript(js) { res ->
+            if (res == "\"dispatched\"") {
+                holder.lastHandledPlaySeq = req.first
+            }
+        }
     }
 
     LaunchedEffect(effectiveMuted, holder.bridgeReady) {
@@ -357,6 +368,23 @@ private fun createGuardedWebView(
             fun onProgress(posMs: Long, durMs: Long, playing: Boolean) {
                 if (posMs < 0L || durMs < 0L) return
                 mainHandler.post { holder.playbackCallback(posMs, durMs, playing) }
+            }
+
+            @JavascriptInterface
+            fun onProgressWithGen(posMs: Long, durMs: Long, playing: Boolean, docGen: Long) {
+                if (posMs < 0L || durMs < 0L) return
+                mainHandler.post {
+                    if (docGen > 0L && docGen < holder.activeDocGeneration) return@post
+                    holder.playbackCallback(posMs, durMs, playing)
+                }
+            }
+
+            @JavascriptInterface
+            fun onPlayCommandResult(seq: Int, playing: Boolean, rejected: Boolean, reason: String?) {
+                val safeReason = reason.orEmpty()
+                mainHandler.post {
+                    holder.playResultCallback(seq, playing, rejected, safeReason)
+                }
             }
 
             @JavascriptInterface
@@ -586,7 +614,7 @@ private fun createGuardedWebView(
             }
         }
 
-        fun injectGuardScript(view: WebView?) {
+        fun injectGuardScript(view: WebView?, docGeneration: Long = holder.activeDocGeneration) {
             if (view == null) return
             val seedDomain = WebNavigationGuard.registrableDomain(
                 WebNavigationGuard.extractHost(seedUrlProvider())
@@ -597,6 +625,7 @@ private fun createGuardedWebView(
                     seedDomain = seedDomain,
                     initialIsolate = holder.isolateVideoInViewport,
                     initialAllowedHosts = holder.activeAllowedHostsSnapshot(),
+                    expectedDocGeneration = docGeneration,
                 ),
                 null,
             )
@@ -744,11 +773,14 @@ private fun createGuardedWebView(
                     recoverFromBlockedTopFrame(view, decision.targetUrl, decision.host)
                     return
                 }
+                holder.activeDocGeneration += 1L
+                holder.lastHandledPlaySeq = 0
+                holder.lastHandledSeekSeq = 0
                 if (cleanUrl.startsWith("http", ignoreCase = true) && !WebNavigationGuard.isLikelyRedirectorUrl(cleanUrl)) {
                     holder.lastCleanVideoUrl = cleanUrl
                 }
                 // Inject anti-popup & overlay guard immediately on page start so early Play taps are already protected
-                injectGuardScript(view)
+                injectGuardScript(view, holder.activeDocGeneration)
                 val adHost = WebNavigationGuard.isKnownAdOrPromoHost(host, cleanUrl)
                 mainHandler.post {
                     updateNavState { cur ->
@@ -805,7 +837,8 @@ private fun createGuardedWebView(
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                injectGuardScript(view)
+                runCatching { CookieManager.getInstance().flush() }
+                injectGuardScript(view, holder.activeDocGeneration)
                 holder.bridgeReady = true
                 val cleanUrl = url.orEmpty()
                 val host = WebNavigationGuard.extractHost(cleanUrl)
@@ -825,11 +858,12 @@ private fun createGuardedWebView(
     }
 }
 
-private fun buildWebStreamHookScript(
+internal fun buildWebStreamHookScript(
     isScoutInstance: Boolean,
     seedDomain: String,
     initialIsolate: Boolean,
     initialAllowedHosts: Set<String> = emptySet(),
+    expectedDocGeneration: Long = 1L,
 ): String {
     val safeSeedDomain = seedDomain.replace("'", "")
     val allowedJson = org.json.JSONArray(initialAllowedHosts.toList()).toString()
@@ -838,6 +872,7 @@ private fun buildWebStreamHookScript(
   var isScout = ${if (isScoutInstance) "true" else "false"};
   var seedDomain = '$safeSeedDomain';
   window.__dlAllowedHosts = $allowedJson;
+  window.__dlDocGeneration = $expectedDocGeneration;
   window.dlUpdateAllowedHosts = function(hosts) {
     if (Array.isArray(hosts)) {
       window.__dlAllowedHosts = hosts.map(function(x) { return String(x || '').toLowerCase(); });
@@ -850,15 +885,15 @@ private fun buildWebStreamHookScript(
     return;
   }
   window.__dlWebHookInstalled = true;
-  window.__dlHookVersion = 4;
+  window.__dlHookVersion = 5;
   window.__dlLastTrackSig = '';
   window.__dlLastDirectSrc = '';
   window.__dlLastMetaSig = '';
   window.__dlLastNavSig = '';
-  window.__dlPlayGraceUntil = 0;
   window.__dlElemSeq = 0;
-  window.__dlDocGeneration = (window.__dlDocGeneration || 0) + 1;
   window.__dlSelectedElementId = '';
+  window.__dlCommittedElementId = '';
+  window.__dlPendingPlayCmd = null;
   window.__dlLastDiagKey = '';
   window.__dlCapState = window.__dlCapState || {
     active: false,
@@ -868,6 +903,8 @@ private fun buildWebStreamHookScript(
     recSeq: 0,
     elementId: '',
     sliceStartMs: 0,
+    pendingSeekTargetSec: -1,
+    awaitingSeekSettle: false,
     seekDirty: false,
     droppedGapCount: 0,
     discontinuityNext: false,
@@ -949,6 +986,30 @@ private fun buildWebStreamHookScript(
     return false;
   }
 
+  function isConsentOrInterstitialControl(el) {
+    if (!el) return false;
+    var tag = (el.tagName || '').toLowerCase();
+    var role = (el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+    var isCtrl = tag === 'button' || role === 'button' ||
+      (tag === 'a' && !isOffsiteAdHref(el.getAttribute('href'))) ||
+      (tag === 'input' && ((el.type || '').toLowerCase() === 'button' || (el.type || '').toLowerCase() === 'submit'));
+    var label = (((el.innerText || '') + ' ' + (el.getAttribute && (el.getAttribute('aria-label') || '') || ''))).toLowerCase().trim();
+    if (!label && el.querySelector) {
+      var childBtn = el.querySelector('button, [role="button"], input[type="button"], input[type="submit"]');
+      if (childBtn) return true;
+    }
+    var hasConsentWord = label.indexOf('continue') >= 0 ||
+      label.indexOf('watch') >= 0 ||
+      label.indexOf('enter') >= 0 ||
+      label.indexOf('agree') >= 0 ||
+      label.indexOf('confirm') >= 0 ||
+      label.indexOf('18+') >= 0 ||
+      label.indexOf('proceed') >= 0 ||
+      label.indexOf('accept') >= 0 ||
+      label.indexOf('yes') >= 0;
+    return isCtrl && hasConsentWord;
+  }
+
   function neutralizeClickShields(video) {
     if (!video) return;
     try {
@@ -958,6 +1019,7 @@ private fun buildWebStreamHookScript(
       for (var i = 0; i < Math.min(els.length, 100); i++) {
         var el = els[i];
         if (!el || el === video || el.contains(video) || video.contains(el)) continue;
+        if (isConsentOrInterstitialControl(el)) continue;
         var st = window.getComputedStyle(el);
         if (!st || st.display === 'none' || st.visibility === 'hidden' || st.pointerEvents === 'none') continue;
         var r = el.getBoundingClientRect();
@@ -984,6 +1046,7 @@ private fun buildWebStreamHookScript(
       for (var i = 0; i < Math.min(candidates.length, 120); i++) {
         var el = candidates[i];
         if (!el || (primaryVideo && (el === primaryVideo || el.contains(primaryVideo) || primaryVideo.contains(el)))) continue;
+        if (isConsentOrInterstitialControl(el)) continue;
         if (el.dataset && el.dataset.dlPromoHidden === '1') continue;
         var txt = ((el.innerText || '') + ' ' + (el.className || '') + ' ' + (el.id || '')).toLowerCase().slice(0, 500);
         var isCamPromo = txt.indexOf('stripchat') >= 0 ||
@@ -1194,7 +1257,7 @@ private fun buildWebStreamHookScript(
     return score;
   }
 
-  function findPrimaryVideo() {
+  function collectAllVideos() {
     var vids = Array.prototype.slice.call(document.querySelectorAll('video'));
     var frames = document.querySelectorAll('iframe');
     for (var i = 0; i < frames.length; i++) {
@@ -1206,7 +1269,35 @@ private fun buildWebStreamHookScript(
         }
       } catch (e) {}
     }
-    if (!vids.length) return null;
+    return vids;
+  }
+
+  function findVideoByElementId(vids, id) {
+    if (!id) return null;
+    for (var i = 0; i < vids.length; i++) {
+      if (vids[i] && vids[i].dataset && vids[i].dataset.dlElementId === id) {
+        return vids[i];
+      }
+    }
+    return null;
+  }
+
+  function findPrimaryVideo() {
+    var vids = collectAllVideos();
+    if (!vids.length) {
+      window.__dlCommittedElementId = '';
+      return null;
+    }
+    if (window.__dlCommittedElementId) {
+      var committed = findVideoByElementId(vids, window.__dlCommittedElementId);
+      var unrecoverablyDead = !committed || !committed.isConnected ||
+        (committed.error != null && committed.networkState === 3 && !committed.currentSrc);
+      if (!unrecoverablyDead) {
+        window.__dlSelectedElementId = window.__dlCommittedElementId;
+        return committed;
+      }
+      window.__dlCommittedElementId = '';
+    }
     vids.sort(function(a, b) {
       return scoreVideoCandidate(b) - scoreVideoCandidate(a);
     });
@@ -1215,7 +1306,9 @@ private fun buildWebStreamHookScript(
     var r = top.getBoundingClientRect();
     var usable = (r.width >= 60 && r.height >= 40) || !top.paused || (isFinite(top.duration) && top.duration > 0);
     if (usable) {
-      window.__dlSelectedElementId = ensureVideoElementId(top);
+      var id = ensureVideoElementId(top);
+      window.__dlSelectedElementId = id;
+      window.__dlCommittedElementId = id;
     }
     return usable ? top : null;
   }
@@ -1399,7 +1492,13 @@ private fun buildWebStreamHookScript(
       st.discontinuityNext = false;
 
       st.onSeeked = function() {
-        st.sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+        var curSec = Number(video.currentTime || 0);
+        if (st.awaitingSeekSettle && st.pendingSeekTargetSec >= 0 && Math.abs(curSec - st.pendingSeekTargetSec) > 1.5) {
+          return;
+        }
+        st.awaitingSeekSettle = false;
+        st.pendingSeekTargetSec = -1;
+        st.sliceStartMs = Math.max(0, Math.round(curSec * 1000));
         st.seekDirty = true;
         st.discontinuityNext = true;
         if (st.rec && st.rec.state === 'recording') {
@@ -1437,7 +1536,7 @@ private fun buildWebStreamHookScript(
               st.timerId = null;
             }
             var curEndMs = Math.max(capturedStart + 350, Math.round((video.currentTime || 0) * 1000));
-            if (st.seekDirty) {
+            if (st.seekDirty || st.awaitingSeekSettle) {
               st.seekDirty = false;
               st.sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
               if (st.active && !video.paused && !video.ended) runStandaloneClip();
@@ -1450,6 +1549,7 @@ private fun buildWebStreamHookScript(
               st.discontinuityNext = false;
               var reader = new FileReader();
               reader.onloadend = function() {
+                if (st.seekDirty || st.awaitingSeekSettle) return;
                 var res = reader.result || '';
                 var comma = res.indexOf(',');
                 if (comma > 0) {
@@ -1546,9 +1646,26 @@ private fun buildWebStreamHookScript(
     }
     var curMs = Math.round((v.currentTime || 0) * 1000);
     var durMs = (isFinite(v.duration) && v.duration > 0) ? Math.round(v.duration * 1000) : 0;
-    var playing = (!v.paused && !v.ended) || (Date.now() < window.__dlPlayGraceUntil && !v.ended);
+    var playing = (!v.paused && !v.ended && v.readyState >= 2);
+    if (window.__dlPendingPlayCmd && window.DialogueLensWeb.onPlayCommandResult) {
+      var pcmd = window.__dlPendingPlayCmd;
+      if (pcmd.targetPlaying && playing) {
+        window.__dlPendingPlayCmd = null;
+        try { window.DialogueLensWeb.onPlayCommandResult(pcmd.seq, true, false, 'web_playing'); } catch (e) {}
+      } else if (!pcmd.targetPlaying && v.paused) {
+        window.__dlPendingPlayCmd = null;
+        try { window.DialogueLensWeb.onPlayCommandResult(pcmd.seq, false, false, 'web_paused'); } catch (e) {}
+      } else if (Date.now() - pcmd.issuedAt > 3500) {
+        window.__dlPendingPlayCmd = null;
+        try { window.DialogueLensWeb.onPlayCommandResult(pcmd.seq, playing, true, 'web_play_timeout'); } catch (e) {}
+      }
+    }
     try {
-      window.DialogueLensWeb.onProgress(curMs, durMs, playing);
+      if (typeof window.DialogueLensWeb.onProgressWithGen === 'function') {
+        window.DialogueLensWeb.onProgressWithGen(curMs, durMs, playing, Number(window.__dlDocGeneration || 1));
+      } else {
+        window.DialogueLensWeb.onProgress(curMs, durMs, playing);
+      }
     } catch (err) {}
     harvestTextTracks(v);
     reportDirectSrc(v);
@@ -1561,21 +1678,50 @@ private fun buildWebStreamHookScript(
   reportPageMetadata();
   setInterval(syncCycle, 80);
 
-  window.dlWebPlay = function() {
-    window.__dlPlayGraceUntil = Date.now() + 2000;
+  window.dlWebPlay = function(seq) {
+    if (typeof seq === 'number' && seq > 0) {
+      window.__dlPendingPlayCmd = { seq: seq, targetPlaying: true, issuedAt: Date.now() };
+    }
     var v = findPrimaryVideo();
-    if (v) {
-      if (isScout) { v.muted = true; v.volume = 0; }
-      if (v.play) {
-        var p = v.play();
-        if (p && p.catch) p.catch(function() {});
+    if (!v) return 'pending';
+    if (isScout) { v.muted = true; v.volume = 0; }
+    if (v.play) {
+      var p = v.play();
+      if (p && typeof p.then === 'function') {
+        p.then(function() {
+          if (window.__dlPendingPlayCmd && window.__dlPendingPlayCmd.targetPlaying &&
+              !v.paused && !v.ended && v.readyState >= 2 &&
+              window.DialogueLensWeb && window.DialogueLensWeb.onPlayCommandResult) {
+            var ackSeq = window.__dlPendingPlayCmd.seq;
+            window.__dlPendingPlayCmd = null;
+            window.DialogueLensWeb.onPlayCommandResult(ackSeq, true, false, 'web_promise_resolved');
+          }
+        }).catch(function(err) {
+          var reason = String(err && err.name ? err.name : 'PlayRejected');
+          if (window.__dlPendingPlayCmd && window.__dlPendingPlayCmd.targetPlaying &&
+              window.DialogueLensWeb && window.DialogueLensWeb.onPlayCommandResult) {
+            var rejSeq = window.__dlPendingPlayCmd.seq;
+            window.__dlPendingPlayCmd = null;
+            window.DialogueLensWeb.onPlayCommandResult(rejSeq, false, true, reason);
+          }
+        });
       }
     }
+    return 'dispatched';
   };
-  window.dlWebPause = function() {
-    window.__dlPlayGraceUntil = 0;
+  window.dlWebPause = function(seq) {
+    if (typeof seq === 'number' && seq > 0) {
+      window.__dlPendingPlayCmd = { seq: seq, targetPlaying: false, issuedAt: Date.now() };
+    }
     var v = findPrimaryVideo();
-    if (v && v.pause) v.pause();
+    if (!v) return 'pending';
+    if (v.pause) v.pause();
+    if (typeof seq === 'number' && seq > 0 && v.paused &&
+        window.DialogueLensWeb && window.DialogueLensWeb.onPlayCommandResult) {
+      window.__dlPendingPlayCmd = null;
+      window.DialogueLensWeb.onPlayCommandResult(seq, false, false, 'web_paused');
+    }
+    return 'dispatched';
   };
   window.dlWebMute = function() { var v = findPrimaryVideo(); if (v) v.muted = true; };
   window.dlWebUnmute = function() {
@@ -1584,7 +1730,29 @@ private fun buildWebStreamHookScript(
     if (v) v.muted = false;
   };
   window.dlWebRate = function(r) { var v = findPrimaryVideo(); if (v) v.playbackRate = r; };
-  window.dlWebSeek = function(sec) { var v = findPrimaryVideo(); if (v) v.currentTime = sec; };
+  window.dlWebSeek = function(sec) {
+    var v = findPrimaryVideo();
+    if (!v || !isFinite(sec)) return false;
+    var st = window.__dlCapState;
+    if (st) {
+      st.pendingSeekTargetSec = sec;
+      st.awaitingSeekSettle = true;
+      st.seekDirty = true;
+      st.discontinuityNext = true;
+      if (st.rec && st.rec.state === 'recording') {
+        try { st.rec.stop(); } catch (e) {}
+      }
+    }
+    if (v.seekable && v.seekable.length > 0) {
+      var minS = v.seekable.start(0);
+      var maxS = v.seekable.end(v.seekable.length - 1);
+      if (isFinite(maxS) && maxS > minS && sec > maxS + 3) {
+        sec = maxS;
+      }
+    }
+    v.currentTime = Math.max(0, sec);
+    return true;
+  };
 })();
 """.trimIndent()
 }

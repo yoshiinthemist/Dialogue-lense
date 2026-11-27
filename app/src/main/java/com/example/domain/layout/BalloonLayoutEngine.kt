@@ -85,6 +85,7 @@ class BalloonLayoutEngine {
     private val lastTailWasLiveTracked = mutableMapOf<String, Boolean>()
     private val canonicalKeyByEventId = mutableMapOf<String, String>()
     private val timelineMatcher = SubtitleTimelineMatcher()
+    val lastTailSuppressionReasons: MutableMap<String, String> = mutableMapOf()
 
     private var cachedEventsRef: List<DialogueEvent>? = null
     private var cachedOrdinals: Map<String, Int> = emptyMap()
@@ -100,8 +101,20 @@ class BalloonLayoutEngine {
         recentLiveFacesByShot.clear()
         lastTailWasLiveTracked.clear()
         canonicalKeyByEventId.clear()
+        lastTailSuppressionReasons.clear()
         lastActiveEventKeys = emptySet()
         timelineMatcher.reset()
+    }
+
+    private fun recordTailSuppression(cueKey: String, reason: String?) {
+        if (reason == null) {
+            lastTailSuppressionReasons.remove(cueKey)
+        } else {
+            val prev = lastTailSuppressionReasons.put(cueKey, reason)
+            if (prev != reason) {
+                runCatching { android.util.Log.d("DialogueLensTail", "Tail suppressed [$cueKey]: $reason") }
+            }
+        }
     }
 
     /**
@@ -544,9 +557,11 @@ class BalloonLayoutEngine {
                 } else {
                     event.avoidBoxes
                 }
-                val calmTailUnobstructed = rawCalmTail != null &&
-                    isOnScreenAimTarget(rawCalmTail) &&
-                    !isShortDrawnTailObstructed(stableRect, rawCalmTail, bystanderCalm)
+                val rawCalmTargetOnScreen = rawCalmTail != null && isOnScreenAimTarget(rawCalmTail)
+                val calmTailObstructed = rawCalmTail != null &&
+                    rawCalmTargetOnScreen &&
+                    isShortDrawnTailObstructed(stableRect, rawCalmTail, bystanderCalm)
+                val calmTailUnobstructed = rawCalmTail != null && rawCalmTargetOnScreen && !calmTailObstructed
                 val stableTail = if (effectiveShowTails && calmTailUnobstructed) {
                     applyTailTargetSmoothing(
                         eventId = cueKey,
@@ -558,6 +573,20 @@ class BalloonLayoutEngine {
                 } else {
                     null
                 }
+                recordTailSuppression(
+                    cueKey,
+                    when {
+                        stableTail != null -> null
+                        !effectiveShowTails -> "MODE_TAILLESS"
+                        isUnknown -> "UNKNOWN_SPEAKER"
+                        liveFrameObservedEmpty -> "LIVE_FRAME_EMPTY"
+                        event.confidenceTier == ConfidenceTier.LOW -> "LOW_CONFIDENCE"
+                        rawCalmTail == null -> "NO_MOUTH_TARGET"
+                        !rawCalmTargetOnScreen -> "OFF_SCREEN_AIM"
+                        calmTailObstructed -> "OBSTRUCTED_BY_BYSTANDER"
+                        else -> "TAIL_SUPPRESSED"
+                    }
+                )
                 val emphasis = resolveEmphasis(event)
                 results.add(
                     PlacedBalloon(
@@ -949,7 +978,8 @@ class BalloonLayoutEngine {
                 }
                 val rawMouthY = targetY.coerceIn(0.14f, 0.78f)
                 val rawTailCandidate = NormalizedPoint(targetX, rawMouthY)
-                val tailObstructedByBystander = !isOnScreenAimTarget(rawTailCandidate) ||
+                val aimOnScreen = isOnScreenAimTarget(rawTailCandidate)
+                val tailObstructedByBystander = !aimOnScreen ||
                     isShortDrawnTailObstructed(finalRect, rawTailCandidate, bystanderAvoidBoxes)
                 val resolvedTailRaw = if (!effectiveShowTails) {
                     null
@@ -972,6 +1002,18 @@ class BalloonLayoutEngine {
                         hasLiveFaceTracking = liveFaces.isNotEmpty(),
                     )
                 }
+                recordTailSuppression(
+                    cueKey,
+                    when {
+                        tailPt != null -> null
+                        !effectiveShowTails -> "MODE_TAILLESS"
+                        isUnknown -> "UNKNOWN_SPEAKER"
+                        liveFrameObservedEmpty -> "LIVE_FRAME_EMPTY"
+                        !aimOnScreen -> "OFF_SCREEN_AIM"
+                        tailObstructedByBystander -> "OBSTRUCTED_BY_BYSTANDER"
+                        else -> "HYSTERESIS_HOLD"
+                    }
+                )
                 occupiedBalloonRects.add(finalRect)
                 val emphasis = resolveEmphasis(event)
                 results.add(
@@ -1029,6 +1071,7 @@ class BalloonLayoutEngine {
                             stabilityDiagnostics.recordTrackingDropout()
                         }
                         occupiedBalloonRects.add(heldRect)
+                        recordTailSuppression(cueKey, "DROPOUT_GRACE_HOLD")
                         val emphasis = resolveEmphasis(event)
                         results.add(
                             PlacedBalloon(
@@ -1063,6 +1106,16 @@ class BalloonLayoutEngine {
                     hasMultipleSpeakers = project.speakers.size >= 2,
                 )
                 occupiedBalloonRects.add(neutralRect)
+                recordTailSuppression(
+                    cueKey,
+                    when {
+                        !effectiveShowTails -> "MODE_TAILLESS"
+                        event.confidenceTier == ConfidenceTier.LOW -> "LOW_CONFIDENCE"
+                        isUnknown -> "UNKNOWN_SPEAKER"
+                        liveFrameObservedEmpty -> "LIVE_FRAME_EMPTY"
+                        else -> "NO_MOUTH_TARGET"
+                    }
+                )
                 val emphasis = resolveEmphasis(event)
                 results.add(
                     PlacedBalloon(
@@ -1210,7 +1263,8 @@ class BalloonLayoutEngine {
 
             val finalRect = centeredRect(committedCenter.x, committedCenter.y, estWidth, estHeight)
             val rawMouthPt = computeMouthPoint(matchedSample)
-            val tailObstructedByBystander = !isOnScreenAimTarget(rawMouthPt) ||
+            val rawAimOnScreen = isOnScreenAimTarget(rawMouthPt)
+            val tailObstructedByBystander = !rawAimOnScreen ||
                 isShortDrawnTailObstructed(finalRect, rawMouthPt, bystanderFaces)
             val resolvedMouthPt = if (!effectiveShowTails || tailObstructedByBystander) {
                 null
@@ -1233,6 +1287,18 @@ class BalloonLayoutEngine {
                     hasLiveFaceTracking = liveFaces.isNotEmpty(),
                 )
             }
+            recordTailSuppression(
+                cueKey,
+                when {
+                    mouthTarget != null -> null
+                    !effectiveShowTails -> "MODE_TAILLESS"
+                    isUnknown -> "UNKNOWN_SPEAKER"
+                    liveFrameObservedEmpty -> "LIVE_FRAME_EMPTY"
+                    !rawAimOnScreen -> "OFF_SCREEN_AIM"
+                    tailObstructedByBystander -> "OBSTRUCTED_BY_BYSTANDER"
+                    else -> "HYSTERESIS_HOLD"
+                }
+            )
             occupiedBalloonRects.add(finalRect)
 
             val emphasis = resolveEmphasis(event)
@@ -1909,16 +1975,16 @@ class BalloonLayoutEngine {
         pt.x in 0.01f..0.99f && pt.y in 0.01f..0.99f
 
     /**
-     * Evaluates obstruction against the actual drawn short pointer (~0.055 normalized units from
-     * the bubble's perimeter edge toward [aimTarget]), NEVER an imaginary full connector across
-     * the scene (R09). A distant on-screen mouth remains an aim target unless the drawn short
-     * pointer itself intersects a bystander or face obstacle.
+     * Evaluates obstruction against the actual drawn short pointer (computed via [TailGeometry]
+     * from the bubble's perimeter edge toward [aimTarget], capped at 18.dp), NEVER an imaginary
+     * full connector across the scene (R09). A distant on-screen mouth remains an aim target unless
+     * the drawn short pointer itself intersects a bystander or face obstacle.
      */
     private fun isShortDrawnTailObstructed(
         rect: NormalizedRect,
         aimTarget: NormalizedPoint,
         obstacles: List<NormalizedRect>,
-        maxPointerReachNorm: Float = 0.055f,
+        maxPointerReachNorm: Float? = null,
     ): Boolean {
         val cx = rect.centerX
         val cy = rect.centerY
@@ -1934,11 +2000,18 @@ class BalloonLayoutEngine {
         val ty = if (abs(uy) > 1e-4f) halfH / abs(uy) else Float.POSITIVE_INFINITY
         val edgeDist = minOf(tx, ty)
         if (centerDist <= edgeDist + 0.004f) {
-            // Aim target lies inside or essentially touching the bubble body: check tip clearance
             return false
         }
         val availableOutside = (centerDist - edgeDist).coerceAtLeast(0f)
-        val pointerLen = minOf(availableOutside * 0.72f, maxPointerReachNorm)
+        val pointerLen = if (maxPointerReachNorm != null) {
+            minOf(availableOutside * 0.72f, maxPointerReachNorm)
+        } else {
+            TailGeometry.computeNormalizedTailReach(
+                ux = ux,
+                uy = uy,
+                distOutsideNorm = availableOutside,
+            ).coerceAtMost(TailGeometry.maxNormalizedTailReachForStage(ux = ux, uy = uy))
+        }
         if (pointerLen <= 0.005f) return false
         val rootPt = NormalizedPoint(cx + ux * edgeDist, cy + uy * edgeDist)
         val tipPt = NormalizedPoint(rootPt.x + ux * pointerLen, rootPt.y + uy * pointerLen)

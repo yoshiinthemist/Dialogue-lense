@@ -91,6 +91,7 @@ data class PlaybackTimingDiagnostics(
     val requestedSeekSeq: Long = 0L,
     val dispatchedSeekSeq: Long = 0L,
     val seekDispatchedAtEpochMs: Long = 0L,
+    val isMediaHardwareError: Boolean = false,
 )
 
 data class PlaybackReadinessSnapshot(
@@ -237,6 +238,7 @@ class PlaybackReadinessController(
         targetPositionMs = pos
         waitTimedOut = false
         failureReason = ""
+        isMediaHardwareError = false
 
         if (!requiresCoverageGate) {
             state = PlaybackReadinessState.PLAYING
@@ -531,6 +533,7 @@ class PlaybackReadinessController(
         )
         waitTimedOut = false
         failureReason = ""
+        isMediaHardwareError = false
         pendingAutoResume = null
         userIntent = UserPlaybackIntent.PLAY
         state = PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE
@@ -578,6 +581,7 @@ class PlaybackReadinessController(
         val primary = displayMode.normalizedPrimaryMode()
         if (primary == CaptionDisplayMode.OFF) {
             requiresCoverageGate = false
+            activeWatchNowBypass = null
             pendingAutoResume = null
             waitTimedOut = false
             if (!isMediaHardwareError) {
@@ -756,6 +760,14 @@ class PlaybackReadinessController(
             requestedSeekSeq = requestedSeekSeq,
             dispatchedSeekSeq = dispatchedSeekSeq,
             seekDispatchedAtEpochMs = seekDispatchedAtEpochMs,
+            isMediaHardwareError = isMediaHardwareError ||
+                (state == PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR &&
+                    (failureReason.contains("error", ignoreCase = true) ||
+                        failureReason.contains("fail", ignoreCase = true) ||
+                        failureReason.contains("player", ignoreCase = true) ||
+                        failureReason.contains("hardware", ignoreCase = true) ||
+                        failureReason.contains("video", ignoreCase = true) ||
+                        failureReason.contains("network", ignoreCase = true))),
         )
         return PlaybackReadinessSnapshot(
             state = state,

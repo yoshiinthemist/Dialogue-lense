@@ -93,6 +93,7 @@ import com.example.data.model.isBubbleNonSpeakerSpecific
 import com.example.data.model.isBubbleSpeakerUnknown
 import com.example.data.model.isNonSpeakerSpecificEvent
 import com.example.domain.layout.PlacedBalloon
+import com.example.domain.layout.TailGeometry
 import com.example.ui.theme.BalloonHighContrastBorder
 import com.example.ui.theme.BalloonHighContrastInk
 import com.example.ui.theme.BalloonHighContrastSurface
@@ -624,7 +625,6 @@ private fun UnifiedBalloonBody(
                     event.dialogueType == DialogueType.INTERNAL_MONOLOGUE ->
                         buildThoughtCloudPath(bodyRect)
                     else -> {
-                        val restrainedTailMaxPx = 28.dp.toPx()
                         buildPointedSpeechPath(
                             bodyRect = bodyRect,
                             showPointerTail = showPointerTail,
@@ -633,15 +633,15 @@ private fun UnifiedBalloonBody(
                             cornerFraction = cornerFraction,
                             isManga = isManga,
                             isCinemaSubtle = isCinemaSubtle,
-                            mouthClearancePx = 10.dp.toPx(),
-                            maxTailReachPx = restrainedTailMaxPx,
-                            minTailReachPx = 10.dp.toPx(),
+                            mouthClearancePx = TailGeometry.MOUTH_CLEARANCE_DP.dp.toPx(),
+                            nominalTailReachPx = TailGeometry.NOMINAL_TAIL_REACH_DP.dp.toPx(),
+                            maxTailReachPx = TailGeometry.MAX_TAIL_REACH_DP.dp.toPx(),
+                            minTailReachPx = TailGeometry.MIN_TAIL_REACH_DP.dp.toPx(),
                         )
                     }
                 }
 
                 val drawContourPath = if (isHighEnergyShout) {
-                    val restrainedShoutTailMaxPx = 28.dp.toPx()
                     buildJitteredShoutPath(
                         bodyRect = bodyRect,
                         showPointerTail = showPointerTail,
@@ -649,9 +649,10 @@ private fun UnifiedBalloonBody(
                         target = localTarget,
                         spikeAmplitudePx = (if (isManga) 3.4.dp else 2.2.dp).toPx(),
                         jitterPhase = jitterPhase,
-                        mouthClearancePx = 10.dp.toPx(),
-                        maxTailReachPx = restrainedShoutTailMaxPx,
-                        minTailReachPx = 10.dp.toPx(),
+                        mouthClearancePx = TailGeometry.MOUTH_CLEARANCE_DP.dp.toPx(),
+                        nominalTailReachPx = TailGeometry.NOMINAL_TAIL_REACH_DP.dp.toPx(),
+                        maxTailReachPx = TailGeometry.MAX_TAIL_REACH_DP.dp.toPx(),
+                        minTailReachPx = TailGeometry.MIN_TAIL_REACH_DP.dp.toPx(),
                     )
                 } else {
                     bubblePath
@@ -888,6 +889,7 @@ internal fun computePerimeterTailGeometry(
     mouthClearancePx: Float,
     minTailReachPx: Float,
     maxTailReachPx: Float,
+    nominalTailReachPx: Float = (minTailReachPx + maxTailReachPx) * 0.5f,
 ): PerimeterTailGeometry {
     val l = bodyRect.left
     val t = bodyRect.top
@@ -952,7 +954,13 @@ internal fun computePerimeterTailGeometry(
     val baseSample = sampleRoundedRectPerimeter(bodyRect, cr, exitS)
     val baseRadius = hypot((baseSample.point.x - cx).toDouble(), (baseSample.point.y - cy).toDouble()).toFloat()
     val distOutsideBorder = (targetDistanceFromCenterPx - baseRadius).coerceAtLeast(0f)
-    val reach = (distOutsideBorder - mouthClearancePx).coerceIn(minTailReachPx, maxTailReachPx)
+    val reach = TailGeometry.computeTailReachPxWithPxBounds(
+        distOutsideBorderPx = distOutsideBorder,
+        nominalReachPx = nominalTailReachPx,
+        maxReachPx = maxTailReachPx,
+        minReachPx = minTailReachPx,
+        mouthClearancePx = mouthClearancePx,
+    )
 
     // Proportionally tapered elastic throat: crisp and generous at short reaches, gracefully sleek across long
     // dead-space reaches (up to 58% of stage width) so stretched tails never look bloated OR frayed.
@@ -1032,6 +1040,7 @@ private fun buildPointedSpeechPath(
     isManga: Boolean,
     isCinemaSubtle: Boolean,
     mouthClearancePx: Float,
+    nominalTailReachPx: Float,
     maxTailReachPx: Float,
     minTailReachPx: Float,
 ): Path {
@@ -1064,7 +1073,13 @@ private fun buildPointedSpeechPath(
         mouthClearancePx = mouthClearancePx,
         minTailReachPx = minTailReachPx,
         maxTailReachPx = maxTailReachPx,
+        nominalTailReachPx = nominalTailReachPx,
     )
+    if (geom.tailLengthPx <= 1f) {
+        return Path().apply {
+            addRoundRect(RoundRect(bodyRect, CornerRadius(cornerR, cornerR)))
+        }
+    }
 
     val bodySpan = (geom.perimeterLength - 2f * geom.effectiveHalfThroatPx).coerceAtLeast(1f)
     val steps = 64
@@ -1103,50 +1118,29 @@ private fun buildJitteredShoutPath(
     spikeAmplitudePx: Float,
     jitterPhase: Float,
     mouthClearancePx: Float,
+    nominalTailReachPx: Float,
     maxTailReachPx: Float,
     minTailReachPx: Float,
 ): Path {
-    val cx = bodyRect.center.x
-    val cy = bodyRect.center.y
-    val rx = (bodyRect.width * 0.54f).coerceAtLeast(24f)
-    val ry = (bodyRect.height * 0.58f).coerceAtLeast(16f)
-    val steps = 32
-
-    val tailAngle = if (showPointerTail && target != null && !aimAngleRad.isNaN()) {
-        aimAngleRad
-    } else {
-        Float.NaN
-    }
-
-    val tailTip = if (showPointerTail && target != null && !tailAngle.isNaN()) {
-        val dx = target.x - cx
-        val dy = target.y - cy
-        val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(1f)
-        val edgeR = hypot((rx * cos(tailAngle)).toDouble(), (ry * sin(tailAngle)).toDouble()).toFloat()
-        val reach = (dist - mouthClearancePx).coerceIn(edgeR + minTailReachPx, edgeR + maxTailReachPx)
-        Offset(cx + cos(tailAngle) * reach, cy + sin(tailAngle) * reach)
-    } else {
-        null
-    }
-
+    val vertices = TailGeometry.computeShoutBalloonVertices(
+        centerX = bodyRect.center.x,
+        centerY = bodyRect.center.y,
+        radiusX = (bodyRect.width * 0.54f).coerceAtLeast(24f),
+        radiusY = (bodyRect.height * 0.58f).coerceAtLeast(16f),
+        spikeAmplitudePx = spikeAmplitudePx,
+        jitterPhase = jitterPhase,
+        showPointerTail = showPointerTail,
+        aimAngleRad = aimAngleRad,
+        targetX = target?.x,
+        targetY = target?.y,
+        nominalReachPx = nominalTailReachPx,
+        maxReachPx = maxTailReachPx,
+        minReachPx = minTailReachPx,
+        mouthClearancePx = mouthClearancePx,
+    )
     return Path().apply {
-        for (i in 0 until steps) {
-            val angle = (i.toFloat() / steps.toFloat()) * (2f * PI).toFloat()
-            var angDiff = if (!tailAngle.isNaN()) abs(shortestAngularDeltaRad(angle, tailAngle)) else Float.MAX_VALUE
-
-            if (tailTip != null && angDiff < 0.20f) {
-                if (angDiff < 0.08f) {
-                    lineTo(tailTip.x, tailTip.y)
-                    continue
-                }
-            }
-
-            val isSpike = i % 2 == 0
-            val phasePulse = 0.72f + 0.28f * sin(jitterPhase + i * 1.9f)
-            val radialDelta = if (isSpike) spikeAmplitudePx * phasePulse else -spikeAmplitudePx * 0.38f * phasePulse
-            val px = cx + (rx + radialDelta) * cos(angle)
-            val py = cy + (ry + radialDelta * 0.85f) * sin(angle)
-            if (i == 0) moveTo(px, py) else lineTo(px, py)
+        vertices.forEachIndexed { idx, pt ->
+            if (idx == 0) moveTo(pt.x, pt.y) else lineTo(pt.x, pt.y)
         }
         close()
     }

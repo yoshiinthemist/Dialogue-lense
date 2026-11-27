@@ -185,6 +185,7 @@ fun VideoPlayerStage(
     onYouTubePlayerError: (Int) -> Unit = {},
     onYouTubeTimedTextCaptured: (String, String, String?, String?) -> Unit = { _, _, _, _ -> },
     onWebStreamPlaybackState: (Long, Long, Boolean) -> Unit = { _, _, _ -> },
+    onStreamPlayCommandResult: (seq: Int, playing: Boolean, rejected: Boolean, reason: String) -> Unit = { _, _, _, _ -> },
     onWebStreamCapturedCaptions: (String) -> Unit = {},
     onWebStreamPageMetadata: (String, String, String) -> Unit = { _, _, _ -> },
     viewerWebNavCommand: WebNavCommand? = null,
@@ -428,6 +429,7 @@ fun VideoPlayerStage(
                         playRequest = streamPlayRequest,
                         seekRequest = youtubeSeekRequest,
                         onPlaybackState = onYouTubePlaybackState,
+                        onPlayCommandResult = onStreamPlayCommandResult,
                         // Softly hide YouTube's default track ONLY when DialogueLens bubbles are loaded AND turned ON;
                         // when bubbles are absent or OFF, leave YouTube's native CC completely unblocked.
                         suppressNativeCaptions = hasRealSubtitles && displayMode != CaptionDisplayMode.OFF,
@@ -447,6 +449,7 @@ fun VideoPlayerStage(
                         playRequest = streamPlayRequest,
                         seekRequest = youtubeSeekRequest,
                         onPlaybackState = onWebStreamPlaybackState,
+                        onPlayCommandResult = onStreamPlayCommandResult,
                         onCapturedCaptions = onWebStreamCapturedCaptions,
                         isolateVideoInViewport = true,
                         onDirectMediaUrl = onScoutWebStreamDirectMediaUrl,

@@ -585,8 +585,29 @@ class Scout2IndependentReviewer {
                             evt.copy(translatedText = sanitizedTranslated, stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
                         }
                         refOriginIsHighTrust && (semantic.hasCriticalDivergence || semantic.score < EQUIVALENT_TEXT_THRESHOLD) -> {
-                            usedCaptionAlignment = true
-                            if (canCompareAgainstTranslated && !cueRequiresTranslation) {
+                            val blockAllCapsDowngrade = referenceTrack?.originKind != CaptionOriginKind.USER_IMPORTED &&
+                                isSuspiciousAllCapsPhoneticDegradation(
+                                    candidateText = combinedRefText,
+                                    existingText = if (canCompareAgainstTranslated && !cueRequiresTranslation) evt.sourceText else evt.sourceText,
+                                )
+                            if (blockAllCapsDowngrade) {
+                                unverifiedCueCount++
+                                notes.add("Preserved mixed-case proper nouns on ${evt.id} against ALL-CAPS phonetic caption")
+                                cueReviews.add(
+                                    CueReviewRecord(
+                                        eventId = evt.id,
+                                        stableCueKey = stableKey,
+                                        status = DialogueReviewStatus.FALLBACK_UNVERIFIED,
+                                        isSourceVerified = draftEvidenceIsAudio,
+                                        isTranslationVerified = !cueNeedsTranslation,
+                                        needsTranslation = cueNeedsTranslation,
+                                        wordingMethod = if (draftEvidenceIsAudio) WordingVerificationMethod.AUDIO_ASR_INDEPENDENT else WordingVerificationMethod.NONE,
+                                        note = "Preserved mixed-case proper noun against ALL-CAPS caption",
+                                    )
+                                )
+                                evt.copy(translatedText = sanitizedTranslated, stableCueKey = stableKey, needsTranslation = cueNeedsTranslation)
+                            } else if (canCompareAgainstTranslated && !cueRequiresTranslation) {
+                                usedCaptionAlignment = true
                                 val srcChanged = normalizeTextForCompare(combinedRefText) != normalizeTextForCompare(evt.sourceText)
                                 val nextRev = if (srcChanged) evt.sourceTextRevision + 1 else evt.sourceTextRevision
                                 repairedDialogueCount++
@@ -613,6 +634,7 @@ class Scout2IndependentReviewer {
                                     translationSourceRevision = nextRev,
                                 )
                             } else if (canCompareAgainstTranslated && cueRequiresTranslation) {
+                                usedCaptionAlignment = true
                                 // Target-language reference repairs ONLY translatedText; NEVER overwrite foreign sourceText!
                                 repairedDialogueCount++
                                 val srcBacked = draftEvidenceIsAudio
@@ -637,6 +659,7 @@ class Scout2IndependentReviewer {
                                     translationSourceRevision = evt.sourceTextRevision,
                                 )
                             } else {
+                                usedCaptionAlignment = true
                                 // Source-language reference repair: substantive source changes MUST invalidate
                                 // derived target/literal/romanization outputs and queue targeted re-translation.
                                 val srcMateriallyChanged = normalizeTextForCompare(combinedRefText) != normalizeTextForCompare(evt.sourceText)
@@ -1209,6 +1232,48 @@ class Scout2IndependentReviewer {
                 .toSet()
         }
 
+        private fun consonantSkeleton(word: String): String =
+            word.lowercase().filter { it in 'a'..'z' && it !in "aeiouy" }
+
+        private fun levenshteinDistance(a: String, b: String): Int {
+            if (a == b) return 0
+            if (a.isEmpty()) return b.length
+            if (b.isEmpty()) return a.length
+            val dp = IntArray(b.length + 1) { it }
+            for (i in 1..a.length) {
+                var prev = dp[0]
+                dp[0] = i
+                for (j in 1..b.length) {
+                    val temp = dp[j]
+                    val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                    dp[j] = minOf(dp[j] + 1, dp[j - 1] + 1, prev + cost)
+                    prev = temp
+                }
+            }
+            return dp[b.length]
+        }
+
+        fun isSuspiciousAllCapsPhoneticDegradation(
+            candidateText: String,
+            existingText: String,
+        ): Boolean {
+            val letters = candidateText.filter { it.isLetter() }
+            if (letters.length < 6 || letters.any { it.isLowerCase() }) return false
+            val existingProperTokens = existingText.trim().split(Regex("\\s+"))
+                .map { it.trim { ch -> !ch.isLetter() } }
+                .filter { tok -> tok.length >= 3 && tok[0].isUpperCase() && tok.drop(1).any { it.isLowerCase() } }
+            if (existingProperTokens.isEmpty()) return false
+            val candWords = candidateText.lowercase().split(Regex("[^\\p{L}\\p{N}]+")).filter { it.length >= 2 }
+            val phoneticNearCount = existingProperTokens.count { prop ->
+                val propSkel = consonantSkeleton(prop)
+                candWords.any { cw ->
+                    levenshteinDistance(propSkel, consonantSkeleton(cw)) <= 2 ||
+                        (prop.length >= 4 && cw.startsWith(prop.take(3).lowercase()))
+                }
+            }
+            return phoneticNearCount > 0 || existingProperTokens.size >= 2
+        }
+
         fun detectDominantScriptLanguage(text: String): String {
             if (text.isBlank()) return ""
             var jaKana = 0
@@ -1590,16 +1655,21 @@ class ReleasedTimelineStore {
     fun applyDeadlineFallbackIfDue(
         nowEpochMs: Long = System.currentTimeMillis(),
         playheadMs: Long = 0L,
+        isPlaying: Boolean = true,
     ): List<ReleasedInterval> = synchronized(lock) {
         val newlyReleased = mutableListOf<ReleasedInterval>()
         val overdue = workingDrafts.values
-            .filter { nowEpochMs >= it.deadlineEpochMs || (it.startMs <= playheadMs + 1_500L && it.endMs >= playheadMs) }
+            .filter {
+                nowEpochMs >= it.deadlineEpochMs ||
+                    (isPlaying && it.startMs <= playheadMs + 1_500L && it.endMs >= playheadMs)
+            }
             .sortedBy { it.startMs }
 
         for (draft in overdue) {
             workingDrafts.remove(draft.intervalId)
             if (draft.events.isEmpty()) {
-                // Missing text at deadline: NEVER invent text or mark verified!
+                // Missing text at deadline: NEVER invent text or mark verified, and emit terminal
+                // fallback release so the interval does not remain permanently IN_PROGRESS.
                 val status = if (draft.hasUnavailableEvidence) {
                     DialogueReviewStatus.UNAVAILABLE_EVIDENCE
                 } else {
@@ -1616,27 +1686,30 @@ class ReleasedTimelineStore {
                     notes = listOf("Deadline reached with no dialogue text; left explicitly unverified"),
                     repairedEvents = emptyList(),
                 )
-                if (status == DialogueReviewStatus.UNAVAILABLE_EVIDENCE) {
-                    releaseRevision++
-                    fallbackReleaseCount++
-                    val rel = ReleasedInterval(
-                        intervalId = draft.intervalId,
-                        mediaId = draft.mediaId,
-                        sourceRevision = draft.sourceRevision,
-                        draftRevision = draft.draftRevision,
-                        releaseRevision = releaseRevision,
-                        configFingerprint = draft.configFingerprint,
-                        startMs = draft.startMs,
-                        endMs = draft.endMs,
-                        events = emptyList(),
-                        speakers = draft.speakers,
-                        reviewOutcome = outcome,
-                        isPlayableFallback = true,
-                        releasedAtEpochMs = nowEpochMs,
-                    )
-                    releasedByIntervalId[draft.intervalId] = rel
-                    newlyReleased.add(rel)
-                }
+                releaseRevision++
+                highestReleasedDraftRevByInterval[draft.intervalId] = maxOf(
+                    highestReleasedDraftRevByInterval[draft.intervalId] ?: 0L,
+                    draft.draftRevision,
+                )
+                fallbackReleaseCount++
+                val rel = ReleasedInterval(
+                    intervalId = draft.intervalId,
+                    mediaId = draft.mediaId,
+                    sourceRevision = draft.sourceRevision,
+                    draftRevision = draft.draftRevision,
+                    releaseRevision = releaseRevision,
+                    configFingerprint = draft.configFingerprint,
+                    startMs = draft.startMs,
+                    endMs = draft.endMs,
+                    events = emptyList(),
+                    speakers = draft.speakers,
+                    reviewOutcome = outcome,
+                    isPlayableFallback = true,
+                    releasedAtEpochMs = nowEpochMs,
+                )
+                releasedByIntervalId[draft.intervalId] = rel
+                newlyReleased.add(rel)
+                lastReleaseSummary = "Deadline empty fallback rev #$releaseRevision (${draft.startMs / 1000}s–${draft.endMs / 1000}s · ${status.name})"
                 continue
             }
 
@@ -1815,17 +1888,31 @@ class ReleasedTimelineStore {
                 if (!spansWindowBoundary) return@filter false
                 incoming.any { inc ->
                     val sameParent = evt.parentUtteranceKey.isNotBlank() &&
-                        (evt.parentUtteranceKey == inc.parentUtteranceKey || evt.parentUtteranceKey == inc.canonicalIdentityKey)
-                    val sameSpeakerOrUnknown = evt.speakerId == null ||
-                        inc.speakerId == null ||
-                        evt.speakerId.equals(inc.speakerId, ignoreCase = true)
+                        (evt.parentUtteranceKey == inc.parentUtteranceKey ||
+                            evt.parentUtteranceKey == inc.canonicalIdentityKey ||
+                            inc.parentUtteranceKey == evt.canonicalIdentityKey)
+                    val sameType = evt.dialogueType == inc.dialogueType
+                    val compatibleSpeaker = com.example.domain.analysis.LookaheadWindowPlanner.areSpeakersCompatible(
+                        evt.speakerId,
+                        inc.speakerId,
+                    )
                     val overlap = (minOf(evt.endTimeMs, inc.endTimeMs) - maxOf(evt.startTimeMs, inc.startTimeMs)).coerceAtLeast(0L)
-                    val sem = if (overlap > 0L && sameSpeakerOrUnknown) {
-                        Scout2IndependentReviewer.evaluateSemanticEquivalence(evt.sourceText, inc.sourceText)
+                    if (!compatibleSpeaker || !sameType) {
+                        sameParent
+                    } else if (overlap > 0L) {
+                        val sem = Scout2IndependentReviewer.evaluateSemanticEquivalence(evt.sourceText, inc.sourceText)
+                        val normPrev = Scout2IndependentReviewer.normalizeTextForCompare(evt.sourceText)
+                        val normInc = Scout2IndependentReviewer.normalizeTextForCompare(inc.sourceText)
+                        val prefixOrContains = normPrev.length >= 6 && normInc.length >= 6 &&
+                            (normInc.contains(normPrev) || normPrev.contains(normInc))
+                        sameParent ||
+                            sem.isEquivalent ||
+                            sem.score >= 0.52f ||
+                            prefixOrContains ||
+                            overlap >= 450L
                     } else {
-                        null
+                        sameParent
                     }
-                    sameParent || (sem != null && (sem.isEquivalent || sem.score >= 0.72f))
                 }
             }
             .map { it.id }

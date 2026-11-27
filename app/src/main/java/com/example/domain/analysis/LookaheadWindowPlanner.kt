@@ -443,6 +443,63 @@ object LookaheadWindowPlanner {
         }
     }
 
+    /**
+     * Coordinator-driven Scout WebView sync that honors the 180s RollingBoundary horizon and
+     * active work windows: advances Scout forward when work exists inside [viewerPosMs, boundaryEnd],
+     * follows a playing viewer without spurious rewinds, and idles cleanly when the horizon is complete.
+     */
+    fun computeCoordinatorScoutCommand(
+        viewerPosMs: Long,
+        scoutPosMs: Long,
+        durationMs: Long,
+        nextWorkWindow: TimeWindowRange?,
+        isViewerPlaying: Boolean,
+        isScoutPlaying: Boolean,
+        introRemainingMs: Long,
+        horizonMs: Long = 180_000L,
+    ): ScoutSyncCommand {
+        if (durationMs <= 0L) return ScoutSyncCommand.Hold
+        val safeViewerPos = viewerPosMs.coerceIn(0L, durationMs)
+        val boundaryEnd = (safeViewerPos + horizonMs.coerceAtLeast(LOOKAHEAD_LEAD_MS)).coerceAtMost(durationMs)
+
+        if (introRemainingMs > 0L) {
+            val leadTarget = clampScoutTargetMs(0L, durationMs)
+            if (scoutPosMs > leadTarget + DRIFT_TOLERANCE_MS) {
+                return ScoutSyncCommand.SeekAndPlay(0L)
+            }
+            return if (scoutPosMs < leadTarget - 400L) {
+                if (!isScoutPlaying) ScoutSyncCommand.PlayForward else ScoutSyncCommand.Hold
+            } else {
+                if (isScoutPlaying) ScoutSyncCommand.PauseWithLead else ScoutSyncCommand.Hold
+            }
+        }
+
+        if (nextWorkWindow != null) {
+            val winStart = nextWorkWindow.startMs.coerceIn(0L, boundaryEnd)
+            val winEnd = nextWorkWindow.endMs.coerceIn(winStart + 500L, maxOf(winStart + 500L, boundaryEnd))
+            return when {
+                scoutPosMs < winStart - 1_500L || scoutPosMs > winEnd + 1_500L ->
+                    ScoutSyncCommand.SeekAndPlay(winStart)
+                !isScoutPlaying && scoutPosMs < durationMs - 500L ->
+                    ScoutSyncCommand.PlayForward
+                else -> ScoutSyncCommand.Hold
+            }
+        }
+
+        // Horizon has no remaining work: never pull Scout backward from its hard-earned horizon!
+        return if (isViewerPlaying) {
+            if (scoutPosMs < safeViewerPos - 20_000L && safeViewerPos < durationMs - 800L) {
+                ScoutSyncCommand.SeekAndPlay(safeViewerPos)
+            } else if (!isScoutPlaying && scoutPosMs < boundaryEnd - 800L && scoutPosMs <= safeViewerPos + LOOKAHEAD_LEAD_MS) {
+                ScoutSyncCommand.PlayForward
+            } else {
+                ScoutSyncCommand.Hold
+            }
+        } else {
+            if (isScoutPlaying) ScoutSyncCommand.PauseWithLead else ScoutSyncCommand.Hold
+        }
+    }
+
     data class WindowMergeReport(
         val events: List<DialogueEvent>,
         val acceptedCount: Int,
