@@ -26,7 +26,6 @@ class SpeakerAttributionEngine {
         rememberedCharacterColors: Map<String, Int> = emptyMap(),
         settledEventIds: Set<String> = emptySet(),
         sceneBoundaryMs: List<Long> = emptyList(),
-        slotToSpeakerId: Map<String, String> = emptyMap(),
     ): Pair<List<Speaker>, List<DialogueEvent>> {
         val speakers = existingSpeakers.toMutableList()
         if (speakers.isEmpty()) {
@@ -154,24 +153,19 @@ class SpeakerAttributionEngine {
                 // When the AI Scout directly observed who spoke on camera (slots A-L), ensure the slot exists
                 // and trust the Scout's visual/audio slot instead of letting text heuristics override it.
                 if (faceTracks.isEmpty() && aiExplicitSlotIndex in 0..11) {
-                    val mappedSpeakerId = slotToSpeakerId[aiSlotRaw]
-                    val directSpeaker = mappedSpeakerId?.let { id ->
-                        speakers.firstOrNull { it.id == id }
-                    } ?: run {
-                        while (speakers.size <= aiExplicitSlotIndex) {
-                            val nextIdx = speakers.size
-                            val letter = ('A' + nextIdx)
-                            speakers.add(
-                                Speaker(
-                                    id = "spk_${letter.lowercaseChar()}",
-                                    defaultLabel = "Speaker $letter",
-                                    accentIndex = nextIdx % SpeakerColorOrder.PALETTE_SIZE,
-                                    isIdentityConfirmed = false,
-                                )
+                    while (speakers.size <= aiExplicitSlotIndex) {
+                        val nextIdx = speakers.size
+                        val letter = ('A' + nextIdx)
+                        speakers.add(
+                            Speaker(
+                                id = "spk_${letter.lowercaseChar()}",
+                                defaultLabel = "Speaker $letter",
+                                accentIndex = nextIdx % SpeakerColorOrder.PALETTE_SIZE,
+                                isIdentityConfirmed = false,
                             )
-                        }
-                        speakers[aiExplicitSlotIndex]
+                        )
                     }
+                    val directSpeaker = speakers[aiExplicitSlotIndex]
                     val placement = when {
                         event.dialogueType != DialogueType.SPOKEN -> PlacementMode.EDGE_DOCKED
                         hasScoutSpatialAnchor -> PlacementMode.AUTO

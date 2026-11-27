@@ -700,10 +700,8 @@ class RollingBoundarySchedulerTest {
         )
         vm.loadProject(project)
 
-        // Move viewer to 02:00 and pause (A04: player feedback required to acknowledge async YouTube seek)
+        // Move viewer to 02:00 and pause
         vm.seekTo(120_000L)
-        assertEquals(0L, vm.currentSchedulerSnapshotForTest().acknowledgedViewerPosMs)
-        vm.onYouTubePlaybackState(positionMs = 120_000L, durationMs = videoDurationMs, isPlaying = false)
         vm.pausePlayback()
         val pausedSnap = vm.currentSchedulerSnapshotForTest()
         assertEquals(120_000L, pausedSnap.acknowledgedViewerPosMs)
@@ -723,10 +721,9 @@ class RollingBoundarySchedulerTest {
         assertEquals(2.0f, speedSnap.playbackSpeed, 0.001f)
         assertEquals(300_000L, speedSnap.boundaryEndMs)
 
-        // Backward seek bumps generation and re-anchors boundary once observed by the player
+        // Backward seek bumps generation and re-anchors boundary
         val genBefore = speedSnap.schedulingGeneration
         vm.seekTo(30_000L)
-        vm.onYouTubePlaybackState(positionMs = 30_000L, durationMs = videoDurationMs, isPlaying = false)
         val afterSeekSnap = vm.currentSchedulerSnapshotForTest()
         assertTrue("Committed seek must advance scheduling generation", afterSeekSnap.schedulingGeneration > genBefore)
         assertEquals(30_000L, afterSeekSnap.acknowledgedViewerPosMs)

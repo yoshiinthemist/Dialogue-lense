@@ -28,11 +28,8 @@ import com.example.domain.analysis.WebNavAction
 import com.example.domain.analysis.WebNavCommand
 import com.example.domain.analysis.WebNavigationGuard
 import com.example.domain.analysis.WebNavigationState
-import com.example.domain.media.MediaActivationDecision
 import com.example.domain.media.MediaCapabilities
 import com.example.domain.media.MediaSourceAdapterRegistry
-import com.example.domain.media.YouTubeMediaAdapter
-import com.example.domain.pipeline.DialogueReviewStatus
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.joinAll
@@ -73,8 +70,6 @@ import com.example.data.model.NormalizedRect
 import com.example.data.model.PlacementMode
 import com.example.data.model.ProcessingQualityMode
 import com.example.data.model.QuotaSaverMode
-import com.example.data.model.ScoutCaptureDiagnostics
-import com.example.data.model.ScoutCaptureHealthState
 import com.example.data.model.Shot
 import com.example.data.model.Speaker
 import com.example.data.model.SpeakerColorOrder
@@ -85,8 +80,6 @@ import com.example.data.model.VideoChapter
 import com.example.data.model.VideoSource
 import com.example.data.model.VideoSourceKind
 import com.example.data.model.YouTubeNativeCcState
-import com.example.data.model.YouTubePlayerErrorKind
-import com.example.data.model.classifyYouTubeErrorCode
 import com.example.data.project.DemoScenarioFactory
 import com.example.data.project.ProjectStore
 import com.example.data.subtitle.RawSubtitleCue
@@ -101,10 +94,7 @@ import com.example.domain.pipeline.DraftInterval
 import com.example.domain.pipeline.IntervalReviewOutcome
 import com.example.domain.pipeline.ReleasedPlaybackSnapshot
 import com.example.domain.pipeline.ReleasedTimelineStore
-import com.example.domain.pipeline.Scout1CueTimestamp
-import com.example.domain.pipeline.Scout1TimestampReport
 import com.example.domain.pipeline.Scout2IndependentReviewer
-import com.example.domain.pipeline.ScoutClockProvenance
 import com.example.domain.pipeline.YouTubeCapabilityReport
 import com.example.domain.playback.PlaybackReadinessController
 import com.example.domain.playback.PlaybackReadinessSnapshot
@@ -188,7 +178,7 @@ data class DialogueLensUiState(
     val isPlaying: Boolean = false,
     val isMuted: Boolean = false,
     val currentTimeMs: Long = 600L,
-    val displayMode: CaptionDisplayMode = CaptionDisplayMode.BUBBLES_WITH_TAILS,
+    val displayMode: CaptionDisplayMode = CaptionDisplayMode.BALLOONS,
     val styleSettings: BalloonStyleSettings = BalloonStyleSettings(),
     val isEditMode: Boolean = false,
     val selectedEventId: String? = null,
@@ -261,8 +251,6 @@ data class DialogueLensUiState(
     val sentinelSnapshot: SentinelInspectorSnapshot = SentinelInspectorSnapshot(),
     val releaseSnapshot: ReleasedPlaybackSnapshot = ReleasedPlaybackSnapshot(),
     val youtubeCapabilities: YouTubeCapabilityReport = YouTubeCapabilityReport(),
-    val scoutCaptureDiagnostics: ScoutCaptureDiagnostics = ScoutCaptureDiagnostics(),
-    val youtubePlayerErrorKind: YouTubePlayerErrorKind? = null,
     val hasCompletedOnboarding: Boolean = true,
     val seekGeneration: Long = 0L,
     val measurementEpoch: Long = 0L,
@@ -306,7 +294,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
     private val undoStack = ArrayDeque<DialogueLensProject>()
     private var tickerJob: Job? = null
-    private var scoutReviewLoopJob: Job? = null
     private var analysisJob: Job? = null
     private var introJob: Job? = null
     private var lookaheadJob: Job? = null
@@ -316,23 +303,11 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     private var youtubeTranscriptJob: Job? = null
     private var subtitlePrepJob: Job? = null
     private var speakerToastJob: Job? = null
-    private var statusBannerJob: Job? = null
-    private var seekAckTimeoutJob: Job? = null
     private var nextSpeakerToastId = 0L
     private var lastCapturedWebTrackSignature: String? = null
     private var lastHandledShareText: String? = null
     private var nextStreamCommandSeq = 0
     private var nextScoutCommandSeq = 0
-
-    private data class PendingTransportCommand(
-        val seq: Int,
-        val targetPlaying: Boolean,
-        val issuedAtMs: Long,
-        val sessionToken: Long,
-        val seekGeneration: Long,
-        val sourceId: String,
-    )
-    private var pendingTransportCommand: PendingTransportCommand? = null
     private var lastScoutSeekSentAtMs = 0L
     private var lastScoutSeekTargetMs = -1L
     private val scoutCompletedExtents = mutableListOf<TimeWindowRange>()
@@ -369,48 +344,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     private var lastSceneSideResetKey: String = ""
     private var lastDetectorFrameId: Long = -1L
 
-    private data class CapturedAudioQueueItem(
-        val bucketKey: Long,
-        val startMs: Long,
-        val endMs: Long,
-        val base64Audio: String,
-        val mimeType: String,
-        val discontinuity: Boolean,
-        val requestCtx: WorkRequestContext,
-    )
-
-    private val capturedAudioQueueLock = Any()
-    private val pendingCapturedAudioQueue = ArrayDeque<CapturedAudioQueueItem>()
-    private val inFlightCapturedAudioBuckets = mutableSetOf<Long>()
-    private var capturedAudioConsumerJob: Job? = null
-
-    private fun clearCapturedAudioQueueSync() {
-        capturedAudioConsumerJob?.cancel()
-        capturedAudioConsumerJob = null
-        synchronized(capturedAudioQueueLock) {
-            pendingCapturedAudioQueue.clear()
-            inFlightCapturedAudioBuckets.clear()
-        }
-    }
-
-    private fun buildSlotToSpeakerIdMap(speakers: List<Speaker>): Map<String, String> =
-        speakers.mapIndexedNotNull { idx, spk ->
-            if (idx in 0..11) (('A' + idx).toString()) to spk.id else null
-        }.toMap()
-
-    private fun showStatusBanner(message: String?, autoClearMs: Long = 3_500L) {
-        statusBannerJob?.cancel()
-        _uiState.update { it.copy(statusBanner = message) }
-        if (!message.isNullOrBlank() && autoClearMs > 0L) {
-            statusBannerJob = viewModelScope.launch {
-                delay(autoClearMs)
-                _uiState.update { cur ->
-                    if (cur.statusBanner == message) cur.copy(statusBanner = null) else cur
-                }
-            }
-        }
-    }
-
     internal fun configureRollingBoundaryPolicyForTest(policy: RollingBoundaryPolicy) {
         sentinelCoordinator.configurePolicy(policy)
     }
@@ -435,8 +368,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         scoutCompletedExtents.any { positionMs in it.startMs until it.endMs }
 
     private val sourceEditRevision = AtomicLong(0L)
-    @Volatile
-    private var pendingQuotaModeOverride: QuotaSaverMode? = null
 
     /**
      * Immutable request context captured at dispatch time so late completions from prior
@@ -553,9 +484,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     private var nextDraftRevision = AtomicLong(0L)
 
     /**
-     * Authoritative event merge for a reviewed/released interval that reconciles overlapping or
-     * crossing-boundary superseded cues by logical utterance lineage and preserves user-locked
-     * (`lockedByUser`) edits, distinct concurrent speakers, SFX, and later repeats.
+     * Authoritative event merge for a reviewed/released interval that ALWAYS preserves
+     * user-locked (`lockedByUser`) edits inside [startMs, endMs).
      */
     internal fun mergeReleasedIntervalPreservingLocks(
         existingEvents: List<DialogueEvent>,
@@ -563,119 +493,18 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         startMs: Long,
         endMs: Long,
     ): List<DialogueEvent> {
-        val incomingIds = releasedIntervalEvents.map { it.id }.toSet()
-        val incomingKeys = releasedIntervalEvents.map { it.canonicalIdentityKey }.toSet()
-        val isSuperseded: (DialogueEvent) -> Boolean = { evt ->
-            when {
-                evt.lockedByUser -> false
-                evt.id in incomingIds || evt.canonicalIdentityKey in incomingKeys -> true
-                evt.startTimeMs in startMs until endMs -> true
-                evt.startTimeMs < endMs && evt.endTimeMs > startMs -> {
-                    releasedIntervalEvents.any { inc ->
-                        val sameParent = evt.parentUtteranceKey.isNotBlank() &&
-                            (evt.parentUtteranceKey == inc.parentUtteranceKey ||
-                                evt.parentUtteranceKey == inc.canonicalIdentityKey ||
-                                inc.parentUtteranceKey == evt.canonicalIdentityKey)
-                        val sameType = evt.dialogueType == inc.dialogueType
-                        val compatibleSpeaker = LookaheadWindowPlanner.areSpeakersCompatible(
-                            evt.speakerId,
-                            inc.speakerId,
-                        )
-                        val overlap = (minOf(evt.endTimeMs, inc.endTimeMs) - maxOf(evt.startTimeMs, inc.startTimeMs)).coerceAtLeast(0L)
-                        if (!compatibleSpeaker || !sameType) {
-                            sameParent
-                        } else if (overlap > 0L) {
-                            val sem = Scout2IndependentReviewer.evaluateSemanticEquivalence(evt.sourceText, inc.sourceText)
-                            val normPrev = Scout2IndependentReviewer.normalizeTextForCompare(evt.sourceText)
-                            val normInc = Scout2IndependentReviewer.normalizeTextForCompare(inc.sourceText)
-                            val prefixOrContains = normPrev.length >= 6 && normInc.length >= 6 &&
-                                (normInc.contains(normPrev) || normPrev.contains(normInc))
-                            sameParent || sem.isEquivalent || sem.score >= 0.52f || prefixOrContains || overlap >= 450L
-                        } else {
-                            sameParent
-                        }
-                    }
-                }
-                else -> false
+        val outside = existingEvents.filterNot { it.startTimeMs in startMs until endMs }
+        val lockedInside = existingEvents.filter { it.startTimeMs in startMs until endMs && it.lockedByUser }
+        if (lockedInside.isEmpty()) {
+            return (outside + releasedIntervalEvents).sortedBy { it.startTimeMs }
+        }
+        val filteredIncoming = releasedIntervalEvents.filter { incoming ->
+            lockedInside.none { locked ->
+                locked.id == incoming.id ||
+                    (incoming.startTimeMs < locked.endTimeMs && incoming.endTimeMs > locked.startTimeMs)
             }
         }
-        val preservedExisting = existingEvents.filterNot(isSuperseded)
-        val lockedRelevant = preservedExisting.filter {
-            it.lockedByUser && (it.startTimeMs in startMs until endMs || (it.startTimeMs < endMs && it.endTimeMs > startMs))
-        }
-        val filteredIncoming = if (lockedRelevant.isEmpty()) {
-            releasedIntervalEvents
-        } else {
-            releasedIntervalEvents.filter { incoming ->
-                lockedRelevant.none { locked ->
-                    val sameIdentity = locked.id == incoming.id ||
-                        locked.canonicalIdentityKey == incoming.canonicalIdentityKey
-                    val overlapsTime = incoming.startTimeMs < locked.endTimeMs && incoming.endTimeMs > locked.startTimeMs
-                    val sameOrUnknownSpeaker = locked.speakerId == null ||
-                        incoming.speakerId == null ||
-                        locked.speakerId == incoming.speakerId
-                    sameIdentity || (overlapsTime && sameOrUnknownSpeaker)
-                }
-            }
-        }
-        return (preservedExisting + filteredIncoming).sortedBy { it.startTimeMs }
-    }
-
-    /**
-     * Reconciles cached/restored timeline events into one canonical set before seeding
-     * [ReleasedTimelineStore] and project playback, removing duplicate/overlapping variants of the
-     * same utterance while preserving concurrent speakers, later repeats, SFX, and user locks.
-     */
-    internal fun reconcileRestoredTimeline(
-        events: List<DialogueEvent>,
-    ): List<DialogueEvent> {
-        if (events.size <= 1) return events.map { evt ->
-            evt.copy(stableCueKey = evt.stableCueKey.ifBlank { evt.canonicalIdentityKey })
-        }
-        val sorted = events.sortedWith(compareBy<DialogueEvent> { it.startTimeMs }.thenByDescending { it.sourceTextRevision })
-        val accepted = mutableListOf<DialogueEvent>()
-        for (raw in sorted) {
-            val candidate = raw.copy(stableCueKey = raw.stableCueKey.ifBlank { raw.canonicalIdentityKey })
-            val conflictIdx = accepted.indexOfFirst { prev ->
-                val sameIdOrKey = prev.id == candidate.id || prev.canonicalIdentityKey == candidate.canonicalIdentityKey
-                val sameParent = prev.parentUtteranceKey.isNotBlank() &&
-                    (prev.parentUtteranceKey == candidate.parentUtteranceKey ||
-                        prev.parentUtteranceKey == candidate.canonicalIdentityKey ||
-                        candidate.parentUtteranceKey == prev.canonicalIdentityKey)
-                val overlap = (minOf(prev.endTimeMs, candidate.endTimeMs) - maxOf(prev.startTimeMs, candidate.startTimeMs)).coerceAtLeast(0L)
-                val sameType = prev.dialogueType == candidate.dialogueType
-                val compatibleSpeaker = LookaheadWindowPlanner.areSpeakersCompatible(prev.speakerId, candidate.speakerId)
-                when {
-                    sameIdOrKey -> true
-                    sameParent -> true
-                    !sameType || !compatibleSpeaker || overlap <= 0L -> false
-                    else -> {
-                        val sem = Scout2IndependentReviewer.evaluateSemanticEquivalence(prev.sourceText, candidate.sourceText)
-                        val normPrev = Scout2IndependentReviewer.normalizeTextForCompare(prev.sourceText)
-                        val normCand = Scout2IndependentReviewer.normalizeTextForCompare(candidate.sourceText)
-                        val contains = normPrev.length >= 6 && normCand.length >= 6 &&
-                            (normPrev.contains(normCand) || normCand.contains(normPrev))
-                        sem.isEquivalent || sem.score >= 0.56f || (contains && overlap >= 350L)
-                    }
-                }
-            }
-            if (conflictIdx < 0) {
-                accepted.add(candidate)
-            } else {
-                val existing = accepted[conflictIdx]
-                if (!existing.lockedByUser) {
-                    val preferCandidate = candidate.lockedByUser ||
-                        candidate.sourceTextRevision > existing.sourceTextRevision ||
-                        (candidate.sourceTextRevision == existing.sourceTextRevision &&
-                            candidate.sourceText.length > existing.sourceText.length &&
-                            (candidate.endTimeMs - candidate.startTimeMs) >= (existing.endTimeMs - existing.startTimeMs) * 0.7f)
-                    if (preferCandidate) {
-                        accepted[conflictIdx] = candidate
-                    }
-                }
-            }
-        }
-        return accepted.sortedBy { it.startTimeMs }
+        return (outside + lockedInside + filteredIncoming).sortedBy { it.startTimeMs }
     }
 
     /**
@@ -744,38 +573,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
      * via the same [BalloonLayoutEngine] -> ReleasedTimelineStore atomically publishes the reviewed
      * interval (or rejects stale session/seek/config/revision writes).
      */
-    private fun buildScout1TimestampReport(
-        windowStartMs: Long,
-        windowEndMs: Long,
-        events: List<DialogueEvent>,
-        rawCuesByEventId: Map<String, AiTranscribedCue> = emptyMap(),
-        explicitProvenance: ScoutClockProvenance? = null,
-    ): Scout1TimestampReport {
-        val provenance = explicitProvenance ?: when {
-            rawCuesByEventId.isEmpty() -> ScoutClockProvenance.WINDOW_FALLBACK
-            rawCuesByEventId.values.any { it.appliedClockOffsetMs > 0L } -> ScoutClockProvenance.OFFSET_SHIFTED_RELATIVE
-            else -> ScoutClockProvenance.ABSOLUTE_VIDEO_SEC
-        }
-        val entries = events.map { evt ->
-            val raw = rawCuesByEventId[evt.id]
-            Scout1CueTimestamp(
-                eventId = evt.id,
-                stableCueKey = evt.canonicalIdentityKey,
-                reportedStartMs = evt.startTimeMs,
-                reportedEndMs = evt.endTimeMs,
-                rawStartSec = raw?.rawStartSec,
-                rawEndSec = raw?.rawEndSec,
-                appliedClockOffsetMs = raw?.appliedClockOffsetMs ?: 0L,
-            )
-        }
-        return Scout1TimestampReport(
-            windowStartMs = windowStartMs,
-            windowEndMs = windowEndMs,
-            clockProvenance = provenance,
-            cueTimestamps = entries,
-        )
-    }
-
     internal fun stageAndReviewIntervalThroughReleaseGate(
         project: DialogueLensProject,
         intervalId: String,
@@ -790,7 +587,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         hasIndependentAudioOrFrameEvidence: Boolean = false,
         elapsedProcessingMs: Long = 0L,
         expectedConfigFingerprint: String? = null,
-        timestampReport: Scout1TimestampReport? = null,
     ): Pair<IntervalReviewOutcome?, ReleasedPlaybackSnapshot> {
         if (elapsedProcessingMs > 0L) {
             readinessController.recordProcessingLatencyMs(elapsedProcessingMs)
@@ -800,11 +596,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         val nowMs = System.currentTimeMillis()
         val draftRev = nextDraftRevision.incrementAndGet()
         val refTrack = releaseStore.currentReferenceTrack()
-        val resolvedReport = timestampReport ?: buildScout1TimestampReport(
-            windowStartMs = startMs,
-            windowEndMs = endMs,
-            events = events,
-        )
         val draft = DraftInterval(
             intervalId = intervalId,
             mediaId = project.id,
@@ -825,15 +616,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             hasUnavailableEvidence = hasUnavailableEvidence,
             hasIndependentAudioOrFrameEvidence = hasIndependentAudioOrFrameEvidence,
             createdAtEpochMs = nowMs,
-            timestampReport = resolvedReport,
         )
         if (!releaseStore.stageDraft(draft)) {
             return null to releaseStore.snapshot()
         }
-        val reportSummaryLabel = "Scout 1 report: ${resolvedReport.cueTimestamps.size} cues · " +
-            "${SubtitleParser.formatCompactTime(startMs)}–${SubtitleParser.formatCompactTime(endMs)} · " +
-            resolvedReport.clockProvenance.name
-        sentinelCoordinator.recordScout1TimestampReportSummary(reportSummaryLabel)
         sentinelCoordinator.updatePendingReviewCount(releaseStore.pendingDraftCount())
 
         // Dependent Stage Scheduler: Scout 2 review runs at CRITICAL priority and is NEVER suspended by low lead
@@ -869,15 +655,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     repairCompleted = false,
                 )
             }
-            val deferredSnap = releaseStore.snapshot()
-            _uiState.update {
-                it.copy(
-                    releaseSnapshot = deferredSnap,
-                    sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
-                )
-            }
             wakeScheduler("review_claim_deferred")
-            return null to deferredSnap
+            return null to releaseStore.snapshot()
         }
         val stagedDraft = releaseStore.pendingDraft(claimedReview.first.beaconId ?: intervalId)
         if (stagedDraft == null || stagedDraft.draftRevision != draft.draftRevision) {
@@ -913,16 +692,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             outcome = outcome,
             nowEpochMs = System.currentTimeMillis(),
         )
-        if (releasedSnap != null) {
-            sentinelCoordinator.recordScoutTimestampAudit(
-                reportSummary = outcome.scout1ReportSummary.ifBlank { reportSummaryLabel },
-                verifiedCount = outcome.timestampVerifiedCount,
-                adjustedCount = outcome.timestampAdjustedCount,
-                adjustments = outcome.timestampAdjustments,
-            )
-        }
         sentinelCoordinator.updatePendingReviewCount(releaseStore.pendingDraftCount())
-        _uiState.update { it.copy(sentinelSnapshot = sentinelCoordinator.inspectorSnapshot()) }
         return if (releasedSnap != null) outcome to releasedSnap else null to releaseStore.snapshot()
     }
 
@@ -941,16 +711,16 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             }
             VideoSourceKind.YOUTUBE_COMPLIANT,
             VideoSourceKind.WEB_STREAM -> {
-                val playSeq = issuePendingStreamPlayCommand(true, targetMs)
+                val playSeq = ++nextStreamCommandSeq
                 val seekSeq = if (kotlin.math.abs(cur.currentTimeMs - targetMs) > 1_200L) {
                     ++nextStreamCommandSeq
                 } else {
                     null
                 }
-                playbackClockAnchor.reset(targetMs, cur.playbackSpeed, playing = false)
+                playbackClockAnchor.reset(targetMs, cur.playbackSpeed, playing = true)
                 _uiState.update { s ->
                     s.copy(
-                        isPlaying = false,
+                        isPlaying = true,
                         isCinemaIntroActive = false,
                         isScoutCatchUpBuffering = false,
                         currentTimeMs = targetMs,
@@ -1174,25 +944,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
         viewModelScope.launch {
             projectStore.quotaSaverModeFlow.collect { mode ->
-                val expectedOverride = pendingQuotaModeOverride
-                if (expectedOverride != null) {
-                    if (mode != expectedOverride) {
-                        return@collect
-                    }
-                    pendingQuotaModeOverride = null
-                }
-                val prevMode = _uiState.value.quotaSaverMode
                 scoutHeartbeatService.setZeroCloudPaused(mode == QuotaSaverMode.ZERO_CLOUD)
                 sentinelCoordinator.updateRuntimeConditions(quotaMode = mode)
                 _uiState.update {
                     it.copy(
                         quotaSaverMode = mode,
                         sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
-                    )
-                }
-                if (prevMode != mode) {
-                    releaseStore.updateSeekOrConfigGeneration(
-                        configFingerprint = currentConfigFingerprint(_uiState.value.project, mode),
                     )
                 }
             }
@@ -1283,11 +1040,9 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         }
 
         startPlaybackTicker()
-        startScout2ReviewAndDeadlineLoop()
     }
 
     fun setQuotaSaverMode(mode: QuotaSaverMode) {
-        pendingQuotaModeOverride = mode
         if (mode != QuotaSaverMode.ZERO_CLOUD) {
             quotaCircuitBreakerTripped = false
             downgradedToLiteForStream = false
@@ -1322,12 +1077,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             changeoverPreListenJob?.cancel()
             lookaheadJob?.cancel()
             healBeaconJob?.cancel()
-            clearCapturedAudioQueueSync()
             aiTranslationJob?.cancel()
             speakerAnalysisJob?.cancel()
             castDiscoveryJob?.cancel()
             sentinelCoordinator.cancelQueuedCloudWork()
-            sentinelCoordinator.cancelOrSupersedeStaleHealTasks(_uiState.value.seekGeneration)
             sentinelCoordinator.updateRuntimeConditions(
                 quotaMode = QuotaSaverMode.ZERO_CLOUD,
                 isPlaybackBuffering = _uiState.value.readinessSnapshot.isBufferingHoldActive,
@@ -1403,8 +1156,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         if (state.isPlaying &&
                             !state.isCinemaIntroActive &&
                             !state.isScoutCatchUpBuffering &&
-                            !state.hasPendingPlayIntro &&
-                            !state.readinessSnapshot.diagnostics.isSeekInFlight
+                            !state.hasPendingPlayIntro
                         ) {
                             val maxDur = state.project.videoSource.durationMs.coerceAtLeast(1000L)
                             val sampled = playbackClockAnchor.sampleInterpolatedMs(
@@ -1430,261 +1182,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     }
                 }
                 delay(16L)
-            }
-        }
-    }
-
-    private fun issuePendingStreamPlayCommand(targetPlaying: Boolean, positionMs: Long): Int {
-        val seq = ++nextStreamCommandSeq
-        val cur = _uiState.value
-        pendingTransportCommand = PendingTransportCommand(
-            seq = seq,
-            targetPlaying = targetPlaying,
-            issuedAtMs = System.currentTimeMillis(),
-            sessionToken = activeSessionToken.get(),
-            seekGeneration = cur.seekGeneration,
-            sourceId = cur.project.id,
-        )
-        return seq
-    }
-
-    private fun cancelPendingPlayCommand() {
-        if (pendingTransportCommand?.targetPlaying == true) {
-            pendingTransportCommand = null
-        }
-    }
-
-    fun onStreamPlayCommandResult(seq: Int, playing: Boolean, rejected: Boolean, reason: String) {
-        val pending = pendingTransportCommand
-        val cur = _uiState.value
-        val kind = cur.project.videoSource.kind
-        if (kind != VideoSourceKind.YOUTUBE_COMPLIANT && kind != VideoSourceKind.WEB_STREAM) return
-        val currentIntent = cur.readinessSnapshot.userIntent
-        val isMatchingPending = pending != null &&
-            pending.seq == seq &&
-            pending.sessionToken == activeSessionToken.get() &&
-            pending.sourceId == cur.project.id &&
-            pending.seekGeneration == cur.seekGeneration
-
-        if (rejected) {
-            if (isMatchingPending) pendingTransportCommand = null
-            val isTransientUnready = reason.contains("not ready", ignoreCase = true) ||
-                reason.contains("pending", ignoreCase = true) ||
-                reason.contains("No video element", ignoreCase = true)
-            if (currentIntent == UserPlaybackIntent.PLAY && !isTransientUnready && reason.isNotBlank()) {
-                val errReadiness = readinessController.onMediaOrAnalysisError(
-                    reason = reason,
-                    isMediaHardwareError = true,
-                )
-                playbackClockAnchor.reset(cur.currentTimeMs, cur.playbackSpeed, playing = false)
-                _uiState.update { state ->
-                    state.copy(
-                        isPlaying = false,
-                        isScoutCatchUpBuffering = false,
-                        readinessSnapshot = errReadiness,
-                        humanReadiness = HumanReadableStatus.resolve(
-                            project = state.project,
-                            scoutState = state.scoutCaptionState,
-                            coverageSummary = state.coverageSummary,
-                            readinessSnapshot = errReadiness,
-                            releaseSnapshot = state.releaseSnapshot,
-                            sentinelSnapshot = state.sentinelSnapshot,
-                        ),
-                    )
-                }
-            }
-            return
-        }
-
-        if (isMatchingPending) {
-            if (pending!!.targetPlaying && currentIntent == UserPlaybackIntent.PAUSE) {
-                pendingTransportCommand = null
-                val pauseSeq = ++nextStreamCommandSeq
-                playbackClockAnchor.reset(cur.currentTimeMs, cur.playbackSpeed, playing = false)
-                _uiState.update { it.copy(isPlaying = false, streamPlayRequest = pauseSeq to false) }
-                return
-            }
-            if (playing == pending.targetPlaying) {
-                pendingTransportCommand = null
-                val allowPlay = playing &&
-                    currentIntent == UserPlaybackIntent.PLAY &&
-                    !cur.readinessSnapshot.isBufferingHoldActive &&
-                    cur.readinessSnapshot.state != PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR
-                playbackClockAnchor.reset(cur.currentTimeMs, cur.playbackSpeed, playing = allowPlay)
-                _uiState.update { state ->
-                    state.copy(
-                        isPlaying = allowPlay,
-                        hasPendingPlayIntro = if (allowPlay) false else state.hasPendingPlayIntro,
-                    )
-                }
-            }
-        }
-    }
-
-    /**
-     * Independent lifecycle-aware Scout 2 drain and deadline loop that continues even while
-     * the viewer clock is paused/held, ensuring deferred reviews execute cleanly without
-     * retranscribing intervals and deadlines emit explicit terminal outcomes.
-     */
-    private fun startScout2ReviewAndDeadlineLoop() {
-        scoutReviewLoopJob?.cancel()
-        scoutReviewLoopJob = viewModelScope.launch {
-            while (isActive) {
-                delay(350L)
-                val state = _uiState.value
-                if (state.showStartLauncher) continue
-                val proj = state.project
-                if (proj.videoSource.kind == VideoSourceKind.DEMO_SCENARIO) continue
-                val sessionToken = activeSessionToken.get()
-                val playheadMs = sentinelCoordinator.currentAcknowledgedViewerPosMs()
-                val nowMs = System.currentTimeMillis()
-                var drainedAny = false
-
-                while (isActive) {
-                    val claimed = sentinelCoordinator.claimRequiredReviewWork(
-                        workerId = SentinelWorkforceCoordinator.WORKER_2_ID,
-                        playheadMs = playheadMs,
-                        nowEpochMs = nowMs,
-                    ) ?: break
-                    val (item, res) = claimed
-                    val intervalId = item.beaconId
-                    if (intervalId == null) {
-                        sentinelCoordinator.markWorkerIdle(SentinelWorkforceCoordinator.WORKER_2_ID, res.reservationId, false)
-                        continue
-                    }
-                    val draft = releaseStore.pendingDraft(intervalId)
-                    if (draft == null || draft.mediaId != proj.id || draft.sessionToken != sessionToken) {
-                        sentinelCoordinator.markWorkerIdle(SentinelWorkforceCoordinator.WORKER_2_ID, res.reservationId, false)
-                        continue
-                    }
-                    val ctx = WorkRequestContext(
-                        mediaId = draft.mediaId,
-                        sessionToken = draft.sessionToken,
-                        seekGeneration = draft.seekGeneration,
-                        configFingerprint = draft.configFingerprint,
-                    )
-                    val refTrack = releaseStore.currentReferenceTrack()
-                    val outcome = try {
-                        if (!isRequestContextCurrent(ctx)) {
-                            null
-                        } else {
-                            scout2Reviewer.reviewDraft(
-                                draft = draft,
-                                referenceTrack = refTrack,
-                                layoutEngine = layoutEngine,
-                                projectTemplate = proj,
-                                liveFaces = currentLiveFaces,
-                                liveFacesPlayheadMs = _uiState.value.currentTimeMs,
-                                measuredNormalizedSizes = measuredBubbleSizes.toMap(),
-                                styleSettings = _uiState.value.styleSettings,
-                                displayMode = _uiState.value.displayMode,
-                            )
-                        }
-                    } finally {
-                        sentinelCoordinator.markWorkerIdle(
-                            workerId = SentinelWorkforceCoordinator.WORKER_2_ID,
-                            reservationId = res.reservationId,
-                            repairCompleted = true,
-                        )
-                    }
-                    if (outcome != null && isRequestContextCurrent(ctx)) {
-                        val snap = releaseStore.commitReviewedRelease(draft, outcome, System.currentTimeMillis())
-                        if (snap != null) {
-                            sentinelCoordinator.recordScoutTimestampAudit(
-                                reportSummary = outcome.scout1ReportSummary,
-                                verifiedCount = outcome.timestampVerifiedCount,
-                                adjustedCount = outcome.timestampAdjustedCount,
-                                adjustments = outcome.timestampAdjustments,
-                            )
-                            drainedAny = true
-                            val liveProj = _uiState.value.project
-                            val canPublish = !LookaheadWindowPlanner.hasLoadedSubtitlesLocked(
-                                liveProj.subtitleSource,
-                                liveProj.dialogueEvents,
-                            )
-                            val covStatus = when {
-                                outcome.dialogueStatus == DialogueReviewStatus.GAP_UNRESOLVED && outcome.repairedEvents.isEmpty() ->
-                                    CoverageStatus.CAPTION_GAP
-                                outcome.isIndependentlyVerified && outcome.repairedEvents.isEmpty() ->
-                                    CoverageStatus.VERIFIED_SILENCE
-                                outcome.isIndependentlyVerified ->
-                                    CoverageStatus.VERIFIED_DIALOGUE
-                                else ->
-                                    CoverageStatus.RELEASED_FALLBACK
-                            }
-                            if (canPublish && (outcome.repairedEvents.isNotEmpty() || covStatus != CoverageStatus.VERIFIED_DIALOGUE)) {
-                                publishReleasedEventsToProject(
-                                    startMs = draft.startMs,
-                                    endMs = draft.endMs,
-                                    releasedEvents = outcome.repairedEvents,
-                                    coverageStatus = covStatus,
-                                    source = SubtitleSourceKind.AI_DRAFT,
-                                    speakers = draft.speakers,
-                                )
-                            } else {
-                                coverageLedger.recordOutcome(
-                                    startMs = draft.startMs,
-                                    endMs = draft.endMs,
-                                    status = covStatus,
-                                    source = SubtitleSourceKind.AI_DRAFT,
-                                    dialogueCount = outcome.repairedEvents.size,
-                                )
-                            }
-                        }
-                    }
-                }
-
-                val curState = _uiState.value
-                val fallbacks = releaseStore.applyDeadlineFallbackIfDue(
-                    nowEpochMs = System.currentTimeMillis(),
-                    playheadMs = curState.currentTimeMs,
-                    isPlaying = curState.isPlaying,
-                )
-                if (fallbacks.isNotEmpty()) {
-                    val curProj = curState.project
-                    val canPublishFallback = !LookaheadWindowPlanner.hasLoadedSubtitlesLocked(
-                        curProj.subtitleSource,
-                        curProj.dialogueEvents,
-                    )
-                    fallbacks.forEach { fb ->
-                        val status = when (fb.reviewOutcome.dialogueStatus) {
-                            DialogueReviewStatus.UNAVAILABLE_EVIDENCE,
-                            DialogueReviewStatus.GAP_UNRESOLVED -> CoverageStatus.CAPTION_GAP
-                            else -> CoverageStatus.RELEASED_FALLBACK
-                        }
-                        val reason = when (fb.reviewOutcome.dialogueStatus) {
-                            DialogueReviewStatus.UNAVAILABLE_EVIDENCE -> "DEADLINE_UNAVAILABLE_EVIDENCE"
-                            DialogueReviewStatus.GAP_UNRESOLVED -> "DEADLINE_GAP_UNRESOLVED"
-                            else -> "DEADLINE_FALLBACK_UNVERIFIED"
-                        }
-                        if (canPublishFallback && fb.events.isNotEmpty()) {
-                            publishReleasedEventsToProject(
-                                startMs = fb.startMs,
-                                endMs = fb.endMs,
-                                releasedEvents = fb.events,
-                                coverageStatus = status,
-                                source = curProj.subtitleSource,
-                                failureReason = reason,
-                            )
-                        } else {
-                            coverageLedger.recordOutcome(
-                                startMs = fb.startMs,
-                                endMs = fb.endMs,
-                                status = status,
-                                source = curProj.subtitleSource,
-                                dialogueCount = fb.events.size,
-                                failureReason = reason,
-                            )
-                        }
-                    }
-                    drainedAny = true
-                }
-                if (drainedAny) {
-                    sentinelCoordinator.updatePendingReviewCount(releaseStore.pendingDraftCount())
-                    _uiState.update { it.copy(releaseSnapshot = releaseStore.snapshot()) }
-                    syncCoverageUiState()
-                    wakeScheduler("scout2_review_or_deadline_drained")
-                }
             }
         }
     }
@@ -1826,11 +1323,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         }
         // Only reveal/queue chapter patrol tasks that now fall inside the active 3-minute boundary
         sentinelCoordinator.planDefaultChapterPatrol(state.project)
-        val claimed = sentinelCoordinator.claimNextWork(
-            workerId = SentinelWorkforceCoordinator.WORKER_1_ID,
-            nowEpochMs = now,
-            allowedKinds = setOf(SentinelTaskKind.CHAPTER_BOUNDARY_PATROL),
-        )
+        val claimed = sentinelCoordinator.claimNextWork(SentinelWorkforceCoordinator.WORKER_1_ID, now)
         if (claimed != null) {
             val (item, res) = claimed
             try {
@@ -2017,10 +1510,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                             if (reconciledCues.isNotEmpty()) {
                                 val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
                                 val hintMap = mutableMapOf<String, AiTranslatedLine>()
-                                val rawCuesByEventId = mutableMapOf<String, AiTranscribedCue>()
                                 val incomingEvents = reconciledCues.map { cue ->
                                     val eventId = SubtitleParser.newEventId()
-                                    rawCuesByEventId[eventId] = cue
                                     val isOffOrNonSpoken = cue.dialogueType != DialogueType.SPOKEN
                                     val spatialAnchor = if (!isOffOrNonSpoken && cue.anchorX != null && cue.anchorY != null) {
                                         NormalizedPoint(cue.anchorX, cue.anchorY)
@@ -2099,7 +1590,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                         .map { it.startMs }
                                         .filter { it > 0L }
                                         .sorted()
-                                    val slotMap = buildSlotToSpeakerIdMap(workingProj.speakers)
                                     val (attributedSpeakers, attributedEvents) = attributionEngine.assignSpeakers(
                                         events = mergeReport.events,
                                         shots = workingProj.shots,
@@ -2109,7 +1599,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                         rememberedCharacterColors = _uiState.value.characterColorMemory,
                                         settledEventIds = settledAttributedEventIds,
                                         sceneBoundaryMs = sceneBoundaries,
-                                        slotToSpeakerId = slotMap,
                                     )
                                     val finalEvents = applyCutawayOffScreenSideMemory(
                                         events = attributedEvents,
@@ -2122,12 +1611,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                         }
                                     }
                                     val seamEvents = finalEvents.filter { it.startTimeMs in seamStartMs until seamEndMs }
-                                    val seamTimestampReport = buildScout1TimestampReport(
-                                        windowStartMs = seamStartMs,
-                                        windowEndMs = seamEndMs,
-                                        events = seamEvents,
-                                        rawCuesByEventId = rawCuesByEventId,
-                                    )
                                     val (reviewOutcome, releaseSnap) = stageAndReviewIntervalThroughReleaseGate(
                                         project = workingProj.copy(speakers = attributedSpeakers, dialogueEvents = finalEvents),
                                         intervalId = "seam_${seamStartMs}_${seamEndMs}",
@@ -2140,7 +1623,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                         hasIndependentAudioOrFrameEvidence = false,
                                         elapsedProcessingMs = (System.currentTimeMillis() - seamExecStartMs).coerceAtLeast(1L),
                                         expectedConfigFingerprint = requestCtx.configFingerprint,
-                                        timestampReport = seamTimestampReport,
                                     )
                                     if (reviewOutcome != null) {
                                         val mergedReviewed = mergeReleasedIntervalPreservingLocks(
@@ -2256,7 +1738,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         liveFaces: List<LiveFaceObservation> = currentLiveFaces,
         displayMode: CaptionDisplayMode = _uiState.value.displayMode,
     ): Pair<List<PlacedBalloon>, VideoChapter?> {
-        val primaryMode = displayMode.normalizedPrimaryMode()
         val ctx = contextEngine.onPlaybackPosition(project, timeMs)
         val balloons = layoutEngine.computeLayout(
             project = project,
@@ -2268,28 +1749,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             liveFrameObservedEmpty = ctx.sceneMemory.liveFrameObservedEmpty,
             activeChapterId = ctx.chapterMemory.activeChapter?.id,
             measuredNormalizedSizes = measuredBubbleSizes,
-            fixedZoneTaillessMode = !primaryMode.shouldShowTails,
-            displayMode = primaryMode,
+            fixedZoneTaillessMode = displayMode == CaptionDisplayMode.FIXED_ZONES,
             detectorFrameId = lastDetectorFrameId,
         )
         return balloons to ctx.chapterMemory.activeChapter
-    }
-
-    private fun updateVisualPresentationOnly(targetMs: Long) {
-        _uiState.update { state ->
-            val (balloons, activeChapter) = computeContextAwareLayout(
-                project = state.project,
-                timeMs = targetMs,
-                styleSettings = state.styleSettings,
-                liveFaces = currentLiveFaces,
-                displayMode = state.displayMode,
-            )
-            state.copy(
-                placedBalloons = balloons,
-                activeChapter = activeChapter,
-                visualStabilitySnapshot = layoutEngine.stabilityDiagnostics.snapshot(),
-            )
-        }
     }
 
     private fun updateTimeAndLayout(timeMs: Long) {
@@ -2385,7 +1848,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             val fallbacks = releaseStore.applyDeadlineFallbackIfDue(
                 nowEpochMs = nowMs,
                 playheadMs = timeMs,
-                isPlaying = preState.isPlaying,
             )
             if (fallbacks.isNotEmpty()) {
                 val curProj = _uiState.value.project
@@ -2394,33 +1856,23 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     curProj.dialogueEvents,
                 )
                 fallbacks.forEach { fb ->
-                    val status = when (fb.reviewOutcome.dialogueStatus) {
-                        DialogueReviewStatus.UNAVAILABLE_EVIDENCE,
-                        DialogueReviewStatus.GAP_UNRESOLVED -> CoverageStatus.CAPTION_GAP
-                        else -> CoverageStatus.RELEASED_FALLBACK
-                    }
-                    val reason = when (fb.reviewOutcome.dialogueStatus) {
-                        DialogueReviewStatus.UNAVAILABLE_EVIDENCE -> "DEADLINE_UNAVAILABLE_EVIDENCE"
-                        DialogueReviewStatus.GAP_UNRESOLVED -> "DEADLINE_GAP_UNRESOLVED"
-                        else -> "DEADLINE_FALLBACK_UNVERIFIED"
-                    }
                     if (canPublishFallback && fb.events.isNotEmpty()) {
                         publishReleasedEventsToProject(
                             startMs = fb.startMs,
                             endMs = fb.endMs,
                             releasedEvents = fb.events,
-                            coverageStatus = status,
+                            coverageStatus = CoverageStatus.RELEASED_FALLBACK,
                             source = curProj.subtitleSource,
-                            failureReason = reason,
+                            failureReason = "DEADLINE_FALLBACK_UNVERIFIED",
                         )
                     } else {
                         coverageLedger.recordOutcome(
                             startMs = fb.startMs,
                             endMs = fb.endMs,
-                            status = status,
+                            status = CoverageStatus.RELEASED_FALLBACK,
                             source = curProj.subtitleSource,
                             dialogueCount = fb.events.size,
-                            failureReason = reason,
+                            failureReason = "DEADLINE_FALLBACK_UNVERIFIED",
                         )
                     }
                 }
@@ -2520,8 +1972,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         liveFrameObservedEmpty = ctx.sceneMemory.liveFrameObservedEmpty,
                         activeChapterId = ctx.chapterMemory.activeChapter?.id,
                         measuredNormalizedSizes = measuredBubbleSizes,
-                        fixedZoneTaillessMode = !cur.displayMode.normalizedPrimaryMode().shouldShowTails,
-                        displayMode = cur.displayMode.normalizedPrimaryMode(),
+                        fixedZoneTaillessMode = cur.displayMode == CaptionDisplayMode.FIXED_ZONES,
                         detectorFrameId = lastDetectorFrameId,
                     ),
                     visualStabilitySnapshot = layoutEngine.stabilityDiagnostics.snapshot(),
@@ -2591,9 +2042,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
     fun dismissScoutCatchUpBuffering() {
         val state = _uiState.value
-        if (state.isCinemaIntroActive) {
-            introJob?.cancel()
-        }
         val bypassSnap = readinessController.onUserWatchNowBypass()
         sentinelCoordinator.onViewerPauseChanged(
             paused = false,
@@ -2601,13 +2049,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             durationMs = state.project.videoSource.durationMs,
         )
         if (!state.isScoutCatchUpBuffering && !state.readinessSnapshot.isBufferingHoldActive) {
-            _uiState.update {
-                it.copy(
-                    isCinemaIntroActive = false,
-                    introRemainingMs = 0L,
-                    readinessSnapshot = bypassSnap,
-                )
-            }
+            _uiState.update { it.copy(readinessSnapshot = bypassSnap) }
             return
         }
         val kind = state.project.videoSource.kind
@@ -2615,8 +2057,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             VideoSourceKind.LOCAL_MP4 -> {
                 _uiState.update {
                     it.copy(
-                        isCinemaIntroActive = false,
-                        introRemainingMs = 0L,
                         isScoutCatchUpBuffering = false,
                         isPlaying = true,
                         readinessSnapshot = bypassSnap,
@@ -2628,14 +2068,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             }
             VideoSourceKind.YOUTUBE_COMPLIANT,
             VideoSourceKind.WEB_STREAM -> {
-                val cmdSeq = issuePendingStreamPlayCommand(true, state.currentTimeMs)
-                playbackClockAnchor.reset(state.currentTimeMs, state.playbackSpeed, playing = false)
+                val cmdSeq = ++nextStreamCommandSeq
+                playbackClockAnchor.reset(state.currentTimeMs, state.playbackSpeed, playing = true)
                 _uiState.update {
                     it.copy(
-                        isCinemaIntroActive = false,
-                        introRemainingMs = 0L,
                         isScoutCatchUpBuffering = false,
-                        isPlaying = false,
+                        isPlaying = true,
                         streamPlayRequest = cmdSeq to true,
                         readinessSnapshot = bypassSnap,
                         sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
@@ -2645,8 +2083,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             VideoSourceKind.DEMO_SCENARIO -> {
                 _uiState.update {
                     it.copy(
-                        isCinemaIntroActive = false,
-                        introRemainingMs = 0L,
                         isScoutCatchUpBuffering = false,
                         isPlaying = true,
                         readinessSnapshot = bypassSnap,
@@ -2683,63 +2119,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     durationMs = state.project.videoSource.durationMs,
                 )
                 wakeScheduler("user_play_during_hold")
-                val canPlayNow = !playSnap.isBufferingHoldActive &&
-                    playSnap.state != PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR
-                if (canPlayNow) {
-                    introJob?.cancel()
-                    val kind = state.project.videoSource.kind
-                    when (kind) {
-                        VideoSourceKind.LOCAL_MP4 -> {
-                            exoPlayer.play()
-                            playbackClockAnchor.reset(state.currentTimeMs, state.playbackSpeed, playing = true)
-                            _uiState.update {
-                                it.copy(
-                                    isCinemaIntroActive = false,
-                                    introRemainingMs = 0L,
-                                    isScoutCatchUpBuffering = false,
-                                    isPlaying = true,
-                                    readinessSnapshot = playSnap,
-                                    sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
-                                )
-                            }
-                        }
-                        VideoSourceKind.YOUTUBE_COMPLIANT,
-                        VideoSourceKind.WEB_STREAM -> {
-                            val cmdSeq = issuePendingStreamPlayCommand(true, state.currentTimeMs)
-                            playbackClockAnchor.reset(state.currentTimeMs, state.playbackSpeed, playing = false)
-                            _uiState.update {
-                                it.copy(
-                                    isCinemaIntroActive = false,
-                                    introRemainingMs = 0L,
-                                    isScoutCatchUpBuffering = false,
-                                    isPlaying = false,
-                                    streamPlayRequest = cmdSeq to true,
-                                    readinessSnapshot = playSnap,
-                                    sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
-                                )
-                            }
-                        }
-                        VideoSourceKind.DEMO_SCENARIO -> {
-                            _uiState.update {
-                                it.copy(
-                                    isCinemaIntroActive = false,
-                                    introRemainingMs = 0L,
-                                    isScoutCatchUpBuffering = false,
-                                    isPlaying = true,
-                                    readinessSnapshot = playSnap,
-                                    sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
-                                )
-                            }
-                        }
-                    }
-                } else {
-                    _uiState.update {
-                        it.copy(
-                            isScoutCatchUpBuffering = playSnap.isBufferingHoldActive,
-                            readinessSnapshot = playSnap,
-                            sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
-                        )
-                    }
+                _uiState.update {
+                    it.copy(
+                        isScoutCatchUpBuffering = playSnap.isBufferingHoldActive,
+                        readinessSnapshot = playSnap,
+                        sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
+                    )
                 }
             }
             return
@@ -2813,31 +2198,16 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             }
             VideoSourceKind.YOUTUBE_COMPLIANT,
             VideoSourceKind.WEB_STREAM -> {
-                if (allowImmediateMediaPlay) {
-                    val cmdSeq = issuePendingStreamPlayCommand(true, state.currentTimeMs)
-                    playbackClockAnchor.reset(state.currentTimeMs, state.playbackSpeed, playing = false)
-                    _uiState.update { cur ->
-                        cur.copy(
-                            isPlaying = false,
-                            isScoutCatchUpBuffering = false,
-                            streamPlayRequest = cmdSeq to true,
-                            readinessSnapshot = nextReadiness,
-                            sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
-                        )
-                    }
-                } else {
-                    cancelPendingPlayCommand()
-                    val cmdSeq = ++nextStreamCommandSeq
-                    playbackClockAnchor.reset(state.currentTimeMs, state.playbackSpeed, playing = false)
-                    _uiState.update { cur ->
-                        cur.copy(
-                            isPlaying = false,
-                            isScoutCatchUpBuffering = nextReadiness.isBufferingHoldActive,
-                            streamPlayRequest = cmdSeq to false,
-                            readinessSnapshot = nextReadiness,
-                            sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
-                        )
-                    }
+                val cmdSeq = ++nextStreamCommandSeq
+                playbackClockAnchor.reset(state.currentTimeMs, state.playbackSpeed, playing = allowImmediateMediaPlay)
+                _uiState.update { cur ->
+                    cur.copy(
+                        isPlaying = allowImmediateMediaPlay,
+                        isScoutCatchUpBuffering = nextReadiness.isBufferingHoldActive,
+                        streamPlayRequest = cmdSeq to allowImmediateMediaPlay,
+                        readinessSnapshot = nextReadiness,
+                        sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
+                    )
                 }
             }
             VideoSourceKind.DEMO_SCENARIO -> {
@@ -2853,7 +2223,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun pausePlayback() {
-        cancelPendingPlayCommand()
         val cur = _uiState.value
         val kind = cur.project.videoSource.kind
         val pausedSnap = readinessController.onUserPauseRequested(cur.currentTimeMs)
@@ -2865,7 +2234,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         if (kind == VideoSourceKind.LOCAL_MP4) {
             exoPlayer.pause()
         }
-        playbackClockAnchor.reset(cur.currentTimeMs, cur.playbackSpeed, playing = false)
         val pauseSeq = if (kind == VideoSourceKind.YOUTUBE_COMPLIANT || kind == VideoSourceKind.WEB_STREAM) {
             ++nextStreamCommandSeq
         } else {
@@ -2902,7 +2270,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun seekTo(timeMs: Long) {
-        cancelPendingPlayCommand()
         val cur = _uiState.value
         val duration = cur.project.videoSource.durationMs.coerceAtLeast(1000L)
         val clamped = timeMs.coerceIn(0L, duration)
@@ -2913,20 +2280,16 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             durationMs = duration,
             isPlaying = seekSnap.userIntent == UserPlaybackIntent.PLAY,
             externalSeekGeneration = nextSeekGen,
-            anchorBoundaryImmediately = cur.project.videoSource.kind == VideoSourceKind.DEMO_SCENARIO,
         )
 
         val significantJump = kotlin.math.abs(clamped - cur.currentTimeMs) > 2_500L
         changeoverPreListenJob?.cancel()
-        seekAckTimeoutJob?.cancel()
         if (significantJump) {
             aiTranslationJob?.cancel()
             speakerAnalysisJob?.cancel()
             lastAutoAiTriggerElapsedMs = 0L
             lastScoutSeekSentAtMs = 0L
             lastScoutSeekTargetMs = -1L
-            scoutAudioSliceTimestamps.clear()
-            pendingCapturedAudioQueue.clear()
             if (cur.isTranslatingAi || cur.isScoutCatchUpBuffering) {
                 _uiState.update { state ->
                     state.copy(
@@ -2941,14 +2304,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 }
             }
         }
-
-        // Supersede older queued heal beacons & cancel stale coordinator heal tasks on committed seek
-        val supersededProj = HealBeaconEngine.supersedeOrCancelStaleBeacons(
-            project = _uiState.value.project,
-            activeGenerationToken = nextSeekGen,
-            cancelActiveHealing = false,
-        )
-        sentinelCoordinator.cancelOrSupersedeStaleHealTasks(nextSeekGen)
 
         currentLiveFaces = emptyList()
         lastDetectorFrameId = -1L
@@ -2971,7 +2326,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         }
         _uiState.update {
             it.copy(
-                project = supersededProj,
                 liveFaceExclusionRects = emptyList(),
                 seekGeneration = nextSeekGen,
                 isPlaying = if (holdAfterSeek) false else it.isPlaying,
@@ -2982,117 +2336,28 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
             )
         }
-        val kind = _uiState.value.project.videoSource.kind
-        when (kind) {
-            VideoSourceKind.LOCAL_MP4 -> {
-                exoPlayer.seekTo(clamped)
-                readinessController.onSeekDispatched(nextSeekGen)
-            }
+        when (_uiState.value.project.videoSource.kind) {
+            VideoSourceKind.LOCAL_MP4 -> exoPlayer.seekTo(clamped)
             VideoSourceKind.YOUTUBE_COMPLIANT,
             VideoSourceKind.WEB_STREAM -> {
                 val seekSeq = ++nextStreamCommandSeq
                 _uiState.update { state ->
                     state.copy(youtubeSeekRequest = seekSeq to clamped)
                 }
-                readinessController.onSeekDispatched(nextSeekGen)
             }
             VideoSourceKind.DEMO_SCENARIO -> Unit
         }
         layoutEngine.clearSmoothing()
-        if (kind == VideoSourceKind.DEMO_SCENARIO) {
-            playbackClockAnchor.reset(
-                positionMs = clamped,
-                speed = _uiState.value.playbackSpeed,
-                playing = if (holdAfterSeek) false else _uiState.value.isPlaying,
-            )
-            updateTimeAndLayout(clamped)
-        } else {
-            // Do NOT self-acknowledge async seeks before the player actually arrives;
-            // keep playbackClockAnchor & currentTimeMs on observed position with isSeekInFlight = true.
-            playbackClockAnchor.reset(
-                positionMs = _uiState.value.currentTimeMs,
-                speed = _uiState.value.playbackSpeed,
-                playing = false,
-            )
-            updateVisualPresentationOnly(clamped)
-            seekAckTimeoutJob = viewModelScope.launch {
-                delay(PlaybackReadinessController.SEEK_ACK_TIMEOUT_MS + 250L)
-                val currentSnap = readinessController.snapshot()
-                if (currentSnap.diagnostics.seekGeneration == nextSeekGen &&
-                    currentSnap.diagnostics.isSeekInFlight
-                ) {
-                    val timedOutSnap = readinessController.onSeekAckTimedOut(coverageLedger)
-                    val sentinelSnap = sentinelCoordinator.inspectorSnapshot()
-                    _uiState.update { s ->
-                        s.copy(
-                            isPlaying = false,
-                            isScoutCatchUpBuffering = false,
-                            readinessSnapshot = timedOutSnap,
-                            sentinelSnapshot = sentinelSnap,
-                            humanReadiness = HumanReadableStatus.resolve(
-                                project = s.project,
-                                scoutState = s.scoutCaptionState,
-                                coverageSummary = s.coverageSummary,
-                                readinessSnapshot = timedOutSnap,
-                                releaseSnapshot = s.releaseSnapshot,
-                                sentinelSnapshot = sentinelSnap,
-                            ),
-                        )
-                    }
-                }
-            }
-        }
+        playbackClockAnchor.reset(
+            positionMs = clamped,
+            speed = _uiState.value.playbackSpeed,
+            playing = if (holdAfterSeek) false else _uiState.value.isPlaying,
+        )
+        updateTimeAndLayout(clamped)
     }
 
     fun onYouTubePlaybackState(positionMs: Long, durationMs: Long, isPlaying: Boolean) {
         val safePos = positionMs.coerceAtLeast(0L)
-        val preState = _uiState.value
-        if (preState.project.videoSource.kind != VideoSourceKind.YOUTUBE_COMPLIANT) return
-
-        val wasSeekInFlight = preState.readinessSnapshot.diagnostics.isSeekInFlight
-        val readinessSnap = executePendingAutoResumeIfNeeded(
-            readinessController.onPlayerPositionSample(
-                reportedPositionMs = safePos,
-                playerIsPlaying = isPlaying,
-                ledger = coverageLedger,
-            ),
-        )
-        val shouldForceStreamPause = readinessSnap.isBufferingHoldActive ||
-            readinessSnap.state == PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR ||
-            readinessSnap.userIntent == UserPlaybackIntent.PAUSE ||
-            pendingTransportCommand?.targetPlaying == false
-        val effectiveObservedPlaying = !shouldForceStreamPause && isPlaying
-        if (effectiveObservedPlaying && pendingTransportCommand?.targetPlaying == true) {
-            pendingTransportCommand = null
-        }
-
-        // Reject stale pre-seek observations before updating clock/layout/coverage/scheduler (A04)
-        if (wasSeekInFlight && readinessSnap.diagnostics.isSeekInFlight) {
-            val pauseSeq = if (shouldForceStreamPause && isPlaying) ++nextStreamCommandSeq else null
-            val sentinelSnap = sentinelCoordinator.inspectorSnapshot()
-            _uiState.update { cur ->
-                cur.copy(
-                    isPlaying = if (shouldForceStreamPause) false else cur.isPlaying,
-                    isScoutCatchUpBuffering = readinessSnap.isBufferingHoldActive,
-                    streamPlayRequest = pauseSeq?.let { it to false } ?: cur.streamPlayRequest,
-                    readinessSnapshot = readinessSnap,
-                    sentinelSnapshot = sentinelSnap,
-                    humanReadiness = HumanReadableStatus.resolve(
-                        project = cur.project,
-                        scoutState = cur.scoutCaptionState,
-                        coverageSummary = cur.coverageSummary,
-                        readinessSnapshot = readinessSnap,
-                        releaseSnapshot = cur.releaseSnapshot,
-                        sentinelSnapshot = sentinelSnap,
-                    ),
-                )
-            }
-            return
-        }
-        if (wasSeekInFlight && !readinessSnap.diagnostics.isSeekInFlight) {
-            seekAckTimeoutJob?.cancel()
-        }
-
         _uiState.update { state ->
             if (state.project.videoSource.kind != VideoSourceKind.YOUTUBE_COMPLIANT) return@update state
             val updatedProj = if (durationMs > 1000L && durationMs != state.project.videoSource.durationMs) {
@@ -3107,7 +2372,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             playbackClockAnchor.reconcileRemoteSample(
                 reportedPosMs = safePos,
                 speed = state.playbackSpeed,
-                playing = effectiveObservedPlaying,
+                playing = isPlaying,
             )
             val presentationMs = playbackClockAnchor.sampleInterpolatedMs(
                 maxDurationMs = updatedProj.videoSource.durationMs.takeIf { it > 0L } ?: Long.MAX_VALUE,
@@ -3119,48 +2384,42 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 liveFaces = currentLiveFaces,
                 displayMode = state.displayMode,
             )
-            val refCues = releaseStore.currentReferenceTrack()?.cues.orEmpty()
-            val nextCcState = if (
-                (state.youtubeNativeCcState == YouTubeNativeCcState.ENABLED_NO_CURRENT_CUE ||
-                    state.youtubeNativeCcState == YouTubeNativeCcState.ENABLED_ACTIVE_CUES) &&
-                (refCues.isNotEmpty() || updatedProj.subtitleSource == SubtitleSourceKind.EMBEDDED_TRACK)
-            ) {
-                val hasCueNow = refCues.any { presentationMs in (it.startMs - 400L)..(it.endMs + 400L) } ||
-                    (updatedProj.subtitleSource == SubtitleSourceKind.EMBEDDED_TRACK &&
-                        updatedProj.dialogueEvents.any {
-                            it.sourceText.isNotBlank() &&
-                                !it.sourceText.startsWith("Embedded YouTube Player active") &&
-                                presentationMs in (it.startTimeMs - 400L)..(it.endTimeMs + 400L)
-                        })
-                if (hasCueNow) YouTubeNativeCcState.ENABLED_ACTIVE_CUES else YouTubeNativeCcState.ENABLED_NO_CURRENT_CUE
-            } else {
-                state.youtubeNativeCcState
-            }
             state.copy(
                 project = updatedProj,
-                isPlaying = !shouldForceStreamPause && isPlaying,
-                hasPendingPlayIntro = if (!shouldForceStreamPause && isPlaying) false else state.hasPendingPlayIntro,
+                isPlaying = isPlaying,
+                hasPendingPlayIntro = if (isPlaying) false else state.hasPendingPlayIntro,
                 currentTimeMs = presentationMs,
                 placedBalloons = balloons,
                 activeChapter = activeChapter,
-                youtubeNativeCcState = nextCcState,
             )
         }
         val latestState = _uiState.value
+        val readinessSnap = executePendingAutoResumeIfNeeded(
+            readinessController.onPlayerPositionSample(
+                reportedPositionMs = latestState.currentTimeMs,
+                playerIsPlaying = isPlaying,
+                ledger = coverageLedger,
+            ),
+        )
+        val shouldForceStreamPause = readinessSnap.isBufferingHoldActive ||
+            readinessSnap.state == PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR ||
+            readinessSnap.userIntent == UserPlaybackIntent.PAUSE
         val pauseSeq = if (shouldForceStreamPause && isPlaying) ++nextStreamCommandSeq else null
         if (shouldForceStreamPause) {
             playbackClockAnchor.reset(latestState.currentTimeMs, latestState.playbackSpeed, playing = false)
         }
-        val woke = sentinelCoordinator.updateAcknowledgedViewerPosition(
-            positionMs = latestState.currentTimeMs,
-            durationMs = latestState.project.videoSource.durationMs,
-            isPlaying = !shouldForceStreamPause && isPlaying,
-            playbackSpeed = latestState.playbackSpeed,
-            seekGeneration = latestState.seekGeneration,
-            seekAcknowledged = wasSeekInFlight && !readinessSnap.diagnostics.isSeekInFlight,
-        )
-        if (woke) {
-            wakeScheduler("youtube_playback_advance")
+        // Ignore stale pre-seek position callbacks until the player acknowledges the seek destination
+        if (!readinessSnap.diagnostics.isSeekInFlight) {
+            val woke = sentinelCoordinator.updateAcknowledgedViewerPosition(
+                positionMs = latestState.currentTimeMs,
+                durationMs = latestState.project.videoSource.durationMs,
+                isPlaying = !shouldForceStreamPause && isPlaying,
+                playbackSpeed = latestState.playbackSpeed,
+                seekGeneration = latestState.seekGeneration,
+            )
+            if (woke) {
+                wakeScheduler("youtube_playback_advance")
+            }
         }
         val sentinelSnap = sentinelCoordinator.inspectorSnapshot()
         _uiState.update { cur ->
@@ -3292,10 +2551,9 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun onYouTubeEmbedFallback(errorCode: Int) {
-        val errorKind = classifyYouTubeErrorCode(errorCode)
         _uiState.update { cur ->
             if (cur.project.videoSource.kind != VideoSourceKind.YOUTUBE_COMPLIANT) return@update cur
-            val note = "${errorKind.label} · Switched to YouTube mobile player"
+            val note = "Embed restricted ($errorCode) · Switched to YouTube mobile player"
             val nextDiag = if (cur.scoutDiagnosticDetail.isBlank()) {
                 note
             } else if (cur.scoutDiagnosticDetail.contains("Switched to YouTube mobile player")) {
@@ -3304,48 +2562,9 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 "$note · ${cur.scoutDiagnosticDetail}"
             }
             cur.copy(
-                youtubePlayerErrorKind = errorKind,
                 scoutDiagnosticDetail = nextDiag,
+                statusBanner = "Creator blocked iframe embed ($errorCode) — switched to YouTube mobile player",
             )
-        }
-        showStatusBanner("${errorKind.label} — switched to YouTube mobile player")
-    }
-
-    fun onYouTubePlayerError(errorCode: Int) {
-        val errorKind = classifyYouTubeErrorCode(errorCode)
-        val cur = _uiState.value
-        if (cur.project.videoSource.kind != VideoSourceKind.YOUTUBE_COMPLIANT) return
-        val diagMsg = "YouTube ${errorKind.label} (code $errorCode)"
-        if (errorCode == 101 || errorCode == 150 || errorCode == 152 || errorCode == 153) {
-            onYouTubeEmbedFallback(errorCode)
-            return
-        }
-        val errReadiness = readinessController.onMediaOrAnalysisError(
-            reason = "${errorKind.label}. Retry or check network/source availability.",
-            isMediaHardwareError = true,
-        )
-        _uiState.update { state ->
-            state.copy(
-                isPlaying = false,
-                isScoutCatchUpBuffering = false,
-                youtubePlayerErrorKind = errorKind,
-                scoutDiagnosticDetail = diagMsg,
-                readinessSnapshot = errReadiness,
-                humanReadiness = HumanReadableStatus.resolve(
-                    project = state.project,
-                    scoutState = state.scoutCaptionState,
-                    coverageSummary = state.coverageSummary,
-                    readinessSnapshot = errReadiness,
-                    releaseSnapshot = state.releaseSnapshot,
-                    sentinelSnapshot = state.sentinelSnapshot,
-                ),
-            )
-        }
-    }
-
-    fun onScoutCaptureDiagnosticsUpdated(diagnostics: ScoutCaptureDiagnostics) {
-        _uiState.update { cur ->
-            if (cur.scoutCaptureDiagnostics == diagnostics) cur else cur.copy(scoutCaptureDiagnostics = diagnostics)
         }
     }
 
@@ -3355,54 +2574,49 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     }
 
     private fun emitSpeakerGlossaryToasts(before: List<Speaker>, after: List<Speaker>) {
-        val viewerTimeMs = _uiState.value.currentTimeMs
         val beforeById = before.associateBy { it.id }
         val toastCandidate = after.firstNotNullOfOrNull { spk ->
             val prev = beforeById[spk.id]
-            val revealedNow = spk.hasVisibleCharacterNameAt(viewerTimeMs)
-            val prevRevealed = prev?.hasVisibleCharacterNameAt(viewerTimeMs) == true
-            val visibleNameNow = spk.visibleDisplayNameAt(viewerTimeMs)
-            val prevVisibleName = prev?.visibleDisplayNameAt(viewerTimeMs) ?: spk.defaultLabel
             when {
                 prev != null &&
-                    !prevRevealed &&
-                    revealedNow -> {
+                    !prev.isConfirmedCharacter &&
+                    spk.isConfirmedCharacter -> {
                     SpeakerGlossaryToast(
                         id = ++nextSpeakerToastId,
                         speakerId = spk.id,
                         isRename = true,
                         title = "Speaker confirmed",
-                        detail = "$prevVisibleName → $visibleNameNow",
+                        detail = "${prev.displayName} → ${spk.displayName}",
                         accentIndex = spk.accentIndex,
                         isUnknown = false,
                     )
                 }
                 prev != null &&
-                    !prevVisibleName.equals(visibleNameNow, ignoreCase = true) &&
-                    revealedNow -> {
+                    !prev.displayName.equals(spk.displayName, ignoreCase = true) &&
+                    spk.isConfirmedCharacter -> {
                     SpeakerGlossaryToast(
                         id = ++nextSpeakerToastId,
                         speakerId = spk.id,
                         isRename = true,
                         title = "Speaker identified",
-                        detail = "$prevVisibleName → $visibleNameNow",
+                        detail = "${prev.displayName} → ${spk.displayName}",
                         accentIndex = spk.accentIndex,
                         isUnknown = false,
                     )
                 }
-                prev == null && (revealedNow || spk.visualVoiceNotes.isNotBlank() || spk.isRolePlaceholder) -> {
+                prev == null && (spk.isConfirmedCharacter || spk.visualVoiceNotes.isNotBlank() || spk.isRolePlaceholder) -> {
                     SpeakerGlossaryToast(
                         id = ++nextSpeakerToastId,
                         speakerId = spk.id,
                         isRename = false,
-                        title = if (revealedNow) "Speaker confirmed" else "New speaker spotted",
-                        detail = if (revealedNow) {
-                            visibleNameNow
+                        title = if (spk.isConfirmedCharacter) "Speaker confirmed" else "New speaker spotted",
+                        detail = if (spk.isConfirmedCharacter) {
+                            spk.displayName
                         } else {
-                            spk.visualVoiceNotes.ifBlank { visibleNameNow }.take(40)
+                            spk.visualVoiceNotes.ifBlank { spk.displayName }.take(40)
                         },
                         accentIndex = spk.accentIndex,
-                        isUnknown = !revealedNow,
+                        isUnknown = !spk.isConfirmedCharacter,
                     )
                 }
                 else -> null
@@ -3424,53 +2638,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun onWebStreamPlaybackState(positionMs: Long, durationMs: Long, isPlaying: Boolean) {
-        val safePos = positionMs.coerceAtLeast(0L)
-        val preState = _uiState.value
-        if (preState.project.videoSource.kind != VideoSourceKind.WEB_STREAM) return
-
-        val wasSeekInFlight = preState.readinessSnapshot.diagnostics.isSeekInFlight
-        val readinessSnap = executePendingAutoResumeIfNeeded(
-            readinessController.onPlayerPositionSample(
-                reportedPositionMs = safePos,
-                playerIsPlaying = isPlaying,
-                ledger = coverageLedger,
-            )
-        )
-        val shouldForceStreamPause = readinessSnap.isBufferingHoldActive ||
-            readinessSnap.state == PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR ||
-            readinessSnap.userIntent == UserPlaybackIntent.PAUSE ||
-            pendingTransportCommand?.targetPlaying == false
-        val effectiveObservedPlaying = !shouldForceStreamPause && isPlaying
-        if (effectiveObservedPlaying && pendingTransportCommand?.targetPlaying == true) {
-            pendingTransportCommand = null
-        }
-
-        if (wasSeekInFlight && readinessSnap.diagnostics.isSeekInFlight) {
-            val pauseSeq = if (shouldForceStreamPause && isPlaying) ++nextStreamCommandSeq else null
-            val sentinelSnap = sentinelCoordinator.inspectorSnapshot()
-            _uiState.update { cur ->
-                cur.copy(
-                    isPlaying = if (shouldForceStreamPause) false else cur.isPlaying,
-                    isScoutCatchUpBuffering = readinessSnap.isBufferingHoldActive,
-                    streamPlayRequest = pauseSeq?.let { it to false } ?: cur.streamPlayRequest,
-                    readinessSnapshot = readinessSnap,
-                    sentinelSnapshot = sentinelSnap,
-                    humanReadiness = HumanReadableStatus.resolve(
-                        project = cur.project,
-                        scoutState = cur.scoutCaptionState,
-                        coverageSummary = cur.coverageSummary,
-                        readinessSnapshot = readinessSnap,
-                        releaseSnapshot = cur.releaseSnapshot,
-                        sentinelSnapshot = sentinelSnap,
-                    ),
-                )
-            }
-            return
-        }
-        if (wasSeekInFlight && !readinessSnap.diagnostics.isSeekInFlight) {
-            seekAckTimeoutJob?.cancel()
-        }
-
         _uiState.update { state ->
             if (state.project.videoSource.kind != VideoSourceKind.WEB_STREAM) return@update state
             val updatedProj = if (durationMs > 1000L && durationMs != state.project.videoSource.durationMs) {
@@ -3482,10 +2649,11 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             } else {
                 state.project
             }
+            val safePos = positionMs.coerceAtLeast(0L)
             playbackClockAnchor.reconcileRemoteSample(
                 reportedPosMs = safePos,
                 speed = state.playbackSpeed,
-                playing = effectiveObservedPlaying,
+                playing = isPlaying,
             )
             val presentationMs = playbackClockAnchor.sampleInterpolatedMs(
                 maxDurationMs = updatedProj.videoSource.durationMs.takeIf { it > 0L } ?: Long.MAX_VALUE,
@@ -3499,7 +2667,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             )
             state.copy(
                 project = updatedProj,
-                isPlaying = !shouldForceStreamPause && isPlaying,
+                isPlaying = isPlaying,
                 currentTimeMs = presentationMs,
                 placedBalloons = balloons,
                 activeChapter = activeChapter,
@@ -3507,18 +2675,27 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         }
         val snap = _uiState.value
         val durMs = snap.project.videoSource.durationMs.coerceAtLeast(durationMs)
+        val readinessSnap = executePendingAutoResumeIfNeeded(
+            readinessController.onPlayerPositionSample(
+                reportedPositionMs = snap.currentTimeMs,
+                playerIsPlaying = isPlaying,
+                ledger = coverageLedger,
+            )
+        )
+        val shouldForceStreamPause = readinessSnap.isBufferingHoldActive ||
+            readinessSnap.state == PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR ||
+            readinessSnap.userIntent == UserPlaybackIntent.PAUSE
         val pauseSeq = if (shouldForceStreamPause && isPlaying) ++nextStreamCommandSeq else null
         if (shouldForceStreamPause) {
             playbackClockAnchor.reset(snap.currentTimeMs, snap.playbackSpeed, playing = false)
         }
-        if (!sentinelCoordinator.isScrubberPreviewActive()) {
+        if (!readinessSnap.diagnostics.isSeekInFlight && !sentinelCoordinator.isScrubberPreviewActive()) {
             val wokeFromIdle = sentinelCoordinator.updateAcknowledgedViewerPosition(
                 positionMs = snap.currentTimeMs,
                 durationMs = durMs,
                 isPlaying = !shouldForceStreamPause && isPlaying,
                 playbackSpeed = snap.playbackSpeed,
                 seekGeneration = snap.seekGeneration,
-                seekAcknowledged = wasSeekInFlight && !readinessSnap.diagnostics.isSeekInFlight,
             )
             if (wokeFromIdle) {
                 wakeScheduler("web_playback_advance")
@@ -3644,17 +2821,9 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun skipCinemaIntro() {
-        if (!_uiState.value.isCinemaIntroActive) {
-            if (_uiState.value.isScoutCatchUpBuffering || _uiState.value.readinessSnapshot.isBufferingHoldActive) {
-                dismissScoutCatchUpBuffering()
-            } else {
-                val bypassSnap = readinessController.onUserWatchNowBypass()
-                _uiState.update { it.copy(readinessSnapshot = bypassSnap) }
-            }
-            return
-        }
         val bypassSnap = readinessController.onUserWatchNowBypass()
         _uiState.update { it.copy(readinessSnapshot = bypassSnap) }
+        if (!_uiState.value.isCinemaIntroActive) return
         introJob?.cancel()
         finishIntroAndStartViewer()
     }
@@ -3678,42 +2847,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
         val effectiveDuration = maxOf(state.project.videoSource.durationMs, durationMs).coerceAtLeast(10_000L)
         val safeScoutPos = scoutPosMs.coerceAtLeast(0L)
-        val policy = sentinelCoordinator.currentPolicy()
-        val hasPreloaded = LookaheadWindowPlanner.hasLoadedSubtitlesLocked(
-            state.project.subtitleSource,
-            state.project.dialogueEvents,
-        )
-        val nextWorkWindow = if (hasPreloaded) {
-            LookaheadWindowPlanner.nextPriorityWindow(
-                viewerPosMs = state.currentTimeMs,
-                durationMs = effectiveDuration,
-                completedWindowStarts = emptySet(),
-                completedExtents = scoutCompletedExtents,
-                horizonMs = policy.horizonMs,
-                enforceHardHorizon = true,
-            )
-        } else {
-            coverageLedger.nextPriorityInterval(
-                playheadMs = state.currentTimeMs,
-                maxRetryAttempts = policy.maxRetriesPerInterval,
-                lookaheadHorizonMs = policy.horizonMs,
-                openingWindowMs = LookaheadWindowPlanner.WINDOW_STEP_MS,
-                rollingWindowMs = LookaheadWindowPlanner.WINDOW_STEP_MS,
-                enforceHardHorizon = true,
-                chunkOverlapMs = LookaheadWindowPlanner.WINDOW_OVERLAP_MS,
-                roundingUpToSecond = false,
-                minSliceMs = policy.minSubmittableSliceMs,
-            )?.let { TimeWindowRange(it.startMs, it.endMs) }
-        }
-        val syncCmd = LookaheadWindowPlanner.computeCoordinatorScoutCommand(
+        val syncCmd = LookaheadWindowPlanner.computeScoutSyncCommand(
             viewerPosMs = state.currentTimeMs,
             scoutPosMs = safeScoutPos,
             durationMs = effectiveDuration,
-            nextWorkWindow = nextWorkWindow,
             isViewerPlaying = state.isPlaying,
             isScoutPlaying = isScoutPlaying,
             introRemainingMs = state.introRemainingMs,
-            horizonMs = policy.horizonMs,
         )
 
         var newPlayReq = state.scoutPlayRequest
@@ -3823,34 +2963,28 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    fun onScoutWebStreamAudioSlice(
-        startMs: Long,
-        base64Audio: String,
-        mimeType: String,
-        endMs: Long = startMs + LookaheadWindowPlanner.WINDOW_STEP_MS,
-        discontinuity: Boolean = false,
-    ) {
+    fun onScoutWebStreamAudioSlice(startMs: Long, base64Audio: String, mimeType: String) {
         val state = _uiState.value
         val proj = state.project
         if (!state.dualInstanceEnabled || proj.videoSource.kind != VideoSourceKind.WEB_STREAM) return
+        // Enforce Free CC Only & quota circuit breaker across ALL cloud entry paths
         if (state.quotaSaverMode == QuotaSaverMode.ZERO_CLOUD || quotaCircuitBreakerTripped) return
         if (LookaheadWindowPlanner.hasLoadedSubtitlesLocked(proj.subtitleSource, proj.dialogueEvents)) {
             return
         }
+        // Avoid duplicate cloud transcription when HTTP/HLS stream lookahead is already producing cues
         if (!discoveredWebMediaUrl.isNullOrBlank() &&
             lookaheadJob?.isActive == true &&
             LookaheadWindowPlanner.hasRealSubtitles(proj.dialogueEvents)
         ) {
             return
         }
-        val safeStartMs = startMs.coerceAtLeast(0L)
-        val rawSliceEndMs = endMs.coerceAtLeast(safeStartMs + 500L)
-        val bucketKey = (safeStartMs / 5_000L) * 5_000L
+        val bucketKey = (startMs / 5_000L) * 5_000L
         if (bucketKey in scoutAudioSliceTimestamps) return
-
+        val rawSliceEndMs = startMs + LookaheadWindowPlanner.WINDOW_STEP_MS
         val policy = sentinelCoordinator.currentPolicy()
         val boundaryGate = sentinelCoordinator.clipOrDeferToBoundary(
-            startMs = safeStartMs,
+            startMs = startMs,
             endMs = rawSliceEndMs,
             overlapMs = 0L,
             roundingUpToSec = false,
@@ -3858,441 +2992,221 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         )
         if (boundaryGate !is BoundarySubmissionDecision.Allowed) return
         val clippedStartMs = boundaryGate.startMs
-        val clippedEndMs = minOf(boundaryGate.endMs, rawSliceEndMs)
-        if (clippedEndMs <= clippedStartMs) return
-
+        val clippedEndMs = boundaryGate.endMs
+        if (!scoutAudioSliceTimestamps.add(bucketKey)) return
         val requestCtx = captureWorkRequestContext(proj, state.quotaSaverMode)
-        val newItem = CapturedAudioQueueItem(
-            bucketKey = bucketKey,
-            startMs = clippedStartMs,
-            endMs = clippedEndMs,
-            base64Audio = base64Audio,
-            mimeType = mimeType.ifBlank { "audio/webm" },
-            discontinuity = discontinuity,
-            requestCtx = requestCtx,
-        )
 
-        val ackViewerPosMs = sentinelCoordinator.currentAcknowledgedViewerPosMs()
-        val droppedRanges = mutableListOf<Pair<Long, Long>>()
-        synchronized(capturedAudioQueueLock) {
-            if (bucketKey in inFlightCapturedAudioBuckets) return
-            // Coalesce duplicate pending bucket (keep newest valid descriptor for current context)
-            val existingIdx = pendingCapturedAudioQueue.indexOfFirst { it.bucketKey == bucketKey }
-            if (existingIdx >= 0) {
-                pendingCapturedAudioQueue.removeAt(existingIdx)
+        viewModelScope.launch {
+            val audioBytes = runCatching { Base64.decode(base64Audio, Base64.DEFAULT) }.getOrNull()
+            if (audioBytes == null || audioBytes.size < 1800) {
+                scoutAudioSliceTimestamps.remove(bucketKey)
+                return@launch
             }
-            // Enforce strict total limit <= 4 across pending + in-flight
-            while (pendingCapturedAudioQueue.size + inFlightCapturedAudioBuckets.size >= 4 &&
-                pendingCapturedAudioQueue.isNotEmpty()
-            ) {
-                val evictIdx = pendingCapturedAudioQueue.indices.maxByOrNull { idx ->
-                    val candidate = pendingCapturedAudioQueue[idx]
-                    val staleBonus = if (candidate.requestCtx.seekGeneration != requestCtx.seekGeneration) 1_000_000_000L else 0L
-                    val distanceFromViewer = kotlin.math.abs(candidate.startMs - ackViewerPosMs)
-                    staleBonus + distanceFromViewer
-                } ?: break
-                val evicted = pendingCapturedAudioQueue.removeAt(evictIdx)
-                scoutAudioSliceTimestamps.remove(evicted.bucketKey)
-                droppedRanges.add(evicted.startMs to evicted.endMs)
+            if (!canInvokeCloudAi(requestCtx, clippedStartMs, clippedEndMs, enforceBoundary = true, requireUnloadedTracks = true)) {
+                scoutAudioSliceTimestamps.remove(bucketKey)
+                return@launch
             }
-            if (pendingCapturedAudioQueue.size + inFlightCapturedAudioBuckets.size >= 4) {
-                return
-            }
-            scoutAudioSliceTimestamps.add(bucketKey)
-            pendingCapturedAudioQueue.addLast(newItem)
-        }
-        droppedRanges.forEach { (dStart, dEnd) ->
-            coverageLedger.recordOutcome(
-                startMs = dStart,
-                endMs = dEnd,
-                status = CoverageStatus.PENDING,
-                source = SubtitleSourceKind.AI_DRAFT,
-                failureReason = "Deferred by bounded capture queue",
-                incrementRetry = false,
+
+            coverageLedger.recordWindowRequested()
+            coverageLedger.markInProgress(clippedStartMs, clippedEndMs)
+            val execStartMs = System.currentTimeMillis()
+            val preferLite = _uiState.value.quotaSaverMode == QuotaSaverMode.QUOTA_SAVER || downgradedToLiteForStream
+
+            val res = translationAiService.transcribeAndTranslateAudioDetailed(
+                wavBytes = audioBytes,
+                chunkStartMs = clippedStartMs,
+                sourceLanguage = proj.sourceLanguage,
+                targetLanguage = proj.targetLanguage,
+                glossary = (proj.glossary + _uiState.value.glossaryEntries).distinctBy { it.term.trim().lowercase() },
+                audioMimeType = mimeType.ifBlank { "audio/webm" },
+                preferLiteModel = preferLite,
             )
-        }
-        ensureCapturedAudioConsumerRunning()
-    }
-
-    private fun ensureCapturedAudioConsumerRunning() {
-        if (capturedAudioConsumerJob?.isActive == true) return
-        capturedAudioConsumerJob = viewModelScope.launch {
-            while (isActive) {
-                val nextItem: CapturedAudioQueueItem? = synchronized(capturedAudioQueueLock) {
-                    val ackPos = sentinelCoordinator.currentAcknowledgedViewerPosMs()
-                    val bestIdx = pendingCapturedAudioQueue.indices.minByOrNull { idx ->
-                        val item = pendingCapturedAudioQueue[idx]
-                        val dist = kotlin.math.abs(item.startMs - ackPos)
-                        if (item.startMs in ackPos..(ackPos + 20_000L)) dist else dist + 50_000L
-                    }
-                    if (bestIdx != null) {
-                        val picked = pendingCapturedAudioQueue.removeAt(bestIdx)
-                        inFlightCapturedAudioBuckets.add(picked.bucketKey)
-                        picked
-                    } else {
-                        null
-                    }
-                }
-                if (nextItem == null) break
-                try {
-                    processCapturedAudioQueueItem(nextItem)
-                } finally {
-                    synchronized(capturedAudioQueueLock) {
-                        inFlightCapturedAudioBuckets.remove(nextItem.bucketKey)
-                    }
-                }
-            }
-        }
-    }
-
-    private suspend fun processCapturedAudioQueueItem(item: CapturedAudioQueueItem) {
-        if (!isRequestContextCurrent(item.requestCtx)) {
-            scoutAudioSliceTimestamps.remove(item.bucketKey)
-            return
-        }
-        val audioBytes = runCatching { Base64.decode(item.base64Audio, Base64.DEFAULT) }.getOrNull()
-        if (audioBytes == null || audioBytes.isEmpty()) {
-            scoutAudioSliceTimestamps.remove(item.bucketKey)
-            onScoutCaptureDiagnosticsUpdated(
-                _uiState.value.scoutCaptureDiagnostics.copy(
-                    healthState = ScoutCaptureHealthState.DECODE_FAILED,
-                    diagnosticDetail = "Empty or invalid captured audio payload",
-                    lastSliceStartMs = item.startMs,
-                    lastSliceEndMs = item.endMs,
-                    discontinuityCount = _uiState.value.scoutCaptureDiagnostics.discontinuityCount + if (item.discontinuity) 1 else 0,
-                )
-            )
-            return
-        }
-
-        val inspection = audioAnalyzer.inspectCapturedAudioChunk(audioBytes, item.mimeType)
-        val curDiag = _uiState.value.scoutCaptureDiagnostics
-        onScoutCaptureDiagnosticsUpdated(
-            curDiag.copy(
-                healthState = inspection.healthState,
-                decodedSampleCount = inspection.decodedSamplesCount,
-                rmsEnergy = inspection.rmsEnergy,
-                peakAmplitude = inspection.peakAmplitude,
-                sampleRateHz = inspection.sampleRateHz,
-                lastSliceStartMs = item.startMs,
-                lastSliceEndMs = item.endMs,
-                discontinuityCount = curDiag.discontinuityCount + if (item.discontinuity) 1 else 0,
-                diagnosticDetail = inspection.diagnosticNote,
-            )
-        )
-
-        if (!isRequestContextCurrent(item.requestCtx)) {
-            scoutAudioSliceTimestamps.remove(item.bucketKey)
-            return
-        }
-
-        val clippedStartMs = item.startMs
-        val clippedEndMs = item.endMs
-        val latestProjBefore = _uiState.value.project
-        if (LookaheadWindowPlanner.hasLoadedSubtitlesLocked(latestProjBefore.subtitleSource, latestProjBefore.dialogueEvents)) {
-            return
-        }
-
-        when (inspection.healthState) {
-            ScoutCaptureHealthState.CONFIRMED_SILENCE -> {
-                val (reviewedSilence, silenceSnap) = stageAndReviewIntervalThroughReleaseGate(
-                    project = latestProjBefore,
-                    intervalId = "web_${clippedStartMs}_${clippedEndMs}",
+            if (!isRequestContextCurrent(requestCtx)) {
+                coverageLedger.recordOutcome(
                     startMs = clippedStartMs,
                     endMs = clippedEndMs,
-                    events = emptyList(),
-                    speakers = latestProjBefore.speakers,
-                    sessionToken = item.requestCtx.sessionToken,
-                    seekGeneration = item.requestCtx.seekGeneration,
-                    isConfirmedSilence = true,
-                    hasIndependentAudioOrFrameEvidence = true,
-                    expectedConfigFingerprint = item.requestCtx.configFingerprint,
+                    status = CoverageStatus.PENDING,
+                    source = SubtitleSourceKind.AI_DRAFT,
+                    incrementRetry = false,
                 )
-                if (reviewedSilence != null && isRequestContextCurrent(item.requestCtx)) {
-                    coverageLedger.recordOutcome(
-                        startMs = clippedStartMs,
-                        endMs = clippedEndMs,
-                        status = CoverageStatus.VERIFIED_SILENCE,
-                        source = SubtitleSourceKind.AI_DRAFT,
-                    )
-                    _uiState.update { it.copy(releaseSnapshot = silenceSnap) }
-                    syncCoverageUiState()
-                }
-                return
+                return@launch
             }
-            ScoutCaptureHealthState.UNSUPPORTED_CAPTURE,
-            ScoutCaptureHealthState.SOURCE_INACCESSIBLE,
-            ScoutCaptureHealthState.DECODE_FAILED,
-            ScoutCaptureHealthState.FAILED_EXHAUSTED,
-            ScoutCaptureHealthState.WAITING_FOR_MEDIA -> {
+
+            val latestProj = _uiState.value.project
+            if (LookaheadWindowPlanner.hasLoadedSubtitlesLocked(latestProj.subtitleSource, latestProj.dialogueEvents)) {
+                return@launch
+            }
+
+            if (res.isFailure) {
+                if (TranslationAiService.isQuotaOrCreditExhaustedError(res.exceptionOrNull())) {
+                    quotaCircuitBreakerTripped = true
+                }
                 coverageLedger.recordOutcome(
                     startMs = clippedStartMs,
                     endMs = clippedEndMs,
                     status = CoverageStatus.FAILED,
                     source = SubtitleSourceKind.AI_DRAFT,
-                    failureReason = inspection.diagnosticNote.ifBlank { inspection.healthState.name },
+                    failureReason = res.exceptionOrNull()?.localizedMessage?.take(120) ?: "Live audio slice error",
                     incrementRetry = true,
                 )
-                scoutAudioSliceTimestamps.remove(item.bucketKey)
+                scoutAudioSliceTimestamps.remove(bucketKey)
                 syncCoverageUiState()
-                return
+                return@launch
             }
-            ScoutCaptureHealthState.USABLE_DECODED_INPUT,
-            ScoutCaptureHealthState.RECORDER_STARTED -> Unit
-        }
 
-        if (!canInvokeCloudAi(item.requestCtx, clippedStartMs, clippedEndMs, enforceBoundary = true, requireUnloadedTracks = true)) {
-            scoutAudioSliceTimestamps.remove(item.bucketKey)
-            return
-        }
-
-        coverageLedger.recordWindowRequested()
-        coverageLedger.markInProgress(clippedStartMs, clippedEndMs)
-        val execStartMs = System.currentTimeMillis()
-        val preferLite = _uiState.value.quotaSaverMode == QuotaSaverMode.QUOTA_SAVER || downgradedToLiteForStream
-
-        val res = translationAiService.transcribeAndTranslateAudioDetailed(
-            wavBytes = audioBytes,
-            chunkStartMs = clippedStartMs,
-            sourceLanguage = latestProjBefore.sourceLanguage,
-            targetLanguage = latestProjBefore.targetLanguage,
-            glossary = (latestProjBefore.glossary + _uiState.value.glossaryEntries).distinctBy { it.term.trim().lowercase() },
-            audioMimeType = item.mimeType,
-            preferLiteModel = preferLite,
-        )
-        if (!isRequestContextCurrent(item.requestCtx)) {
-            coverageLedger.recordOutcome(
-                startMs = clippedStartMs,
-                endMs = clippedEndMs,
-                status = CoverageStatus.PENDING,
-                source = SubtitleSourceKind.AI_DRAFT,
-                incrementRetry = false,
-            )
-            return
-        }
-
-        val latestProj = _uiState.value.project
-        if (LookaheadWindowPlanner.hasLoadedSubtitlesLocked(latestProj.subtitleSource, latestProj.dialogueEvents)) {
-            return
-        }
-
-        if (res.isFailure) {
-            if (TranslationAiService.isQuotaOrCreditExhaustedError(res.exceptionOrNull())) {
-                quotaCircuitBreakerTripped = true
+            val detailed = res.getOrThrow()
+            val cues = detailed.cues
+            val elapsedMs = (System.currentTimeMillis() - execStartMs).coerceAtLeast(1L)
+            coverageLedger.recordWindowCompleted()
+            if (detailed.invalidCueCount > 0) {
+                coverageLedger.recordInvalidOrAmbiguousTimestamp(detailed.invalidCueCount)
             }
-            coverageLedger.recordOutcome(
-                startMs = clippedStartMs,
-                endMs = clippedEndMs,
-                status = CoverageStatus.FAILED,
-                source = SubtitleSourceKind.AI_DRAFT,
-                failureReason = res.exceptionOrNull()?.localizedMessage?.take(120) ?: "Live audio slice error",
-                incrementRetry = true,
-            )
-            scoutAudioSliceTimestamps.remove(item.bucketKey)
-            syncCoverageUiState()
-            return
-        }
 
-        val detailed = res.getOrThrow()
-        val cues = detailed.cues
-        val elapsedMs = (System.currentTimeMillis() - execStartMs).coerceAtLeast(1L)
-        coverageLedger.recordWindowCompleted()
-        if (detailed.invalidCueCount > 0) {
-            coverageLedger.recordInvalidOrAmbiguousTimestamp(detailed.invalidCueCount)
-        }
-
-        when (detailed.outcome) {
-            TranscriptionOutcome.VERIFIED_SILENCE -> {
-                val (reviewedSilence, silenceSnap) = stageAndReviewIntervalThroughReleaseGate(
-                    project = latestProj,
-                    intervalId = "web_${clippedStartMs}_${clippedEndMs}",
-                    startMs = clippedStartMs,
-                    endMs = clippedEndMs,
-                    events = emptyList(),
-                    speakers = latestProj.speakers,
-                    sessionToken = item.requestCtx.sessionToken,
-                    seekGeneration = item.requestCtx.seekGeneration,
-                    isConfirmedSilence = true,
-                    hasIndependentAudioOrFrameEvidence = true,
-                    elapsedProcessingMs = elapsedMs,
-                    expectedConfigFingerprint = item.requestCtx.configFingerprint,
-                )
-                if (reviewedSilence == null) {
-                    _uiState.update { it.copy(releaseSnapshot = silenceSnap) }
-                    return
-                }
-                if (reviewedSilence.repairedEvents.isNotEmpty()) {
-                    val effectiveStatus = if (reviewedSilence.coverageStatus == CoverageStatus.VERIFIED_SILENCE) {
-                        CoverageStatus.RELEASED_FALLBACK
-                    } else {
-                        reviewedSilence.coverageStatus
-                    }
-                    publishReleasedEventsToProject(
+            when (detailed.outcome) {
+                TranscriptionOutcome.VERIFIED_SILENCE -> {
+                    val (reviewedSilence, silenceSnap) = stageAndReviewIntervalThroughReleaseGate(
+                        project = latestProj,
+                        intervalId = "web_${clippedStartMs}_${clippedEndMs}",
                         startMs = clippedStartMs,
                         endMs = clippedEndMs,
-                        releasedEvents = reviewedSilence.repairedEvents,
-                        coverageStatus = effectiveStatus,
-                        source = SubtitleSourceKind.AI_DRAFT,
+                        events = emptyList(),
+                        speakers = latestProj.speakers,
+                        sessionToken = requestCtx.sessionToken,
+                        seekGeneration = requestCtx.seekGeneration,
+                        isConfirmedSilence = true,
+                        hasIndependentAudioOrFrameEvidence = true,
+                        elapsedProcessingMs = elapsedMs,
+                        expectedConfigFingerprint = requestCtx.configFingerprint,
                     )
-                } else {
-                    val silenceStatus = if (reviewedSilence.coverageStatus == CoverageStatus.SUSPECTED_MISSING_DIALOGUE) {
-                        CoverageStatus.SUSPECTED_MISSING_DIALOGUE
-                    } else {
-                        CoverageStatus.VERIFIED_SILENCE
+                    if (reviewedSilence == null) {
+                        _uiState.update { it.copy(releaseSnapshot = silenceSnap) }
+                        return@launch
                     }
+                    if (reviewedSilence.repairedEvents.isNotEmpty()) {
+                        val effectiveStatus = if (reviewedSilence.coverageStatus == CoverageStatus.VERIFIED_SILENCE) {
+                            CoverageStatus.RELEASED_FALLBACK
+                        } else {
+                            reviewedSilence.coverageStatus
+                        }
+                        publishReleasedEventsToProject(
+                            startMs = clippedStartMs,
+                            endMs = clippedEndMs,
+                            releasedEvents = reviewedSilence.repairedEvents,
+                            coverageStatus = effectiveStatus,
+                            source = SubtitleSourceKind.AI_DRAFT,
+                        )
+                    } else {
+                        val silenceStatus = if (reviewedSilence.coverageStatus == CoverageStatus.SUSPECTED_MISSING_DIALOGUE) {
+                            CoverageStatus.SUSPECTED_MISSING_DIALOGUE
+                        } else {
+                            CoverageStatus.VERIFIED_SILENCE
+                        }
+                        coverageLedger.recordOutcome(
+                            startMs = clippedStartMs,
+                            endMs = clippedEndMs,
+                            status = silenceStatus,
+                            source = SubtitleSourceKind.AI_DRAFT,
+                        )
+                        _uiState.update { it.copy(releaseSnapshot = silenceSnap) }
+                        syncCoverageUiState()
+                    }
+                    return@launch
+                }
+                TranscriptionOutcome.INVALID_AI_RESPONSE,
+                TranscriptionOutcome.INVALID_OR_AMBIGUOUS_TIMESTAMPS,
+                TranscriptionOutcome.EMPTY_UNCONFIRMED -> {
                     coverageLedger.recordOutcome(
                         startMs = clippedStartMs,
                         endMs = clippedEndMs,
-                        status = silenceStatus,
+                        status = CoverageStatus.FAILED,
                         source = SubtitleSourceKind.AI_DRAFT,
+                        failureReason = detailed.diagnosticNote.ifBlank { detailed.outcome.name },
+                        incrementRetry = true,
                     )
-                    _uiState.update { it.copy(releaseSnapshot = silenceSnap) }
+                    scoutAudioSliceTimestamps.remove(bucketKey)
                     syncCoverageUiState()
+                    return@launch
                 }
-                return
+                else -> Unit
             }
-            TranscriptionOutcome.INVALID_AI_RESPONSE,
-            TranscriptionOutcome.INVALID_OR_AMBIGUOUS_TIMESTAMPS,
-            TranscriptionOutcome.EMPTY_UNCONFIRMED -> {
-                coverageLedger.recordOutcome(
-                    startMs = clippedStartMs,
-                    endMs = clippedEndMs,
-                    status = CoverageStatus.FAILED,
-                    source = SubtitleSourceKind.AI_DRAFT,
-                    failureReason = detailed.diagnosticNote.ifBlank { detailed.outcome.name },
-                    incrementRetry = true,
+
+            if (cues.isEmpty()) return@launch
+
+            val rawEvents = cues.map { c ->
+                DialogueEvent(
+                    id = SubtitleParser.newEventId(),
+                    startTimeMs = c.startMs,
+                    endTimeMs = c.endMs,
+                    sourceText = c.sourceText,
+                    translatedText = c.naturalTranslation,
+                    literalText = c.literalTranslation,
+                    romanization = c.romanization,
+                    speakerId = null,
+                    speakerConfidence = 0.56f,
+                    faceTrackId = null,
+                    faceConfidence = 0f,
+                    shotId = "shot_1",
+                    dialogueType = c.dialogueType,
+                    placementMode = if (c.dialogueType == DialogueType.SPOKEN) PlacementMode.NEUTRAL_FALLBACK else PlacementMode.EDGE_DOCKED,
+                    contextCueReason = c.contextReason,
+                    culturalNote = c.culturalNote,
                 )
-                scoutAudioSliceTimestamps.remove(item.bucketKey)
-                syncCoverageUiState()
-                return
             }
-            else -> Unit
-        }
-
-        if (cues.isEmpty()) return
-
-        var workingAudioProj = latestProj
-        val (reconciledCues, reconciledUpdates, _) = reconcileWindowOutcomeSpeakersAndCues(
-            existingSpeakers = workingAudioProj.speakers,
-            cues = cues,
-            speakerUpdates = detailed.speakerUpdates,
-        )
-        if (reconciledUpdates.isNotEmpty()) {
-            val (castMerged, updatedMem) = mergeCastSlotAssignments(
-                project = workingAudioProj,
-                assignments = reconciledUpdates,
-                rememberedColors = _uiState.value.characterColorMemory,
-                reconcileColors = attributionEngine::reconcileCharacterColors,
-                discoveryTimestampMs = clippedStartMs,
+            val paced = SubtitleParser.applyReadingPacingGuardrails(rawEvents)
+            val mergeReport = LookaheadWindowPlanner.mergeWindowDialogueEventsWithReport(
+                existing = latestProj.dialogueEvents.filterNot { it.sourceText.startsWith("Web Cinema ready") },
+                incoming = paced,
+                windowStartMs = clippedStartMs,
+                windowEndMs = clippedEndMs + 1_000L,
             )
-            if (updatedMem != _uiState.value.characterColorMemory) {
-                persistCharacterColorMemory(updatedMem)
+            coverageLedger.recordDuplicateDecisions(mergeReport.decisions)
+            val (updatedSpeakers, attributed) = attributionEngine.assignSpeakers(
+                events = mergeReport.events,
+                shots = latestProj.shots,
+                faceTracks = latestProj.faceTracks,
+                existingSpeakers = latestProj.speakers,
+                rememberedCharacterColors = _uiState.value.characterColorMemory,
+            )
+            if (!isRequestContextCurrent(requestCtx)) return@launch
+
+            val windowSlice = attributed.filter { it.startTimeMs in clippedStartMs until clippedEndMs }
+            val (reviewOutcome, releaseSnap) = stageAndReviewIntervalThroughReleaseGate(
+                project = latestProj.copy(speakers = updatedSpeakers, dialogueEvents = attributed),
+                intervalId = "web_${clippedStartMs}_${clippedEndMs}",
+                startMs = clippedStartMs,
+                endMs = clippedEndMs,
+                events = windowSlice,
+                speakers = updatedSpeakers,
+                sessionToken = requestCtx.sessionToken,
+                seekGeneration = requestCtx.seekGeneration,
+                isConfirmedSilence = false,
+                hasIndependentAudioOrFrameEvidence = true,
+                elapsedProcessingMs = elapsedMs,
+                expectedConfigFingerprint = requestCtx.configFingerprint,
+            )
+            if (reviewOutcome == null) {
+                _uiState.update { it.copy(releaseSnapshot = releaseSnap) }
+                return@launch
             }
-            workingAudioProj = castMerged
-        }
-
-        val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
-        val hintMap = mutableMapOf<String, AiTranslatedLine>()
-        val rawCuesByEventId = mutableMapOf<String, AiTranscribedCue>()
-        val rawEvents = reconciledCues.map { c ->
-            val id = SubtitleParser.newEventId()
-            rawCuesByEventId[id] = c
-            val slotUpper = c.suggestedSpeakerSlot.trim().uppercase()
-            hintMap[id] = AiTranslatedLine(
-                id = id,
-                naturalTranslation = c.naturalTranslation,
-                literalTranslation = c.literalTranslation,
-                romanization = c.romanization,
-                dialogueTypeHint = c.dialogueType,
-                speakerTurnHint = "UNCERTAIN",
-                suggestedSpeakerSlot = slotUpper.ifBlank { "UNCERTAIN" },
-                contextReason = c.contextReason,
-                culturalNote = c.culturalNote,
+            val coverageStatus = when {
+                detailed.outcome == TranscriptionOutcome.PARTIAL_SUCCESS -> CoverageStatus.PARTIAL_RECOVERY
+                reviewOutcome.coverageStatus == CoverageStatus.VERIFIED_DIALOGUE -> CoverageStatus.VERIFIED_DIALOGUE
+                else -> CoverageStatus.RELEASED_FALLBACK
+            }
+            publishReleasedEventsToProject(
+                startMs = clippedStartMs,
+                endMs = clippedEndMs,
+                releasedEvents = reviewOutcome.repairedEvents,
+                coverageStatus = coverageStatus,
+                source = SubtitleSourceKind.AI_DRAFT,
+                speakers = updatedSpeakers,
+                failureReason = if (coverageStatus == CoverageStatus.PARTIAL_RECOVERY) detailed.diagnosticNote else "",
             )
-            DialogueEvent(
-                id = id,
-                startTimeMs = c.startMs,
-                endTimeMs = c.endMs,
-                sourceText = c.sourceText,
-                translatedText = c.naturalTranslation,
-                literalText = c.literalTranslation,
-                romanization = c.romanization,
-                speakerId = null,
-                speakerConfidence = if (slotUpper in validSlots) 0.82f else 0.56f,
-                faceTrackId = null,
-                faceConfidence = 0f,
-                shotId = "shot_1",
-                dialogueType = c.dialogueType,
-                placementMode = if (c.dialogueType == DialogueType.SPOKEN) PlacementMode.NEUTRAL_FALLBACK else PlacementMode.EDGE_DOCKED,
-                contextCueReason = c.contextReason,
-                culturalNote = c.culturalNote,
-            )
-        }
-        val paced = SubtitleParser.applyReadingPacingGuardrails(rawEvents)
-        val mergeReport = LookaheadWindowPlanner.mergeWindowDialogueEventsWithReport(
-            existing = workingAudioProj.dialogueEvents.filterNot { it.sourceText.startsWith("Web Cinema ready") },
-            incoming = paced,
-            windowStartMs = clippedStartMs,
-            windowEndMs = clippedEndMs + 1_000L,
-        )
-        coverageLedger.recordDuplicateDecisions(mergeReport.decisions)
-        cachedAiTurnHints.putAll(hintMap)
-        val (updatedSpeakers, attributed) = attributionEngine.assignSpeakers(
-            events = mergeReport.events,
-            shots = workingAudioProj.shots,
-            faceTracks = workingAudioProj.faceTracks,
-            existingSpeakers = workingAudioProj.speakers,
-            turnHints = cachedAiTurnHints,
-            rememberedCharacterColors = _uiState.value.characterColorMemory,
-            slotToSpeakerId = buildSlotToSpeakerIdMap(workingAudioProj.speakers),
-        )
-        if (!isRequestContextCurrent(item.requestCtx)) return
-
-        val windowSlice = attributed.filter { it.startTimeMs in clippedStartMs until clippedEndMs }
-        val audioTimestampReport = buildScout1TimestampReport(
-            windowStartMs = clippedStartMs,
-            windowEndMs = clippedEndMs,
-            events = windowSlice,
-            rawCuesByEventId = rawCuesByEventId,
-            explicitProvenance = ScoutClockProvenance.CHUNK_RELATIVE_OFFSET,
-        )
-        val (reviewOutcome, releaseSnap) = stageAndReviewIntervalThroughReleaseGate(
-            project = workingAudioProj.copy(speakers = updatedSpeakers, dialogueEvents = attributed),
-            intervalId = "web_${clippedStartMs}_${clippedEndMs}",
-            startMs = clippedStartMs,
-            endMs = clippedEndMs,
-            events = windowSlice,
-            speakers = updatedSpeakers,
-            sessionToken = item.requestCtx.sessionToken,
-            seekGeneration = item.requestCtx.seekGeneration,
-            isConfirmedSilence = false,
-            hasIndependentAudioOrFrameEvidence = true,
-            elapsedProcessingMs = elapsedMs,
-            expectedConfigFingerprint = item.requestCtx.configFingerprint,
-            timestampReport = audioTimestampReport,
-        )
-        if (reviewOutcome == null) {
-            _uiState.update { it.copy(releaseSnapshot = releaseSnap) }
-            return
-        }
-        val coverageStatus = when {
-            detailed.outcome == TranscriptionOutcome.PARTIAL_SUCCESS -> CoverageStatus.PARTIAL_RECOVERY
-            reviewOutcome.coverageStatus == CoverageStatus.VERIFIED_DIALOGUE -> CoverageStatus.VERIFIED_DIALOGUE
-            else -> CoverageStatus.RELEASED_FALLBACK
-        }
-        publishReleasedEventsToProject(
-            startMs = clippedStartMs,
-            endMs = clippedEndMs,
-            releasedEvents = reviewOutcome.repairedEvents,
-            coverageStatus = coverageStatus,
-            source = SubtitleSourceKind.AI_DRAFT,
-            speakers = updatedSpeakers,
-            failureReason = if (coverageStatus == CoverageStatus.PARTIAL_RECOVERY) detailed.diagnosticNote else "",
-        )
-        _uiState.update { cur ->
-            cur.copy(
-                scoutStatusText = "Scout verified live audio (${SubtitleParser.formatCompactTime(clippedStartMs)}–${SubtitleParser.formatCompactTime(clippedEndMs)})",
-            )
+            _uiState.update { cur ->
+                cur.copy(
+                    scoutStatusText = "Scout verified live audio (${SubtitleParser.formatCompactTime(clippedStartMs)}–${SubtitleParser.formatCompactTime(clippedEndMs)})",
+                )
+            }
         }
     }
 
@@ -4519,7 +3433,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     val resolvedLang = cur.youtubeNativeCcLang.ifBlank { refTrack.languageCode }
                     val nextCcState = resolveYouTubeNativeCcState(
                         trackCount = cur.youtubeNativeCcTrackCount ?: 1,
-                        trackEnabled = cur.youtubeNativeCcTrackEnabled,
+                        trackEnabled = if (cur.youtubeNativeCcTrackCount == null) true else cur.youtubeNativeCcTrackEnabled || true,
                         activeCuePresent = refTrack.cues.any { cur.currentTimeMs in (it.startMs - 400L)..(it.endMs + 400L) },
                         probeBlocked = false,
                         playheadMs = cur.currentTimeMs,
@@ -4529,7 +3443,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     cur.copy(
                         youtubeNativeCcLang = resolvedLang,
                         youtubeNativeCcTrackCount = cur.youtubeNativeCcTrackCount ?: 1,
-                        youtubeNativeCcTrackEnabled = cur.youtubeNativeCcTrackEnabled,
+                        youtubeNativeCcTrackEnabled = true,
                         youtubeNativeCcProbeBlocked = false,
                         youtubeNativeCcState = nextCcState,
                         releaseSnapshot = releaseStore.snapshot(),
@@ -4847,16 +3761,15 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             }
             VideoSourceKind.YOUTUBE_COMPLIANT,
             VideoSourceKind.WEB_STREAM -> {
-                val playSeq = issuePendingStreamPlayCommand(true, 0L)
+                val playSeq = ++nextStreamCommandSeq
                 val seekSeq = ++nextStreamCommandSeq
-                playbackClockAnchor.reset(0L, state.playbackSpeed, playing = false)
                 _uiState.update { cur ->
                     cur.copy(
                         isCinemaIntroActive = false,
                         introRemainingMs = 0L,
                         isOpeningSpeakersReady = false,
                         isScoutCatchUpBuffering = false,
-                        isPlaying = false,
+                        isPlaying = true,
                         currentTimeMs = 0L,
                         youtubeSeekRequest = seekSeq to 0L,
                         streamPlayRequest = playSeq to true,
@@ -4900,44 +3813,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
     fun setDisplayMode(mode: CaptionDisplayMode) {
         val normalized = mode.normalizedPrimaryMode()
-        val preState = _uiState.value
-        val previous = preState.displayMode.normalizedPrimaryMode()
-        if (previous.shouldShowBubbles != normalized.shouldShowBubbles) {
+        val previous = _uiState.value.displayMode
+        if ((previous == CaptionDisplayMode.FIXED_ZONES) != (normalized == CaptionDisplayMode.FIXED_ZONES)) {
             layoutEngine.clearSmoothing()
         }
-        val nextReadiness = readinessController.onDisplayModeChanged(normalized, coverageLedger)
-        val kind = preState.project.videoSource.kind
-        val canResumeForOffMode = normalized == CaptionDisplayMode.OFF &&
-            nextReadiness.state == PlaybackReadinessState.PLAYING &&
-            nextReadiness.userIntent == UserPlaybackIntent.PLAY &&
-            !nextReadiness.isBufferingHoldActive
-        val mustPauseForHold = normalized != CaptionDisplayMode.OFF &&
-            nextReadiness.isBufferingHoldActive
-
-        val cmdSeq = if ((canResumeForOffMode && !preState.isPlaying) || (mustPauseForHold && preState.isPlaying)) {
-            if (kind == VideoSourceKind.LOCAL_MP4) {
-                if (canResumeForOffMode) exoPlayer.play() else exoPlayer.pause()
-                null
-            } else if (kind == VideoSourceKind.YOUTUBE_COMPLIANT || kind == VideoSourceKind.WEB_STREAM) {
-                if (canResumeForOffMode) {
-                    issuePendingStreamPlayCommand(true, preState.currentTimeMs)
-                } else {
-                    cancelPendingPlayCommand()
-                    ++nextStreamCommandSeq
-                }
-            } else {
-                null
-            }
-        } else {
-            if (mustPauseForHold) cancelPendingPlayCommand()
-            null
-        }
-        if (canResumeForOffMode && kind != VideoSourceKind.YOUTUBE_COMPLIANT && kind != VideoSourceKind.WEB_STREAM) {
-            playbackClockAnchor.reset(preState.currentTimeMs, preState.playbackSpeed, playing = true)
-        } else if (mustPauseForHold) {
-            playbackClockAnchor.reset(preState.currentTimeMs, preState.playbackSpeed, playing = false)
-        }
-
         _uiState.update { state ->
             val (balloons, activeChapter) = computeContextAwareLayout(
                 project = state.project,
@@ -4946,27 +3825,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 liveFaces = currentLiveFaces,
                 displayMode = normalized,
             )
-            val resolvedIsPlaying = when {
-                canResumeForOffMode -> kind != VideoSourceKind.YOUTUBE_COMPLIANT && kind != VideoSourceKind.WEB_STREAM
-                mustPauseForHold -> false
-                else -> state.isPlaying
-            }
-            val sentinelSnap = sentinelCoordinator.inspectorSnapshot()
             state.copy(
                 displayMode = normalized,
-                isPlaying = resolvedIsPlaying,
-                isScoutCatchUpBuffering = nextReadiness.isBufferingHoldActive,
-                streamPlayRequest = cmdSeq?.let { it to canResumeForOffMode } ?: state.streamPlayRequest,
-                readinessSnapshot = nextReadiness,
-                sentinelSnapshot = sentinelSnap,
-                humanReadiness = HumanReadableStatus.resolve(
-                    project = state.project,
-                    scoutState = state.scoutCaptionState,
-                    coverageSummary = state.coverageSummary,
-                    readinessSnapshot = nextReadiness,
-                    releaseSnapshot = state.releaseSnapshot,
-                    sentinelSnapshot = sentinelSnap,
-                ),
                 placedBalloons = balloons,
                 activeChapter = activeChapter,
             )
@@ -5061,7 +3921,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun clearStatusBanner() {
-        statusBannerJob?.cancel()
         _uiState.update { it.copy(statusBanner = null) }
     }
 
@@ -5456,12 +4315,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     resolvedTranslated = evt.translatedText
                     resolvedNeedsTranslation = evt.needsTranslation
                 }
-                val nextRev = if (sourceChanged) evt.sourceTextRevision + 1 else evt.sourceTextRevision
-                val nextTrRev = if (!resolvedNeedsTranslation && resolvedTranslated.isNotBlank()) {
-                    nextRev
-                } else {
-                    evt.translationSourceRevision
-                }
                 val nextEvt = evt.copy(
                     sourceText = nextSource,
                     translatedText = resolvedTranslated,
@@ -5471,8 +4324,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     lockedByUser = lockedByUser ?: if (sourceChanged || translatedText != null) true else evt.lockedByUser,
                     needsTranslation = resolvedNeedsTranslation,
                     stableCueKey = evt.stableCueKey.ifBlank { evt.id },
-                    sourceTextRevision = nextRev,
-                    translationSourceRevision = nextTrRev,
                     placementMode = if (newType != DialogueType.SPOKEN && evt.placementMode == PlacementMode.AUTO) {
                         PlacementMode.EDGE_DOCKED
                     } else if (newType == DialogueType.SPOKEN && evt.placementMode == PlacementMode.EDGE_DOCKED) {
@@ -5525,8 +4376,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         aiTranslationJob?.cancel()
         speakerAnalysisJob?.cancel()
         lookaheadJob?.cancel()
-        healBeaconJob?.cancel()
-        clearCapturedAudioQueueSync()
         sourceEditRevision.incrementAndGet()
         autoAnalyzedEventIds.clear()
         cachedAiTurnHints.clear()
@@ -5550,7 +4399,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         translatedText = evt.sourceText,
                         needsTranslation = false,
                         stableCueKey = evt.stableCueKey.ifBlank { evt.id },
-                        translationSourceRevision = evt.sourceTextRevision,
                     )
                 } else {
                     evt.copy(
@@ -5561,13 +4409,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 }
             }
         }
-        val supersededProj = HealBeaconEngine.supersedeOrCancelStaleBeacons(
-            project = current,
-            activeGenerationToken = _uiState.value.seekGeneration,
-            reason = "Language configuration changed ($nextSource -> $nextTarget)",
-        )
-        sentinelCoordinator.cancelOrSupersedeStaleHealTasks(_uiState.value.seekGeneration)
-        val updatedProj = supersededProj.copy(
+        val updatedProj = current.copy(
             sourceLanguage = nextSource,
             targetLanguage = nextTarget,
             dialogueEvents = updatedEvents,
@@ -5612,16 +4454,9 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             translatedText = "${first.translatedText} ${second.translatedText}".trim(),
             literalText = listOf(first.literalText, second.literalText).filter { it.isNotBlank() }.joinToString(" "),
             lockedByUser = true,
-            stableCueKey = first.stableCueKey.ifBlank { first.id },
-            parentUtteranceKey = first.parentUtteranceKey.ifBlank { first.canonicalIdentityKey },
-            sourceSpanStartMs = minOf(first.sourceSpanStartMs ?: first.startTimeMs, second.sourceSpanStartMs ?: second.startTimeMs),
-            sourceSpanEndMs = maxOf(first.sourceSpanEndMs ?: first.endTimeMs, second.sourceSpanEndMs ?: second.endTimeMs),
-            sourceTextRevision = maxOf(first.sourceTextRevision, second.sourceTextRevision) + 1,
         )
         sorted[idx] = merged
         sorted.removeAt(idx + 1)
-        val snap = releaseStore.syncEditedEvent(merged, invalidateOverlappingDrafts = true)
-        _uiState.update { it.copy(releaseSnapshot = snap) }
         updateProject(_uiState.value.project.copy(dialogueEvents = sorted), banner = "Merged 2 dialogue events")
     }
 
@@ -5636,35 +4471,17 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
         val (src1, src2) = splitStringCleanly(evt.sourceText)
         val (tr1, tr2) = splitStringCleanly(evt.translatedText)
-        val rootKey = evt.parentUtteranceKey.ifBlank { evt.canonicalIdentityKey }
-        val baseChildKey = evt.stableCueKey.ifBlank { evt.id }.substringBefore("#p")
-        val nextRev = evt.sourceTextRevision + 1
 
-        val leftEvt = evt.copy(
-            endTimeMs = mid,
-            sourceText = src1,
-            translatedText = tr1,
-            stableCueKey = "${baseChildKey}#p1",
-            parentUtteranceKey = rootKey,
-            sourceSpanStartMs = evt.startTimeMs,
-            sourceSpanEndMs = mid,
-            sourceTextRevision = nextRev,
-            translationSourceRevision = nextRev,
+        sorted[idx] = evt.copy(endTimeMs = mid, sourceText = src1, translatedText = tr1)
+        sorted.add(
+            idx + 1,
+            evt.copy(
+                id = SubtitleParser.newEventId(),
+                startTimeMs = mid + 1L,
+                sourceText = src2,
+                translatedText = tr2,
+            )
         )
-        val rightEvt = evt.copy(
-            id = SubtitleParser.newEventId(),
-            startTimeMs = mid + 1L,
-            sourceText = src2,
-            translatedText = tr2,
-            stableCueKey = "${baseChildKey}#p2",
-            parentUtteranceKey = rootKey,
-            sourceSpanStartMs = mid + 1L,
-            sourceSpanEndMs = evt.endTimeMs,
-            sourceTextRevision = nextRev,
-            translationSourceRevision = nextRev,
-        )
-        sorted[idx] = leftEvt
-        sorted.add(idx + 1, rightEvt)
         updateProject(_uiState.value.project.copy(dialogueEvents = sorted), banner = "Split dialogue event at midpoint")
     }
 
@@ -5688,9 +4505,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         isLocked = true,
                         isRolePlaceholder = false,
                         isIdentityConfirmed = true,
-                        isUserNamed = true,
-                        nameRevealedAtMs = null,
-                        revealProvenance = "USER_RENAME",
                     )
                 } else {
                     spk
@@ -5736,10 +4550,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         castDiscoveryJob?.cancel()
         youtubeTranscriptJob?.cancel()
         changeoverPreListenJob?.cancel()
-        healBeaconJob?.cancel()
-        seekAckTimeoutJob?.cancel()
-        statusBannerJob?.cancel()
-        clearCapturedAudioQueueSync()
         introJob?.cancel()
         lookaheadJob?.cancel()
         scoutCompletedExtents.clear()
@@ -5782,14 +4592,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             initialSeekGeneration = restoredGen,
         )
         _uiState.update {
-            val activeMode = it.displayMode.normalizedPrimaryMode()
             it.copy(
                 project = demo,
                 activeDestination = AppDestination.WATCH,
                 showStartLauncher = false,
                 hasPendingPlayIntro = false,
                 canUndo = false,
-                displayMode = activeMode,
+                displayMode = CaptionDisplayMode.BALLOONS,
                 isPlaying = false,
                 currentTimeMs = 600L,
                 selectedEventId = null,
@@ -5805,8 +4614,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 scoutSeekRequest = null,
                 analysisStatus = AnalysisStatus.Ready,
                 scoutCaptionState = ScoutCaptionState.Idle,
-                scoutCaptureDiagnostics = ScoutCaptureDiagnostics(),
-                youtubePlayerErrorKind = null,
                 liveFaceExclusionRects = emptyList(),
                 bufferedWindowRanges = emptyList(),
                 scoutCompletedWindows = 0,
@@ -5819,10 +4626,9 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
                 releaseSnapshot = releaseStore.snapshot(),
                 seekGeneration = restoredGen,
-                statusBanner = null,
+                statusBanner = "Loaded interactive 2-speaker Demo Scenario",
             )
         }
-        showStatusBanner("Loaded interactive 2-speaker Demo Scenario")
         recomputeBalloons()
     }
 
@@ -5844,10 +4650,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         castDiscoveryJob?.cancel()
         youtubeTranscriptJob?.cancel()
         changeoverPreListenJob?.cancel()
-        healBeaconJob?.cancel()
-        seekAckTimeoutJob?.cancel()
-        statusBannerJob?.cancel()
-        clearCapturedAudioQueueSync()
         introJob?.cancel()
         lookaheadJob?.cancel()
         downgradedToLiteForStream = false
@@ -5855,13 +4657,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             if (_uiState.value.quotaSaverMode == QuotaSaverMode.PRO_ACCURACY) "gemini-3.8-flash" else "gemini-3.5-flash-lite"
         )
         scoutHeartbeatService.setZeroCloudPaused(_uiState.value.quotaSaverMode == QuotaSaverMode.ZERO_CLOUD)
-        _uiState.update {
-            it.copy(
-                scoutCaptionState = ScoutCaptionState.Idle,
-                scoutCaptureDiagnostics = ScoutCaptureDiagnostics(),
-                youtubePlayerErrorKind = null,
-            )
-        }
+        _uiState.update { it.copy(scoutCaptionState = ScoutCaptionState.Idle) }
         scoutCompletedExtents.clear()
         scoutAudioSliceTimestamps.clear()
         capturedYouTubeTimedTextKeys.clear()
@@ -6011,20 +4807,19 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     initialSeekGeneration = restoredGen,
                 )
                 _uiState.update {
-                    val activeMode = it.displayMode.normalizedPrimaryMode()
                     val (balloons, activeChapter) = computeContextAwareLayout(
                         project = newProject,
                         timeMs = 0L,
                         styleSettings = it.styleSettings,
                         liveFaces = currentLiveFaces,
-                        displayMode = activeMode,
+                        displayMode = CaptionDisplayMode.BALLOONS,
                     )
                     it.copy(
                         project = newProject,
                         activeDestination = AppDestination.WATCH,
                         showStartLauncher = false,
                         hasPendingPlayIntro = true,
-                        displayMode = activeMode,
+                        displayMode = CaptionDisplayMode.BALLOONS,
                         isCinemaIntroActive = false,
                         introRemainingMs = 0L,
                         canUndo = false,
@@ -7223,7 +6018,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         existingSpeakers = latestProj.speakers,
                         turnHints = cachedAiTurnHints,
                         rememberedCharacterColors = _uiState.value.characterColorMemory,
-                        slotToSpeakerId = buildSlotToSpeakerIdMap(latestProj.speakers),
                     )
                     if (!silentBackground && !undoPushed) {
                         pushUndoSnapshot()
@@ -7526,18 +6320,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         translationMode: TranslationMode,
     ) {
         subtitlePrepJob?.cancel()
-        val activationDecision = if (rawUrl.isNotBlank()) {
-            MediaSourceAdapterRegistry.default.resolveForActivation(rawUrl)
-        } else {
-            null
-        }
-        val validYoutubeId = when {
-            activationDecision is MediaActivationDecision.YouTube -> activationDecision.videoId
-            YouTubeMediaAdapter.isValidVideoId(youtubeVideoId) &&
-                (rawUrl.isBlank() || MediaSourceAdapterRegistry.default.extractValidYouTubeId(rawUrl) != null) ->
-                youtubeVideoId?.trim()
-            else -> null
-        }
         subtitlePrepJob = viewModelScope.launch {
             val curState = _uiState.value
             val quotaMode = curState.quotaSaverMode
@@ -7547,25 +6329,11 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 } else {
                     pastedSubtitleText
                 }
-                val videoKind = when (activationDecision) {
-                    is MediaActivationDecision.YouTube -> VideoSourceKind.YOUTUBE_COMPLIANT
-                    is MediaActivationDecision.DirectStream,
-                    is MediaActivationDecision.LocalFile -> VideoSourceKind.LOCAL_MP4
-                    is MediaActivationDecision.Demo -> VideoSourceKind.DEMO_SCENARIO
-                    else -> if (validYoutubeId != null) VideoSourceKind.YOUTUBE_COMPLIANT else VideoSourceKind.WEB_STREAM
-                }
-                val canonicalUrl = when (activationDecision) {
-                    is MediaActivationDecision.YouTube -> activationDecision.normalizedUrl
-                    is MediaActivationDecision.DirectStream -> activationDecision.normalizedUrl
-                    is MediaActivationDecision.WebStream -> activationDecision.normalizedUrl
-                    is MediaActivationDecision.LocalFile -> activationDecision.normalizedUri
-                    else -> rawUrl.trim()
-                }
                 subtitlePreGenerator.prepareFromTextOrCues(
-                    title = validYoutubeId?.let { "YouTube · $it" } ?: "Subtitle Track",
-                    videoUrl = canonicalUrl,
-                    videoKind = videoKind,
-                    youtubeVideoId = validYoutubeId,
+                    title = youtubeVideoId?.let { "YouTube · $it" } ?: "Subtitle Track",
+                    videoUrl = rawUrl.trim(),
+                    videoKind = if (youtubeVideoId != null) VideoSourceKind.YOUTUBE_COMPLIANT else VideoSourceKind.WEB_STREAM,
+                    youtubeVideoId = youtubeVideoId,
                     rawText = rawText,
                     fileName = subtitleName,
                     sourceLanguage = sourceLanguage,
@@ -7582,17 +6350,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 return@launch
             }
 
-            if (activationDecision is MediaActivationDecision.Rejected) {
-                _uiState.update {
-                    it.copy(subtitlePrepState = SubtitlePrepState.Error(activationDecision.reason))
-                }
-                return@launch
-            }
-
-            if (validYoutubeId != null) {
+            if (!youtubeVideoId.isNullOrBlank()) {
                 subtitlePreGenerator.prepareYouTubeSubtitles(
-                    youtubeUrl = (activationDecision as? MediaActivationDecision.YouTube)?.normalizedUrl ?: rawUrl.trim(),
-                    videoId = validYoutubeId,
+                    youtubeUrl = rawUrl,
+                    videoId = youtubeVideoId,
                     sourceLanguage = sourceLanguage,
                     targetLanguage = targetLanguage,
                     translationMode = translationMode,
@@ -7850,39 +6611,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun loadProject(project: DialogueLensProject) {
-        val validatedProject = if (project.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT) {
-            val validYtId = MediaSourceAdapterRegistry.default.extractValidYouTubeId(project.videoSource.uriString)
-                ?: project.videoSource.youtubeVideoId?.takeIf { YouTubeMediaAdapter.isValidVideoId(it) }
-            if (validYtId != null) {
-                project.copy(videoSource = project.videoSource.copy(youtubeVideoId = validYtId))
-            } else {
-                when (val repaired = MediaSourceAdapterRegistry.default.resolveForActivation(project.videoSource.uriString)) {
-                    is MediaActivationDecision.WebStream -> project.copy(
-                        videoSource = project.videoSource.copy(
-                            kind = VideoSourceKind.WEB_STREAM,
-                            uriString = repaired.normalizedUrl,
-                            youtubeVideoId = null,
-                        )
-                    )
-                    is MediaActivationDecision.DirectStream -> project.copy(
-                        videoSource = project.videoSource.copy(
-                            kind = VideoSourceKind.LOCAL_MP4,
-                            uriString = repaired.normalizedUrl,
-                            youtubeVideoId = null,
-                        )
-                    )
-                    else -> {
-                        showStatusBanner("Invalid YouTube link — cannot start YouTube playback.")
-                        return
-                    }
-                }
-            }
-        } else {
-            project
-        }
-
         val sessionToken = nextSessionToken()
-        pendingTransportCommand = null
         analysisJob?.cancel()
         introJob?.cancel()
         lookaheadJob?.cancel()
@@ -7891,10 +6620,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         castDiscoveryJob?.cancel()
         youtubeTranscriptJob?.cancel()
         changeoverPreListenJob?.cancel()
-        healBeaconJob?.cancel()
-        seekAckTimeoutJob?.cancel()
-        statusBannerJob?.cancel()
-        clearCapturedAudioQueueSync()
         lastScoutSeekSentAtMs = 0L
         lastScoutSeekTargetMs = -1L
         scoutCompletedExtents.clear()
@@ -7912,26 +6637,21 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         undoStack.clear()
         layoutEngine.clearSmoothing()
         playbackClockAnchor.reset(0L, _uiState.value.playbackSpeed, false)
-        if (validatedProject.videoSource.kind == VideoSourceKind.LOCAL_MP4) {
-            exoPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(validatedProject.videoSource.uriString)))
+        if (project.videoSource.kind == VideoSourceKind.LOCAL_MP4) {
+            exoPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(project.videoSource.uriString)))
             exoPlayer.prepare()
         } else {
             exoPlayer.stop()
             exoPlayer.clearMediaItems()
         }
-        val hasRealSubs = LookaheadWindowPlanner.hasRealSubtitles(validatedProject.dialogueEvents)
-        val rawCleanedEvents = if (!hasRealSubs && validatedProject.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT) {
-            emptyList()
-        } else {
-            reconcileRestoredTimeline(validatedProject.dialogueEvents)
-        }
-        val baseCleanedProject = if (!hasRealSubs && validatedProject.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT) {
-            validatedProject.copy(
+        val hasRealSubs = LookaheadWindowPlanner.hasRealSubtitles(project.dialogueEvents)
+        val baseCleanedProject = if (!hasRealSubs && project.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT) {
+            project.copy(
                 subtitleSource = SubtitleSourceKind.BUILT_IN_DEMO,
                 dialogueEvents = emptyList(),
             )
         } else {
-            validatedProject.copy(dialogueEvents = rawCleanedEvents)
+            project
         }
         baseCleanedProject.dialogueEvents.forEach { evt ->
             if (evt.speakerId != null || evt.attributionSummary == "Unidentified speaker") {
@@ -7947,24 +6667,23 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         } else {
             restoredBeaconsProject.chapters
         }
-        contextEngine.resetForProject(restoredBeaconsProject.copy(chapters = inferredChapters))
-        autoSelfHealDetector.resetForProject(restoredBeaconsProject.id)
-        measuredBubbleSizes.clear()
-        layoutEngine.stabilityDiagnostics.reset()
-        sentinelCoordinator.resetForProject(restoredBeaconsProject.copy(chapters = inferredChapters))
-        val restoredGen = sentinelCoordinator.currentSchedulingGeneration()
-        val restoredSnapshot = releaseStore.resetSession(
-            mediaId = restoredBeaconsProject.id,
-            sessionToken = sessionToken,
-            seekGeneration = restoredGen,
-            configFingerprint = currentConfigFingerprint(restoredBeaconsProject, _uiState.value.quotaSaverMode),
-            initialEvents = if (hasRealSubs) restoredBeaconsProject.dialogueEvents else emptyList(),
-            initialSpeakers = restoredBeaconsProject.speakers,
-        )
         val cleanedProject = restoredBeaconsProject.copy(
             chapters = inferredChapters,
-            dialogueEvents = restoredSnapshot.events,
             lastWatchedAtEpochMs = System.currentTimeMillis(),
+        )
+        contextEngine.resetForProject(cleanedProject)
+        autoSelfHealDetector.resetForProject(cleanedProject.id)
+        measuredBubbleSizes.clear()
+        layoutEngine.stabilityDiagnostics.reset()
+        sentinelCoordinator.resetForProject(cleanedProject)
+        val restoredGen = sentinelCoordinator.currentSchedulingGeneration()
+        releaseStore.resetSession(
+            mediaId = cleanedProject.id,
+            sessionToken = sessionToken,
+            seekGeneration = restoredGen,
+            configFingerprint = currentConfigFingerprint(cleanedProject, _uiState.value.quotaSaverMode),
+            initialEvents = if (hasRealSubs) cleanedProject.dialogueEvents else emptyList(),
+            initialSpeakers = cleanedProject.speakers,
         )
         val resumeMs = cleanedProject.lastPlaybackPositionMs.takeIf { pos ->
             pos > 1_500L && pos < (cleanedProject.videoSource.durationMs - 3_000L)
@@ -8027,14 +6746,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             else -> ScoutCaptionState.Idle
         }
         _uiState.update {
-            val activeMode = it.displayMode.normalizedPrimaryMode()
             it.copy(
                 project = cleanedProject,
                 activeDestination = AppDestination.WATCH,
                 showStartLauncher = false,
                 hasPendingPlayIntro = false,
                 canUndo = false,
-                displayMode = activeMode,
+                displayMode = CaptionDisplayMode.BALLOONS,
                 isPlaying = false,
                 currentTimeMs = resumeMs,
                 selectedEventId = null,
@@ -8055,8 +6773,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 scoutSeekRequest = null,
                 analysisStatus = AnalysisStatus.Ready,
                 scoutCaptionState = initScoutState,
-                scoutCaptureDiagnostics = ScoutCaptureDiagnostics(),
-                youtubePlayerErrorKind = null,
                 youtubeNativeCcTrackCount = null,
                 youtubeNativeCcLang = "",
                 youtubeNativeCcState = if (cleanedProject.videoSource.kind == VideoSourceKind.YOUTUBE_COMPLIANT) {
@@ -8259,7 +6975,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     )
                 }
 
-                val preDecodeCtx = captureWorkRequestContext(proj, state.quotaSaverMode)
                 val existingShots = proj.shots.filterNot { it.cutType == "CONTINUOUS" && it.startMs == 0L && it.endMs == durationMs }
                 val (visualResult, wavChunk) = coroutineScope {
                     val vDef = async {
@@ -8288,18 +7003,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 }
 
                 if (!isCurrentSession(sessionToken, projectId)) break
-                if (!isRequestContextCurrent(preDecodeCtx)) {
-                    if (!hasPreloadedSubtitles) {
-                        coverageLedger.recordOutcome(
-                            startMs = nextWin.startMs,
-                            endMs = nextWin.endMs,
-                            status = CoverageStatus.PENDING,
-                            source = SubtitleSourceKind.AI_DRAFT,
-                            incrementRetry = false,
-                        )
-                    }
-                    continue
-                }
                 val latestAfterDecode = _uiState.value.project
                 if (latestAfterDecode.id != projectId) break
 
@@ -8338,9 +7041,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 var windowCoverageStatus: CoverageStatus = CoverageStatus.PENDING
                 var windowFailureReason = ""
                 var incrementRetryFlag = false
-                var mediaSpeakerUpdates: List<AiCastSlotAssignment> = emptyList()
-                val rawMediaCuesByEventId = mutableMapOf<String, AiTranscribedCue>()
-                var mediaClockProvenance: ScoutClockProvenance = ScoutClockProvenance.WINDOW_FALLBACK
 
                 val updatedEventsInWindow: List<DialogueEvent> = if (
                     allowCloudScout && (!hasPreloadedSubtitles || existingInWindow.isEmpty()) && wavChunk != null
@@ -8466,22 +7166,14 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                 incrementRetryFlag = true
                             }
                         }
-                        val (reconciledMediaCues, reconciledMediaUpdates, _) = reconcileWindowOutcomeSpeakersAndCues(
-                            existingSpeakers = latestAfterDecode.speakers,
-                            cues = detailed.cues,
-                            speakerUpdates = detailed.speakerUpdates,
-                        )
-                        mediaSpeakerUpdates = reconciledMediaUpdates
-                        mediaClockProvenance = ScoutClockProvenance.CHUNK_RELATIVE_OFFSET
-                        if (reconciledMediaCues.isNotEmpty()) {
+                        val aiCues = detailed.cues
+                        if (aiCues.isNotEmpty()) {
                             SubtitleParser.applyReadingPacingGuardrails(
-                                reconciledMediaCues.map { c ->
+                                aiCues.map { c ->
                                     val id = SubtitleParser.newEventId()
-                                    rawMediaCuesByEventId[id] = c
                                     val mid = (c.startMs + c.endMs) / 2L
                                     val sId = mergedShots.firstOrNull { mid in it.startMs..it.endMs }?.id
                                         ?: mergedShots.firstOrNull()?.id ?: "shot_1"
-                                    val slotUpper = c.suggestedSpeakerSlot.trim().uppercase()
                                     hintMap[id] = AiTranslatedLine(
                                         id = id,
                                         naturalTranslation = c.naturalTranslation,
@@ -8489,7 +7181,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                         romanization = c.romanization,
                                         dialogueTypeHint = c.dialogueType,
                                         speakerTurnHint = "UNCERTAIN",
-                                        suggestedSpeakerSlot = slotUpper.ifBlank { "UNCERTAIN" },
+                                        suggestedSpeakerSlot = c.suggestedSpeakerSlot,
                                         contextReason = c.contextReason,
                                         culturalNote = c.culturalNote,
                                     )
@@ -8502,7 +7194,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                         literalText = c.literalTranslation,
                                         romanization = c.romanization,
                                         speakerId = null,
-                                        speakerConfidence = if (slotUpper in setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")) 0.80f else 0.56f,
+                                        speakerConfidence = 0.56f,
                                         faceTrackId = null,
                                         faceConfidence = 0f,
                                         shotId = sId,
@@ -8638,37 +7330,20 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     break
                 }
 
-                var workingBeforeCommit = latestBeforeCommit
-                if (mediaSpeakerUpdates.isNotEmpty()) {
-                    val (castMerged, updatedMem) = mergeCastSlotAssignments(
-                        project = workingBeforeCommit,
-                        assignments = mediaSpeakerUpdates,
-                        rememberedColors = _uiState.value.characterColorMemory,
-                        reconcileColors = attributionEngine::reconcileCharacterColors,
-                        discoveryTimestampMs = nextWin.startMs,
-                    )
-                    if (updatedMem != _uiState.value.characterColorMemory) {
-                        persistCharacterColorMemory(updatedMem)
-                    }
-                    workingBeforeCommit = castMerged
-                }
-
                 val mergeReport = LookaheadWindowPlanner.mergeWindowDialogueEventsWithReport(
-                    existing = workingBeforeCommit.dialogueEvents.filterNot { it.sourceText.startsWith("Web Cinema ready") },
+                    existing = latestBeforeCommit.dialogueEvents.filterNot { it.sourceText.startsWith("Web Cinema ready") },
                     incoming = updatedEventsInWindow,
                     windowStartMs = nextWin.startMs,
                     windowEndMs = nextWin.endMs,
                 )
 
-                cachedAiTurnHints.putAll(hintMap)
                 val (updatedSpeakers, attributed) = attributionEngine.assignSpeakers(
                     events = mergeReport.events,
                     shots = mergedShots,
                     faceTracks = mergedFaces,
-                    existingSpeakers = workingBeforeCommit.speakers,
-                    turnHints = cachedAiTurnHints,
+                    existingSpeakers = latestBeforeCommit.speakers,
+                    turnHints = hintMap,
                     rememberedCharacterColors = _uiState.value.characterColorMemory,
-                    slotToSpeakerId = buildSlotToSpeakerIdMap(workingBeforeCommit.speakers),
                 )
 
                 var finalEvents = attributed
@@ -8679,15 +7354,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         windowCoverageStatus == CoverageStatus.PARTIAL_RECOVERY)
                 ) {
                     val windowSlice = attributed.filter { it.startTimeMs in nextWin.startMs until nextWin.endMs }
-                    val mediaTimestampReport = buildScout1TimestampReport(
-                        windowStartMs = nextWin.startMs,
-                        windowEndMs = nextWin.endMs,
-                        events = windowSlice,
-                        rawCuesByEventId = rawMediaCuesByEventId,
-                        explicitProvenance = mediaClockProvenance,
-                    )
                     val (reviewed, releaseSnap) = stageAndReviewIntervalThroughReleaseGate(
-                        project = workingBeforeCommit.copy(speakers = updatedSpeakers, dialogueEvents = attributed),
+                        project = latestBeforeCommit.copy(speakers = updatedSpeakers, dialogueEvents = attributed),
                         intervalId = "media_${nextWin.startMs}_${nextWin.endMs}",
                         startMs = nextWin.startMs,
                         endMs = nextWin.endMs,
@@ -8698,25 +7366,16 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         isConfirmedSilence = windowCoverageStatus == CoverageStatus.VERIFIED_SILENCE && windowSlice.isEmpty(),
                         hasIndependentAudioOrFrameEvidence = true,
                         expectedConfigFingerprint = winRequestCtx.configFingerprint,
-                        timestampReport = mediaTimestampReport,
                     )
                     if (reviewed == null) {
-                        val keptStatus = if (releaseStore.hasPendingDraftsInWindow(nextWin.startMs, nextWin.endMs)) {
-                            CoverageStatus.IN_PROGRESS
-                        } else {
-                            CoverageStatus.PENDING
-                        }
                         coverageLedger.recordOutcome(
                             startMs = nextWin.startMs,
                             endMs = nextWin.endMs,
-                            status = keptStatus,
+                            status = CoverageStatus.PENDING,
                             source = SubtitleSourceKind.AI_DRAFT,
                             incrementRetry = false,
                         )
                         _uiState.update { it.copy(releaseSnapshot = releaseSnap) }
-                        if (keptStatus == CoverageStatus.IN_PROGRESS) {
-                            wakeScheduler("media_review_deferred")
-                        }
                         continue
                     }
                     finalEvents = mergeReleasedIntervalPreservingLocks(
@@ -8861,67 +7520,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         translationMode: TranslationMode,
         pastedSubtitleText: String = "",
     ) {
-        val activationDecision = if (youtubeUrl.isNotBlank()) {
-            MediaSourceAdapterRegistry.default.resolveForActivation(youtubeUrl)
-        } else {
-            null
-        }
-        val validYoutubeId = when {
-            activationDecision is MediaActivationDecision.YouTube -> activationDecision.videoId
-            YouTubeMediaAdapter.isValidVideoId(youtubeVideoId) &&
-                (youtubeUrl.isBlank() || MediaSourceAdapterRegistry.default.extractValidYouTubeId(youtubeUrl) != null) ->
-                youtubeVideoId.trim()
-            else -> null
-        }
-        if (validYoutubeId == null) {
-            when (activationDecision) {
-                is MediaActivationDecision.WebStream -> {
-                    createWebStreamProject(
-                        webUrl = activationDecision.normalizedUrl,
-                        subtitleUri = subtitleUri,
-                        subtitleFileName = subtitleFileName,
-                        sourceLanguage = sourceLanguage,
-                        targetLanguage = targetLanguage,
-                        translationMode = translationMode,
-                        pastedSubtitleText = pastedSubtitleText,
-                    )
-                    return
-                }
-                is MediaActivationDecision.DirectStream -> {
-                    createDirectMediaUrlProject(
-                        mediaUrl = activationDecision.normalizedUrl,
-                        subtitleUri = subtitleUri,
-                        subtitleFileName = subtitleFileName,
-                        sourceLanguage = sourceLanguage,
-                        targetLanguage = targetLanguage,
-                        translationMode = translationMode,
-                        pastedSubtitleText = pastedSubtitleText,
-                    )
-                    return
-                }
-                else -> {
-                    val reason = (activationDecision as? MediaActivationDecision.Rejected)?.reason
-                        ?: "Enter a valid YouTube link or 11-character video ID."
-                    showStatusBanner(reason)
-                    return
-                }
-            }
-        }
-        val resolvedYoutubeUrl = (activationDecision as? MediaActivationDecision.YouTube)?.normalizedUrl
-            ?: youtubeUrl.trim().ifBlank { "https://www.youtube.com/watch?v=$validYoutubeId" }
-
         val sessionToken = nextSessionToken()
-        pendingTransportCommand = null
         analysisJob?.cancel()
         aiTranslationJob?.cancel()
         speakerAnalysisJob?.cancel()
         castDiscoveryJob?.cancel()
         youtubeTranscriptJob?.cancel()
         changeoverPreListenJob?.cancel()
-        healBeaconJob?.cancel()
-        seekAckTimeoutJob?.cancel()
-        statusBannerJob?.cancel()
-        clearCapturedAudioQueueSync()
         introJob?.cancel()
         lookaheadJob?.cancel()
         downgradedToLiteForStream = false
@@ -8965,7 +7570,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             }
             val cachedTranscript = if (cues.isEmpty()) {
                 projectStore.loadCachedTranscript(
-                    ProjectStore.canonicalYouTubeCacheKey(validYoutubeId, targetLanguage)
+                    ProjectStore.canonicalYouTubeCacheKey(youtubeVideoId, targetLanguage)
                 )
             } else {
                 null
@@ -9019,7 +7624,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     durationMs = cueDur,
                     subSource = SubtitleSourceKind.UPLOADED_FILE,
                     sourceLanguage = sourceLanguage,
-                    title = "YouTube · $validYoutubeId",
+                    title = "YouTube · $youtubeVideoId",
                     channelName = "",
                     description = "",
                     horizonMs = cueDur,
@@ -9031,15 +7636,14 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     cachedTranscript.dialogueEvents.maxOfOrNull { it.endTimeMs } ?: 0L,
                     60_000L,
                 )
-                val reconciledCachedEvents = reconcileRestoredTimeline(cachedTranscript.dialogueEvents)
                 val restoredIntervals = TranscriptCoverageLedger.restoreOrMigrate(cachedTranscript, dur)
                 CacheRestoreTuple(
                     speakers = cachedTranscript.speakers.ifEmpty { initialSpeakers },
-                    events = reconciledCachedEvents,
+                    events = cachedTranscript.dialogueEvents,
                     durationMs = dur,
                     subSource = cachedTranscript.subtitleSource,
                     sourceLanguage = cachedTranscript.sourceLanguage.ifBlank { sourceLanguage },
-                    title = cachedTranscript.title.ifBlank { "YouTube · $validYoutubeId" },
+                    title = cachedTranscript.title.ifBlank { "YouTube · $youtubeVideoId" },
                     channelName = cachedTranscript.channelName,
                     description = cachedTranscript.description,
                     horizonMs = 0L,
@@ -9052,7 +7656,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     durationMs = 180_000L,
                     subSource = SubtitleSourceKind.BUILT_IN_DEMO,
                     sourceLanguage = sourceLanguage,
-                    title = "YouTube · $validYoutubeId",
+                    title = "YouTube · $youtubeVideoId",
                     channelName = "",
                     description = "",
                     horizonMs = 0L,
@@ -9094,7 +7698,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 initialSummary.isFullyVerified
 
             val ytProject = DialogueLensProject(
-                id = "yt_${validYoutubeId}_${System.currentTimeMillis()}",
+                id = "yt_${youtubeVideoId}_${System.currentTimeMillis()}",
                 title = resolvedTitle,
                 createdAtEpochMs = System.currentTimeMillis(),
                 sourceLanguage = resolvedSourceLang,
@@ -9103,13 +7707,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 subtitleSource = resolvedSubSource,
                 qualityMode = ProcessingQualityMode.BALANCED,
                 videoSource = VideoSource(
-                    uriString = resolvedYoutubeUrl,
-                    displayName = "YouTube ($validYoutubeId)",
+                    uriString = youtubeUrl.trim(),
+                    displayName = "YouTube ($youtubeVideoId)",
                     kind = VideoSourceKind.YOUTUBE_COMPLIANT,
                     durationMs = resolvedDurationMs,
                     width = 1920,
                     height = 1080,
-                    youtubeVideoId = validYoutubeId,
+                    youtubeVideoId = youtubeVideoId,
                     channelName = resolvedChannel,
                     description = resolvedDesc,
                 ),
@@ -9157,8 +7761,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     sessionToken = sessionToken,
                     seekGeneration = restoredGen,
                     configFingerprint = currentConfigFingerprint(ytProject, it.quotaSaverMode),
-                    initialEvents = events,
-                    initialSpeakers = speakers,
                 )
                 val initReadiness = readinessController.resetForMedia(
                     initialPositionMs = 0L,
@@ -9168,20 +7770,19 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     playbackSpeed = it.playbackSpeed,
                     initialSeekGeneration = restoredGen,
                 )
-                val activeMode = it.displayMode.normalizedPrimaryMode()
                 val (balloons, activeChapter) = computeContextAwareLayout(
                     project = ytProject,
                     timeMs = 0L,
                     styleSettings = it.styleSettings,
                     liveFaces = currentLiveFaces,
-                    displayMode = activeMode,
+                    displayMode = CaptionDisplayMode.BALLOONS,
                 )
                 it.copy(
                     project = ytProject,
                     activeDestination = AppDestination.WATCH,
                     showStartLauncher = false,
                     hasPendingPlayIntro = true,
-                    displayMode = activeMode,
+                    displayMode = CaptionDisplayMode.BALLOONS,
                     isCinemaIntroActive = false,
                     introRemainingMs = 0L,
                     introTotalDurationMs = LookaheadWindowPlanner.recommendedIntroMaxDurationMs(resolvedDurationMs),
@@ -9210,8 +7811,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         initialTier == ScoutExecutionTier.FREE_LOCAL -> ScoutCaptionState.FetchingCaptions(initialWorkingMsg)
                         else -> ScoutCaptionState.AiTranscribing(initialWorkingMsg, completedWindows = 0, cuesSoFar = 0)
                     },
-                    scoutCaptureDiagnostics = ScoutCaptureDiagnostics(),
-                    youtubePlayerErrorKind = null,
                     youtubeNativeCcTrackCount = null,
                     youtubeNativeCcLang = "",
                     youtubeNativeCcState = YouTubeNativeCcState.LOADING,
@@ -9264,7 +7863,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 if (!fullyCached) {
                     runYouTubeScoutTranscriptPipeline(
                         projectId = ytProject.id,
-                        videoId = validYoutubeId,
+                        videoId = youtubeVideoId,
                         skipTierOneCaptions = true,
                         resumeFromHorizonSec = 0,
                     )
@@ -9524,12 +8123,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     if (reconciledCues.isNotEmpty()) {
                         val windowEvents = mutableListOf<DialogueEvent>()
                         val hintMap = mutableMapOf<String, AiTranslatedLine>()
-                        val rawCuesByEventId = mutableMapOf<String, AiTranscribedCue>()
                         val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
 
                         reconciledCues.forEach { cue ->
                             val eventId = SubtitleParser.newEventId()
-                            rawCuesByEventId[eventId] = cue
                             val isNonSpeaker = cue.dialogueType == DialogueType.SOUND_DESCRIPTION ||
                                 cue.dialogueType == DialogueType.NARRATION
                             val isOffScreenOrVoiceOver = cue.dialogueType != DialogueType.SPOKEN
@@ -9621,7 +8218,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                 rememberedCharacterColors = _uiState.value.characterColorMemory,
                                 settledEventIds = settledAttributedEventIds,
                                 sceneBoundaryMs = sceneBoundaries,
-                                slotToSpeakerId = buildSlotToSpeakerIdMap(workingProj.speakers),
                             )
                             val latestSceneStartMs = sceneBoundaries.lastOrNull { it <= wStartMs } ?: 0L
                             val updatedSpk = attributedSpeakers.map { spk ->
@@ -9656,12 +8252,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
                         // Pass Scout 1 window through Scout 2 Independent Review & Atomic Release Gate
                         val windowSliceEvents = attributedAll.filter { it.startTimeMs in wStartMs until wEndMs }
-                        val ytTimestampReport = buildScout1TimestampReport(
-                            windowStartMs = wStartMs,
-                            windowEndMs = wEndMs,
-                            events = windowSliceEvents,
-                            rawCuesByEventId = rawCuesByEventId,
-                        )
                         val (reviewed, releaseSnap) = stageAndReviewIntervalThroughReleaseGate(
                             project = workingProj.copy(speakers = enrichedSpeakers, dialogueEvents = attributedAll),
                             intervalId = "win_${wStartMs}_${wEndMs}",
@@ -9676,14 +8266,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                             hasIndependentAudioOrFrameEvidence = false,
                             elapsedProcessingMs = elapsedProcessingMs,
                             expectedConfigFingerprint = requestCtx?.configFingerprint,
-                            timestampReport = ytTimestampReport,
                         )
                         if (reviewed == null) {
+                            // Stale session/seek/config write was rejected by the Release Gate
                             _uiState.update { it.copy(releaseSnapshot = releaseSnap) }
-                            if (releaseStore.hasPendingDraftsInWindow(wStartMs, wEndMs)) {
-                                coverageLedger.markInProgress(wStartMs, wEndMs)
-                                wakeScheduler("scout2_review_deferred")
-                            }
                             return
                         }
                         windowReviewOutcome = reviewed
@@ -9724,10 +8310,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         )
                         if (reviewedSilence == null) {
                             _uiState.update { it.copy(releaseSnapshot = silenceReleaseSnap) }
-                            if (releaseStore.hasPendingDraftsInWindow(wStartMs, wEndMs)) {
-                                coverageLedger.markInProgress(wStartMs, wEndMs)
-                                wakeScheduler("scout2_silence_review_deferred")
-                            }
                             return
                         }
                         windowReviewOutcome = reviewedSilence
@@ -10638,46 +9220,11 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         translationMode: TranslationMode,
         pastedSubtitleText: String = "",
     ) {
-        val decision = MediaSourceAdapterRegistry.default.resolveForActivation(mediaUrl)
-        when (decision) {
-            is MediaActivationDecision.Rejected -> {
-                showStatusBanner(decision.reason)
-                return
-            }
-            is MediaActivationDecision.YouTube -> {
-                createYouTubeProject(
-                    youtubeUrl = decision.normalizedUrl,
-                    youtubeVideoId = decision.videoId,
-                    subtitleUri = subtitleUri,
-                    subtitleFileName = subtitleFileName,
-                    sourceLanguage = sourceLanguage,
-                    targetLanguage = targetLanguage,
-                    translationMode = translationMode,
-                    pastedSubtitleText = pastedSubtitleText,
-                )
-                return
-            }
-            is MediaActivationDecision.WebStream -> {
-                createWebStreamProject(
-                    webUrl = decision.normalizedUrl,
-                    subtitleUri = subtitleUri,
-                    subtitleFileName = subtitleFileName,
-                    sourceLanguage = sourceLanguage,
-                    targetLanguage = targetLanguage,
-                    translationMode = translationMode,
-                    pastedSubtitleText = pastedSubtitleText,
-                )
-                return
-            }
-            is MediaActivationDecision.Demo -> {
-                loadDemoScenario()
-                return
-            }
-            is MediaActivationDecision.DirectStream,
-            is MediaActivationDecision.LocalFile -> Unit
-        }
-        pendingTransportCommand = null
         val resolved = MediaSourceAdapterRegistry.default.resolveInput(mediaUrl)
+        if (resolved != null && !resolved.isSupported) {
+            _uiState.update { it.copy(statusBanner = resolved.userNotice) }
+            return
+        }
         val cleanUrl = resolved?.normalizedUri ?: mediaUrl.trim()
         val parsedUri = runCatching { Uri.parse(cleanUrl) }.getOrNull() ?: return
         val title = resolved?.suggestedTitle?.ifBlank { "Direct Video Stream" } ?: "Direct Video Stream"
@@ -10776,51 +9323,24 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         translationMode: TranslationMode,
         pastedSubtitleText: String = "",
     ) {
-        val decision = MediaSourceAdapterRegistry.default.resolveForActivation(webUrl)
-        when (decision) {
-            is MediaActivationDecision.Rejected -> {
-                showStatusBanner(decision.reason)
-                return
-            }
-            is MediaActivationDecision.YouTube -> {
-                createYouTubeProject(
-                    youtubeUrl = decision.normalizedUrl,
-                    youtubeVideoId = decision.videoId,
-                    subtitleUri = subtitleUri,
-                    subtitleFileName = subtitleFileName,
-                    sourceLanguage = sourceLanguage,
-                    targetLanguage = targetLanguage,
-                    translationMode = translationMode,
-                    pastedSubtitleText = pastedSubtitleText,
-                )
-                return
-            }
-            is MediaActivationDecision.DirectStream,
-            is MediaActivationDecision.LocalFile -> {
-                val targetUri = when (decision) {
-                    is MediaActivationDecision.DirectStream -> decision.normalizedUrl
-                    is MediaActivationDecision.LocalFile -> decision.normalizedUri
-                    else -> webUrl
-                }
-                createDirectMediaUrlProject(
-                    mediaUrl = targetUri,
-                    subtitleUri = subtitleUri,
-                    subtitleFileName = subtitleFileName,
-                    sourceLanguage = sourceLanguage,
-                    targetLanguage = targetLanguage,
-                    translationMode = translationMode,
-                    pastedSubtitleText = pastedSubtitleText,
-                )
-                return
-            }
-            is MediaActivationDecision.Demo -> {
-                loadDemoScenario()
-                return
-            }
-            is MediaActivationDecision.WebStream -> Unit
+        val resolved = MediaSourceAdapterRegistry.default.resolveInput(webUrl)
+        if (resolved != null && !resolved.isSupported) {
+            _uiState.update { it.copy(statusBanner = resolved.userNotice) }
+            return
+        }
+        if (resolved?.providerKind == com.example.domain.media.MediaProviderKind.DIRECT_MEDIA_URL) {
+            createDirectMediaUrlProject(
+                mediaUrl = resolved.normalizedUri,
+                subtitleUri = subtitleUri,
+                subtitleFileName = subtitleFileName,
+                sourceLanguage = sourceLanguage,
+                targetLanguage = targetLanguage,
+                translationMode = translationMode,
+                pastedSubtitleText = pastedSubtitleText,
+            )
+            return
         }
         val sessionToken = nextSessionToken()
-        pendingTransportCommand = null
         analysisJob?.cancel()
         aiTranslationJob?.cancel()
         speakerAnalysisJob?.cancel()
@@ -10829,23 +9349,13 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         introJob?.cancel()
         lookaheadJob?.cancel()
         changeoverPreListenJob?.cancel()
-        healBeaconJob?.cancel()
-        seekAckTimeoutJob?.cancel()
-        statusBannerJob?.cancel()
-        clearCapturedAudioQueueSync()
         downgradedToLiteForStream = false
         pendingWebTimedTextFallback = null
         scoutHeartbeatService.resetForNewStream(
             if (_uiState.value.quotaSaverMode == QuotaSaverMode.PRO_ACCURACY) "gemini-3.8-flash" else "gemini-3.5-flash-lite"
         )
         scoutHeartbeatService.setZeroCloudPaused(_uiState.value.quotaSaverMode == QuotaSaverMode.ZERO_CLOUD)
-        _uiState.update {
-            it.copy(
-                scoutCaptionState = ScoutCaptionState.Idle,
-                scoutCaptureDiagnostics = ScoutCaptureDiagnostics(),
-                youtubePlayerErrorKind = null,
-            )
-        }
+        _uiState.update { it.copy(scoutCaptionState = ScoutCaptionState.Idle) }
         lastScoutSeekSentAtMs = 0L
         lastScoutSeekTargetMs = -1L
         scoutCompletedExtents.clear()
@@ -10982,20 +9492,19 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 initialSeekGeneration = restoredGen,
             )
             _uiState.update {
-                val activeMode = it.displayMode.normalizedPrimaryMode()
                 val (balloons, activeChapter) = computeContextAwareLayout(
                     project = webProject,
                     timeMs = 0L,
                     styleSettings = it.styleSettings,
                     liveFaces = currentLiveFaces,
-                    displayMode = activeMode,
+                    displayMode = CaptionDisplayMode.BALLOONS,
                 )
                 it.copy(
                     project = webProject,
                     activeDestination = AppDestination.WATCH,
                     showStartLauncher = false,
                     hasPendingPlayIntro = true,
-                    displayMode = activeMode,
+                    displayMode = CaptionDisplayMode.BALLOONS,
                     isCinemaIntroActive = false,
                     introRemainingMs = 0L,
                     canUndo = false,
@@ -11191,48 +9700,28 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
         val sharedUrl = extractFirstHttpUrl(clean)
         if (sharedUrl != null) {
-            val targetLang = _uiState.value.project.targetLanguage.ifBlank { "English" }
-            val transMode = _uiState.value.project.translationMode
-            when (val decision = MediaSourceAdapterRegistry.default.resolveForActivation(sharedUrl)) {
-                is MediaActivationDecision.YouTube -> createYouTubeProject(
-                    youtubeUrl = decision.normalizedUrl,
-                    youtubeVideoId = decision.videoId,
+            val ytId = com.example.ui.setup.extractYouTubeId(sharedUrl)
+            if (ytId != null) {
+                createYouTubeProject(
+                    youtubeUrl = sharedUrl,
+                    youtubeVideoId = ytId,
                     subtitleUri = null,
                     subtitleFileName = "",
                     sourceLanguage = "Auto-Detect",
-                    targetLanguage = targetLang,
-                    translationMode = transMode,
+                    targetLanguage = _uiState.value.project.targetLanguage.ifBlank { "English" },
+                    translationMode = _uiState.value.project.translationMode,
                     pastedSubtitleText = "",
                 )
-                is MediaActivationDecision.DirectStream -> createDirectMediaUrlProject(
-                    mediaUrl = decision.normalizedUrl,
+            } else {
+                createWebStreamProject(
+                    webUrl = sharedUrl,
                     subtitleUri = null,
                     subtitleFileName = "",
                     sourceLanguage = "Auto-Detect",
-                    targetLanguage = targetLang,
-                    translationMode = transMode,
+                    targetLanguage = _uiState.value.project.targetLanguage.ifBlank { "English" },
+                    translationMode = _uiState.value.project.translationMode,
                     pastedSubtitleText = "",
                 )
-                is MediaActivationDecision.WebStream -> createWebStreamProject(
-                    webUrl = decision.normalizedUrl,
-                    subtitleUri = null,
-                    subtitleFileName = "",
-                    sourceLanguage = "Auto-Detect",
-                    targetLanguage = targetLang,
-                    translationMode = transMode,
-                    pastedSubtitleText = "",
-                )
-                is MediaActivationDecision.LocalFile -> createDirectMediaUrlProject(
-                    mediaUrl = decision.normalizedUri,
-                    subtitleUri = null,
-                    subtitleFileName = "",
-                    sourceLanguage = "Auto-Detect",
-                    targetLanguage = targetLang,
-                    translationMode = transMode,
-                    pastedSubtitleText = "",
-                )
-                is MediaActivationDecision.Demo -> loadDemoScenario()
-                is MediaActivationDecision.Rejected -> showStatusBanner(decision.reason)
             }
             return
         }
@@ -11369,7 +9858,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 timeMs = state.currentTimeMs,
                 styleSettings = state.styleSettings,
                 liveFaces = currentLiveFaces,
-                displayMode = state.displayMode,
             )
             state.copy(
                 project = normalizedProject,
@@ -11387,10 +9875,8 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     source = normalizedProject.videoSource,
                     hasDiscoveredDirectAudio = !discoveredWebMediaUrl.isNullOrBlank(),
                 ),
+                statusBanner = banner ?: state.statusBanner,
             )
-        }
-        if (!banner.isNullOrBlank()) {
-            showStatusBanner(banner)
         }
         if (normalizedProject.id != DemoScenarioFactory.DEMO_PROJECT_ID) {
             viewModelScope.launch {
@@ -11415,9 +9901,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             timestampMs = ts,
             scope = scope,
             autoTriggered = autoTriggered,
-            generationToken = state.seekGeneration,
         )
-        sentinelCoordinator.enqueueHealBeacon(beacon)
         updateProject(
             project = updatedProj,
             banner = if (autoTriggered) null else "Moment marked for healing — you can keep watching",
@@ -11450,14 +9934,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             windowEndMs = window.endMs,
             status = HealBeaconStatus.MARKED,
             repairRevision = existing.repairRevision + 1,
-            generationToken = state.seekGeneration,
             updatedAtEpochMs = System.currentTimeMillis(),
             statusNote = "Queued for localized repair",
         )
         val updated = state.project.copy(
             healBeacons = state.project.healBeacons.map { if (it.id == beaconId) queued else it },
         )
-        sentinelCoordinator.enqueueHealBeacon(queued)
         updateProject(updated)
         enqueueHealBeaconProcessing()
     }
@@ -11489,55 +9971,20 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     val project = state.project
                     if (!isCurrentSession(sessionToken, project.id)) break
                     val nextBeacon = project.healBeacons.firstOrNull { it.status == HealBeaconStatus.MARKED } ?: break
-                    sentinelCoordinator.enqueueHealBeacon(nextBeacon)
-                    val claimed = sentinelCoordinator.claimHealBeaconWork(
-                        workerId = SentinelWorkforceCoordinator.WORKER_2_ID,
-                        targetBeaconId = nextBeacon.id,
-                    )
-                    if (claimed == null) {
-                        val snap = sentinelCoordinator.inspectorSnapshot()
-                        _uiState.update { it.copy(sentinelSnapshot = snap) }
-                        break
-                    }
-                    val (_, reservation) = claimed
-                    try {
-                        processSingleHealBeacon(nextBeacon.id, sessionToken, reservation.reservationId)
-                    } finally {
-                        sentinelCoordinator.markWorkerIdle(
-                            workerId = SentinelWorkforceCoordinator.WORKER_2_ID,
-                            reservationId = reservation.reservationId,
-                        )
-                        _uiState.update { it.copy(sentinelSnapshot = sentinelCoordinator.inspectorSnapshot()) }
-                    }
+                    processSingleHealBeacon(nextBeacon.id, sessionToken)
                 }
             }
         }
     }
 
-    private suspend fun processSingleHealBeacon(
-        beaconId: String,
-        sessionToken: Long,
-        reservationId: String = "",
-    ) {
+    private suspend fun processSingleHealBeacon(beaconId: String, sessionToken: Long) {
         val startState = _uiState.value
         val startProject = startState.project
         if (!isCurrentSession(sessionToken, startProject.id)) return
         val beacon = startProject.healBeacons.firstOrNull { it.id == beaconId } ?: return
-        val repairCtx = captureWorkRequestContext(startProject, _uiState.value.quotaSaverMode)
-        if (beacon.generationToken > 0L && beacon.generationToken != repairCtx.seekGeneration) {
-            val supersededProj = HealBeaconEngine.markBeaconSuperseded(
-                project = startProject,
-                beaconId = beaconId,
-                reason = "Superseded by newer seek/session generation",
-            )
-            updateProject(supersededProj)
-            return
-        }
 
         val healingBeacon = beacon.copy(
             status = HealBeaconStatus.HEALING,
-            generationToken = repairCtx.seekGeneration,
-            coordinatorJobId = reservationId.ifBlank { beacon.coordinatorJobId },
             updatedAtEpochMs = System.currentTimeMillis(),
             statusNote = "Re-checking dialogue and speaker context…",
         )
@@ -11569,24 +10016,15 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 faceTracks = cleanedProj.faceTracks,
                 existingSpeakers = cleanedProj.speakers,
                 rememberedCharacterColors = _uiState.value.characterColorMemory,
-                slotToSpeakerId = buildSlotToSpeakerIdMap(cleanedProj.speakers),
             )
-            if (!isRequestContextCurrent(repairCtx)) {
-                val curProj = _uiState.value.project
-                if (curProj.id == startProject.id) {
-                    updateProject(HealBeaconEngine.markBeaconSuperseded(curProj, beaconId, reason = "Superseded during local repair"))
-                }
-                return
-            }
             val outcome = HealBeaconEngine.applyValidatedLocalizedRepair(
                 project = cleanedProj.copy(speakers = reSpeakers),
                 beaconId = beaconId,
                 candidateEvents = reAttributed,
                 silenceExplicitlyConfirmed = false,
                 expectedRepairRevision = beacon.repairRevision,
-                expectedGenerationToken = repairCtx.seekGeneration,
             )
-            if (isRequestContextCurrent(repairCtx)) {
+            if (isCurrentSession(sessionToken, startProject.id)) {
                 layoutEngine.invalidateEventsOnly(outcome.modifiedEventIds)
                 beacon.patrolChapterId?.let { chId ->
                     sentinelCoordinator.markChapterRepairVerified(chId, outcome.reason)
@@ -11596,6 +10034,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             return
         }
 
+        val repairCtx = captureWorkRequestContext(startProject, quotaMode)
         val isAutoPatrol = beacon.patrolChapterId != null
 
         // Cloud localized reanalysis for YouTube streams via ResilientYouTubeSegmentExecutor
@@ -11648,13 +10087,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     )
                 }
 
-                if (!isRequestContextCurrent(repairCtx)) {
-                    val curProj = _uiState.value.project
-                    if (curProj.id == startProject.id) {
-                        updateProject(HealBeaconEngine.markBeaconSuperseded(curProj, beaconId, reason = "Superseded during YouTube repair"))
-                    }
-                    return
-                }
+                if (!isCurrentSession(sessionToken, startProject.id)) return
                 val liveProj = _uiState.value.project
                 when (segOutcome) {
                     is SegmentExecutionOutcome.Completed -> {
@@ -11729,12 +10162,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                             candidateEvents = candidateEvents,
                             silenceExplicitlyConfirmed = silenceConfirmed,
                             expectedRepairRevision = beacon.repairRevision,
-                            expectedGenerationToken = repairCtx.seekGeneration,
                         )
-                        if (!isRequestContextCurrent(repairCtx)) {
-                            updateProject(HealBeaconEngine.markBeaconSuperseded(liveProj, beaconId, reason = "Superseded before publication"))
-                            return
-                        }
                         settledAttributedEventIds.removeAll(repairOutcome.modifiedEventIds)
                         repairOutcome.updatedProject.dialogueEvents
                             .filter { it.id in repairOutcome.modifiedEventIds && (it.speakerId != null || it.attributionSummary == "Unidentified speaker") }
@@ -11837,43 +10265,9 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                             detailed.outcome == TranscriptionOutcome.PARTIAL_SUCCESS
                         )
                     if (isUsableOutcome && detailed != null) {
-                        var workingHealProj = currentProj
-                        val (reconciledHealCues, reconciledHealUpdates, _) = reconcileWindowOutcomeSpeakersAndCues(
-                            existingSpeakers = workingHealProj.speakers,
-                            cues = detailed.cues,
-                            speakerUpdates = detailed.speakerUpdates,
-                        )
-                        if (reconciledHealUpdates.isNotEmpty()) {
-                            val (castMerged, updatedMem) = mergeCastSlotAssignments(
-                                project = workingHealProj,
-                                assignments = reconciledHealUpdates,
-                                rememberedColors = _uiState.value.characterColorMemory,
-                                reconcileColors = attributionEngine::reconcileCharacterColors,
-                                discoveryTimestampMs = beacon.windowStartMs,
-                            )
-                            if (updatedMem != _uiState.value.characterColorMemory) {
-                                persistCharacterColorMemory(updatedMem)
-                            }
-                            workingHealProj = castMerged
-                        }
-                        val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
-                        val healHints = mutableMapOf<String, AiTranslatedLine>()
-                        val candidateEvents = reconciledHealCues.map { cue ->
-                            val evtId = SubtitleParser.newEventId()
-                            val slotUpper = cue.suggestedSpeakerSlot.trim().uppercase()
-                            healHints[evtId] = AiTranslatedLine(
-                                id = evtId,
-                                naturalTranslation = cue.naturalTranslation,
-                                literalTranslation = cue.literalTranslation,
-                                romanization = cue.romanization,
-                                dialogueTypeHint = cue.dialogueType,
-                                speakerTurnHint = "UNCERTAIN",
-                                suggestedSpeakerSlot = slotUpper.ifBlank { "UNCERTAIN" },
-                                contextReason = cue.contextReason,
-                                culturalNote = cue.culturalNote,
-                            )
+                        val candidateEvents = detailed.cues.map { cue ->
                             DialogueEvent(
-                                id = evtId,
+                                id = SubtitleParser.newEventId(),
                                 startTimeMs = cue.startMs,
                                 endTimeMs = cue.endMs,
                                 sourceText = cue.sourceText,
@@ -11881,46 +10275,36 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                 literalText = cue.literalTranslation,
                                 romanization = cue.romanization,
                                 speakerId = null,
-                                speakerConfidence = if (slotUpper in validSlots) 0.80f else 0.55f,
+                                speakerConfidence = 0.55f,
                                 faceTrackId = null,
                                 faceConfidence = 0f,
-                                shotId = workingHealProj.shots.firstOrNull { cue.startMs in it.startMs..it.endMs }?.id ?: "shot_1",
+                                shotId = currentProj.shots.firstOrNull { cue.startMs in it.startMs..it.endMs }?.id ?: "shot_1",
                                 dialogueType = cue.dialogueType,
                                 placementMode = if (cue.dialogueType == DialogueType.SPOKEN) {
                                     PlacementMode.NEUTRAL_FALLBACK
                                 } else {
                                     PlacementMode.EDGE_DOCKED
                                 },
-                                contextCueReason = cue.contextReason,
                                 culturalNote = cue.culturalNote,
                             )
                         }
-                        cachedAiTurnHints.putAll(healHints)
                         val (reSpeakers, attributedCandidates) = if (candidateEvents.isNotEmpty()) {
                             attributionEngine.assignSpeakers(
                                 events = candidateEvents,
-                                shots = workingHealProj.shots,
-                                faceTracks = workingHealProj.faceTracks,
-                                existingSpeakers = workingHealProj.speakers,
-                                turnHints = cachedAiTurnHints,
+                                shots = currentProj.shots,
+                                faceTracks = currentProj.faceTracks,
+                                existingSpeakers = currentProj.speakers,
                                 rememberedCharacterColors = _uiState.value.characterColorMemory,
-                                slotToSpeakerId = buildSlotToSpeakerIdMap(workingHealProj.speakers),
                             )
                         } else {
-                            workingHealProj.speakers to emptyList()
-                        }
-                        if (!isRequestContextCurrent(repairCtx)) {
-                            updateProject(HealBeaconEngine.markBeaconSuperseded(currentProj, beaconId, reason = "Superseded before publication"))
-                            return
+                            currentProj.speakers to emptyList()
                         }
                         val silenceConfirmed = detailed.outcome == TranscriptionOutcome.VERIFIED_SILENCE
                         val repairOutcome = HealBeaconEngine.applyValidatedLocalizedRepair(
-                            project = workingHealProj.copy(speakers = reSpeakers),
+                            project = currentProj.copy(speakers = reSpeakers),
                             beaconId = beaconId,
                             candidateEvents = attributedCandidates,
                             silenceExplicitlyConfirmed = silenceConfirmed,
-                            expectedRepairRevision = beacon.repairRevision,
-                            expectedGenerationToken = repairCtx.seekGeneration,
                         )
                         updateProject(repairOutcome.updatedProject)
                         return
@@ -11933,13 +10317,6 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             }
         }
 
-        if (!isRequestContextCurrent(repairCtx)) {
-            val curProj = _uiState.value.project
-            if (curProj.id == startProject.id) {
-                updateProject(HealBeaconEngine.markBeaconSuperseded(curProj, beaconId, reason = "Superseded before fallback repair"))
-            }
-            return
-        }
         // Graceful fallback: local speaker re-attribution & anchor sanitization (preserves all dialogue)
         val sanitized = AutoSelfHealDetector.consolidateDuplicateSpeakers(
             liveProj.copy(dialogueEvents = AutoSelfHealDetector.sanitizeCorruptedAnchors(liveProj.dialogueEvents)),
@@ -11954,15 +10331,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             faceTracks = sanitized.faceTracks,
             existingSpeakers = sanitized.speakers,
             rememberedCharacterColors = _uiState.value.characterColorMemory,
-            slotToSpeakerId = buildSlotToSpeakerIdMap(sanitized.speakers),
         )
         val fallbackOutcome = HealBeaconEngine.applyValidatedLocalizedRepair(
             project = sanitized.copy(speakers = reSpeakers),
             beaconId = beaconId,
             candidateEvents = reAttributed,
             silenceExplicitlyConfirmed = false,
-            expectedRepairRevision = beacon.repairRevision,
-            expectedGenerationToken = repairCtx.seekGeneration,
         )
         val finalProject = if (videoSource.kind == VideoSourceKind.WEB_STREAM && discoveredWebMediaUrl.isNullOrBlank()) {
             val notedBeacons = fallbackOutcome.updatedProject.healBeacons.map { b ->
@@ -11976,9 +10350,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         } else {
             fallbackOutcome.updatedProject
         }
-        if (isRequestContextCurrent(repairCtx)) {
-            updateProject(finalProject)
-        }
+        updateProject(finalProject)
     }
 
     private fun maybeRunAutomaticSelfHealCheck(timeMs: Long, placedBalloons: List<PlacedBalloon>) {
@@ -12097,17 +10469,11 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         super.onCleared()
         scoutHeartbeatService.stopMonitoring()
         tickerJob?.cancel()
-        scoutReviewLoopJob?.cancel()
         analysisJob?.cancel()
         aiTranslationJob?.cancel()
         speakerAnalysisJob?.cancel()
         castDiscoveryJob?.cancel()
         youtubeTranscriptJob?.cancel()
-        changeoverPreListenJob?.cancel()
-        healBeaconJob?.cancel()
-        statusBannerJob?.cancel()
-        seekAckTimeoutJob?.cancel()
-        clearCapturedAudioQueueSync()
         speakerToastJob?.cancel()
         introJob?.cancel()
         lookaheadJob?.cancel()
@@ -12156,8 +10522,7 @@ internal fun reconcileWindowOutcomeSpeakersAndCues(
     fun isGenericSpeakerName(raw: String): Boolean {
         val t = raw.trim().lowercase()
         return t.isBlank() ||
-            t.matches(Regex("^(speaker|host|guest|panelist|narrator|person)(\\s+([a-z]|[0-9]+))?$")) ||
-            t.matches(Regex("^(unknown(\\s+speaker)?|unidentified)$"))
+            t.matches(Regex("^(speaker|host|guest|panelist|narrator|person)\\s*[a-z0-9]*$"))
     }
 
     fun namesMatch(incomingRaw: String, existing: Speaker): Boolean {
@@ -12214,26 +10579,19 @@ internal fun reconcileWindowOutcomeSpeakersAndCues(
         }
     }
 
-    // Pass 2: Place remaining new/unnamed assignments, keeping upgradable contextual/inferred slots
-    // eligible for in-place upgrade while relocating away from locked or firmly established different speakers.
+    // Pass 2: Place remaining new/unnamed assignments, relocating away from occupied non-matching slots
     for (assignment in pendingAssignments) {
         val localSlot = assignment.slot.trim().uppercase()
         if (localSlot in slotRemap) continue
 
         val existingAtLocal = existingBySlot[localSlot]
-        val localIsUpgradableContextual = existingAtLocal != null &&
-            !existingAtLocal.isLocked &&
-            !existingAtLocal.isUserNamed &&
-            (existingAtLocal.isRolePlaceholder || existingAtLocal.revealProvenance == "SCOUT_INFERRED")
-        val localHasConflictingVisualVoice = existingAtLocal != null &&
-            existingAtLocal.visualVoiceNotes.isNotBlank() &&
-            assignment.visualVoiceNotes.isNotBlank() &&
-            !existingAtLocal.visualVoiceNotes.equals(assignment.visualVoiceNotes.trim(), ignoreCase = true)
         val localHasDifferentDistinctSpeaker = existingAtLocal != null && (
             existingAtLocal.isLocked ||
-                existingAtLocal.isUserNamed ||
-                (!localIsUpgradableContextual && (existingAtLocal.isConfirmedCharacter || existingAtLocal.hasDistinctCharacterName)) ||
-                localHasConflictingVisualVoice
+                existingAtLocal.isConfirmedCharacter ||
+                existingAtLocal.hasDistinctCharacterName ||
+                (existingAtLocal.visualVoiceNotes.isNotBlank() &&
+                    assignment.visualVoiceNotes.isNotBlank() &&
+                    !existingAtLocal.visualVoiceNotes.equals(assignment.visualVoiceNotes.trim(), ignoreCase = true))
             )
 
         val targetSlot = if (localSlot !in claimedTargetSlots && !localHasDifferentDistinctSpeaker) {
@@ -12319,17 +10677,14 @@ internal fun mergeCastSlotAssignments(
             val spaceIdx = slice.lastIndexOf(' ')
             if (spaceIdx >= 8) slice.substring(0, spaceIdx).trimEnd(',', '-', ':', '/') else slice.trim()
         }
-        val isGenericLabel = cleanedNewName.isBlank() ||
-            cleanedNewName.equals("UNCERTAIN", ignoreCase = true) ||
-            cleanedNewName.equals("Unknown", ignoreCase = true) ||
-            cleanedNewName.equals("Unknown Speaker", ignoreCase = true) ||
-            cleanedNewName.equals("Unidentified", ignoreCase = true) ||
-            cleanedNewName.matches(Regex("^Speaker\\s+[A-Z0-9]+$", RegexOption.IGNORE_CASE))
         val mergedNotes = buildString {
             val incomingNotes = assignment.visualVoiceNotes.trim()
             if (incomingNotes.isNotBlank()) {
                 append(incomingNotes)
-            } else if (!assignment.isVisuallyConfirmed && !isGenericLabel) {
+            } else if (!assignment.isVisuallyConfirmed &&
+                cleanedNewName.isNotBlank() &&
+                !cleanedNewName.matches(Regex("^Speaker\\s+[A-Z0-9]+$", RegexOption.IGNORE_CASE))
+            ) {
                 append(cleanedNewName)
             } else if (existing.visualVoiceNotes.isNotBlank()) {
                 append(existing.visualVoiceNotes)
@@ -12338,8 +10693,9 @@ internal fun mergeCastSlotAssignments(
         val mergedReason = assignment.rationale.trim().ifBlank { existing.discoveryReason }
         val mergedFirstSeen = existing.firstAppearedMs ?: discoveryTimestampMs
 
-        if (isGenericLabel) {
-            // Blank or generic slot names stay unknown (dotted gray) while preserving voice/visual clues
+        if (!assignment.isVisuallyConfirmed) {
+            // Strict visual confirmation gate: keep unconfirmed speakers dotted gray (no premature name)
+            // while storing rich visual/voice clues so later Scout windows can recognize and confirm them!
             if (!existing.isConfirmedCharacter) {
                 workingSpeakers[slotIdx] = existing.copy(
                     isIdentityConfirmed = false,
@@ -12361,23 +10717,13 @@ internal fun mergeCastSlotAssignments(
             return@forEach
         }
 
-        val existingIsInferredOnly = existing.revealProvenance == "SCOUT_INFERRED" || existing.isRolePlaceholder
-        val shouldApplyName = !existing.isUserNamed && (
-            !existing.isConfirmedCharacter ||
-                !existing.hasDistinctCharacterName ||
-                (existing.isRolePlaceholder && !assignment.isRolePlaceholder) ||
-                (existingIsInferredOnly && assignment.isVisuallyConfirmed)
-            )
-        val nextProvenance = when {
-            existing.isUserNamed -> "USER_RENAME"
-            assignment.isVisuallyConfirmed -> "SCOUT_DISCOVERY"
-            else -> "SCOUT_INFERRED"
-        }
+        if (cleanedNewName.isBlank()) return@forEach
 
-        if (shouldApplyName && (!existing.displayName.equals(cleanedNewName, ignoreCase = true) ||
-                !existing.isIdentityConfirmed ||
-                (existing.revealProvenance != nextProvenance && assignment.isVisuallyConfirmed))
-        ) {
+        val shouldApplyName = !existing.isConfirmedCharacter ||
+            !existing.hasDistinctCharacterName ||
+            (existing.isRolePlaceholder && !assignment.isRolePlaceholder)
+
+        if (shouldApplyName && (!existing.displayName.equals(cleanedNewName, ignoreCase = true) || !existing.isIdentityConfirmed)) {
             val priorHistory = if (existing.hasDistinctCharacterName &&
                 existing.displayName.isNotBlank() &&
                 !existing.displayName.equals(cleanedNewName, ignoreCase = true)
@@ -12391,10 +10737,6 @@ internal fun mergeCastSlotAssignments(
                 isRolePlaceholder = assignment.isRolePlaceholder,
                 isIdentityConfirmed = true,
                 firstAppearedMs = mergedFirstSeen,
-                // Preserve existing nameRevealedAtMs (null by default) so immediate Scout labels show across all cues
-                nameRevealedAtMs = existing.nameRevealedAtMs,
-                isUserNamed = existing.isUserNamed,
-                revealProvenance = nextProvenance,
                 visualVoiceNotes = mergedNotes.ifBlank { existing.visualVoiceNotes },
                 previousNames = priorHistory,
                 discoveryReason = mergedReason,

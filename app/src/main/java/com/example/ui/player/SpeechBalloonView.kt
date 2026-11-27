@@ -68,7 +68,6 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -79,9 +78,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.BalloonStyleSettings
 import com.example.data.model.BubbleVisualStyle
-import com.example.data.model.CaptionAccessibilityContrast
-import com.example.data.model.CaptionDisplayMode
-import com.example.data.model.CaptionFontFamily
 import com.example.data.model.ConfidenceTier
 import com.example.data.model.DialogueType
 import com.example.data.model.NormalizedPoint
@@ -93,7 +89,6 @@ import com.example.data.model.isBubbleNonSpeakerSpecific
 import com.example.data.model.isBubbleSpeakerUnknown
 import com.example.data.model.isNonSpeakerSpecificEvent
 import com.example.domain.layout.PlacedBalloon
-import com.example.domain.layout.TailGeometry
 import com.example.ui.theme.BalloonHighContrastBorder
 import com.example.ui.theme.BalloonHighContrastInk
 import com.example.ui.theme.BalloonHighContrastSurface
@@ -105,7 +100,6 @@ import com.example.ui.theme.CinemaObsidian
 import com.example.ui.theme.ConfidenceHighColor
 import com.example.ui.theme.ConfidenceLowColor
 import com.example.ui.theme.ConfidenceMediumColor
-import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.LexendFamily
 import com.example.ui.theme.MangaPaperWarm
 import com.example.ui.theme.NonSpeakerBubbleWhite
@@ -143,15 +137,13 @@ fun SpeechBalloonView(
     onClick: () -> Unit,
     onDragCommit: (NormalizedPoint) -> Unit,
     forceTaillessFixedZone: Boolean = false,
-    displayMode: CaptionDisplayMode = if (forceTaillessFixedZone) CaptionDisplayMode.BALLOONS else CaptionDisplayMode.BUBBLES_WITH_TAILS,
-    currentTimeMs: Long = placed.event.startTimeMs,
     onRenderedFrameReported: ((cueKey: String, leftPx: Float, topPx: Float, widthPx: Float, heightPx: Float) -> Unit)? = null,
     onEntryAnimationStarted: ((cueKey: String) -> Unit)? = null,
     measurementEpoch: Long = 0L,
     modifier: Modifier = Modifier,
 ) {
     val event = placed.event
-    val stableKey = event.canonicalIdentityKey
+    val stableKey = event.stableCueKey.ifBlank { event.id }
     val isUnknownAtRoot = placed.isUnknownSpeaker || isBubbleSpeakerUnknown(event, placed.speaker)
     val isNonSpeakerAtRoot = isBubbleNonSpeakerSpecific(event, style)
     val rawSpeakerAccent = when {
@@ -308,8 +300,9 @@ fun SpeechBalloonView(
         }
     }
 
-    val activeDisplayMode = displayMode.normalizedPrimaryMode(style.showTail)
-    val showPointerTail = activeDisplayMode.shouldShowTails &&
+    val showPointerTail = !forceTaillessFixedZone &&
+        style.showTail &&
+        !isReadingComfort &&
         !isSpecialNonSpoken &&
         !placed.isOffScreenEdge &&
         !placed.isAmbiguousFallback &&
@@ -342,8 +335,8 @@ fun SpeechBalloonView(
         Float.NaN
     }
 
-    // Continuous unwrapped angular target keyed on canonical stableKey
-    var unwrappedAimAngle by remember(stableKey) {
+    // Continuous unwrapped angular target so tails glide seamlessly across +/-PI without 360-degree spins
+    var unwrappedAimAngle by remember(event.id) {
         mutableFloatStateOf(if (rawAimAngleRad.isNaN()) 0f else rawAimAngleRad)
     }
     if (!rawAimAngleRad.isNaN()) {
@@ -384,7 +377,7 @@ fun SpeechBalloonView(
         .onSizeChanged { measuredSize = it }
         .then(
             if (isEditMode) {
-                Modifier.pointerInput(stableKey) {
+                Modifier.pointerInput(event.id) {
                     detectDragGestures(
                         onDrag = { change, dragAmount ->
                             change.consume()
@@ -418,15 +411,13 @@ fun SpeechBalloonView(
         isCinemaSubtle = isCinemaSubtle,
         isEditMode = isEditMode,
         isSelected = isSelected,
-        rawSpeakerAccent = rawSpeakerAccent,
         speakerAccent = speakerAccent,
         isSpecialNonSpoken = isSpecialNonSpoken,
         showPointerTail = showPointerTail,
         tailAimAngleRad = if (showPointerTail) smoothAimAngleRad else Float.NaN,
         localTarget = localTarget,
         maxBubbleWidthDp = maxBubbleWidthDp.value,
-        displayMode = displayMode,
-        currentTimeMs = currentTimeMs,
+        containerWidthPx = containerWidthPx,
         onClick = onClick,
         modifier = rootModifier,
     )
@@ -441,15 +432,13 @@ private fun UnifiedBalloonBody(
     isCinemaSubtle: Boolean,
     isEditMode: Boolean,
     isSelected: Boolean,
-    rawSpeakerAccent: Color,
     speakerAccent: Color,
     isSpecialNonSpoken: Boolean,
     showPointerTail: Boolean,
     tailAimAngleRad: Float,
     localTarget: Offset?,
     maxBubbleWidthDp: Float,
-    displayMode: CaptionDisplayMode,
-    currentTimeMs: Long,
+    containerWidthPx: Float = 0f,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -476,7 +465,7 @@ private fun UnifiedBalloonBody(
 
     val isReadingComfort = style.visualStyle == BubbleVisualStyle.READING_COMFORT && !style.highContrastMode
 
-    val defaultFillColor = when {
+    val rawFillColor = when {
         style.highContrastMode -> BalloonHighContrastSurface.copy(alpha = 0.98f)
         isReadingComfort -> Color(0xFF151C24).copy(alpha = style.balloonOpacity.coerceAtLeast(0.92f))
         isSilentTsubuyaki -> CinemaWhisperScrim.copy(alpha = (adaptiveOpacity * 0.88f).coerceIn(0.62f, 0.86f))
@@ -497,7 +486,13 @@ private fun UnifiedBalloonBody(
             else -> BalloonLightSurface.copy(alpha = style.balloonOpacity.coerceAtLeast(0.82f))
         }
     }
-    val defaultInkColor = when {
+    val fillColor by animateColorAsState(
+        targetValue = rawFillColor,
+        animationSpec = colorAnimSpec,
+        label = "balloon_fill_color",
+    )
+
+    val textColor = when {
         style.highContrastMode -> BalloonHighContrastInk
         isReadingComfort -> Color(0xFFF3F1EC)
         isSilentTsubuyaki -> Color(0xFFE2E8F0)
@@ -508,32 +503,22 @@ private fun UnifiedBalloonBody(
         else -> BalloonLightInk
     }
 
-    val (rawFillColor, textColor) = resolveAccessibleCaptionColors(
-        defaultFill = defaultFillColor,
-        defaultInk = defaultInkColor,
-        style = style,
-        preferredAlpha = style.balloonOpacity,
-    )
-    val fillColor by animateColorAsState(
-        targetValue = rawFillColor,
-        animationSpec = colorAnimSpec,
-        label = "balloon_fill_color",
-    )
-
     val subTextColor = when {
         style.highContrastMode -> Color(0xFFE2E8F0)
-        CaptionAccessibilityContrast.relativeLuminance(colorToArgbLong(rawFillColor)) > 0.45f -> MangaSubtleInk
+        isReadingComfort -> Color(0xFFCBD5E1)
+        isCinemaSubtle || isSilentTsubuyaki || placed.isAmbiguousFallback -> Color(0xFFCBD5E1)
+        isManga -> MangaSubtleInk
+        textColor == BalloonLightInk -> BalloonLightSubtleInk
         else -> Color(0xFFCBD5E1)
     }
 
     val hasCharacterOutline = style.speakerSpecificColors && !isNonSpeakerEvent && !isUnknownSpeaker
 
-    // Single-pass outline animation using rawSpeakerAccent (prevents double-animation lag)
     val rawOutlineColor = when {
         isSelected -> MaterialTheme.colorScheme.primary
         isUnknownSpeaker -> UnknownSpeakerGray.copy(alpha = if (isEditMode) 0.96f else 0.88f)
         style.highContrastMode -> BalloonHighContrastBorder
-        isReadingComfort -> rawSpeakerAccent.copy(alpha = 0.82f)
+        isReadingComfort -> speakerAccent.copy(alpha = 0.82f)
         isNonSpeakerBubble -> NonSpeakerBubbleWhite.copy(
             alpha = when {
                 isManga -> 0.94f
@@ -541,9 +526,9 @@ private fun UnifiedBalloonBody(
                 else -> 0.96f
             }
         )
-        isCinemaSubtle -> rawSpeakerAccent.copy(alpha = if (isHighEnergyShout) 0.98f else 0.84f)
-        isManga -> rawSpeakerAccent
-        else -> rawSpeakerAccent.copy(alpha = if (isHighEnergyShout) 1f else 0.90f)
+        isCinemaSubtle -> speakerAccent.copy(alpha = if (isHighEnergyShout) 0.98f else 0.84f)
+        isManga -> speakerAccent
+        else -> speakerAccent.copy(alpha = if (isHighEnergyShout) 1f else 0.90f)
     }
     val outlineColor by animateColorAsState(
         targetValue = rawOutlineColor,
@@ -625,6 +610,10 @@ private fun UnifiedBalloonBody(
                     event.dialogueType == DialogueType.INTERNAL_MONOLOGUE ->
                         buildThoughtCloudPath(bodyRect)
                     else -> {
+                        val elasticCapPx = minOf(
+                            if (isCinemaSubtle) 200.dp.toPx() else 215.dp.toPx(),
+                            if (containerWidthPx > 0f) containerWidthPx * 0.58f else Float.MAX_VALUE,
+                        )
                         buildPointedSpeechPath(
                             bodyRect = bodyRect,
                             showPointerTail = showPointerTail,
@@ -633,15 +622,18 @@ private fun UnifiedBalloonBody(
                             cornerFraction = cornerFraction,
                             isManga = isManga,
                             isCinemaSubtle = isCinemaSubtle,
-                            mouthClearancePx = TailGeometry.MOUTH_CLEARANCE_DP.dp.toPx(),
-                            nominalTailReachPx = TailGeometry.NOMINAL_TAIL_REACH_DP.dp.toPx(),
-                            maxTailReachPx = TailGeometry.MAX_TAIL_REACH_DP.dp.toPx(),
-                            minTailReachPx = TailGeometry.MIN_TAIL_REACH_DP.dp.toPx(),
+                            mouthClearancePx = 11.dp.toPx(),
+                            maxTailReachPx = elasticCapPx,
+                            minTailReachPx = 13.dp.toPx(),
                         )
                     }
                 }
 
                 val drawContourPath = if (isHighEnergyShout) {
+                    val shoutElasticCapPx = minOf(
+                        205.dp.toPx(),
+                        if (containerWidthPx > 0f) containerWidthPx * 0.56f else Float.MAX_VALUE,
+                    )
                     buildJitteredShoutPath(
                         bodyRect = bodyRect,
                         showPointerTail = showPointerTail,
@@ -649,10 +641,9 @@ private fun UnifiedBalloonBody(
                         target = localTarget,
                         spikeAmplitudePx = (if (isManga) 3.4.dp else 2.2.dp).toPx(),
                         jitterPhase = jitterPhase,
-                        mouthClearancePx = TailGeometry.MOUTH_CLEARANCE_DP.dp.toPx(),
-                        nominalTailReachPx = TailGeometry.NOMINAL_TAIL_REACH_DP.dp.toPx(),
-                        maxTailReachPx = TailGeometry.MAX_TAIL_REACH_DP.dp.toPx(),
-                        minTailReachPx = TailGeometry.MIN_TAIL_REACH_DP.dp.toPx(),
+                        mouthClearancePx = 11.dp.toPx(),
+                        maxTailReachPx = shoutElasticCapPx,
+                        minTailReachPx = 13.dp.toPx(),
                     )
                 } else {
                     bubblePath
@@ -734,8 +725,6 @@ private fun UnifiedBalloonBody(
             isSilentTsubuyaki = isSilentTsubuyaki,
             isHighEnergyShout = isHighEnergyShout,
             maxBubbleWidthDp = maxBubbleWidthDp,
-            displayMode = displayMode,
-            currentTimeMs = currentTimeMs,
         )
     }
 }
@@ -889,7 +878,6 @@ internal fun computePerimeterTailGeometry(
     mouthClearancePx: Float,
     minTailReachPx: Float,
     maxTailReachPx: Float,
-    nominalTailReachPx: Float = (minTailReachPx + maxTailReachPx) * 0.5f,
 ): PerimeterTailGeometry {
     val l = bodyRect.left
     val t = bodyRect.top
@@ -954,13 +942,7 @@ internal fun computePerimeterTailGeometry(
     val baseSample = sampleRoundedRectPerimeter(bodyRect, cr, exitS)
     val baseRadius = hypot((baseSample.point.x - cx).toDouble(), (baseSample.point.y - cy).toDouble()).toFloat()
     val distOutsideBorder = (targetDistanceFromCenterPx - baseRadius).coerceAtLeast(0f)
-    val reach = TailGeometry.computeTailReachPxWithPxBounds(
-        distOutsideBorderPx = distOutsideBorder,
-        nominalReachPx = nominalTailReachPx,
-        maxReachPx = maxTailReachPx,
-        minReachPx = minTailReachPx,
-        mouthClearancePx = mouthClearancePx,
-    )
+    val reach = (distOutsideBorder - mouthClearancePx).coerceIn(minTailReachPx, maxTailReachPx)
 
     // Proportionally tapered elastic throat: crisp and generous at short reaches, gracefully sleek across long
     // dead-space reaches (up to 58% of stage width) so stretched tails never look bloated OR frayed.
@@ -1040,7 +1022,6 @@ private fun buildPointedSpeechPath(
     isManga: Boolean,
     isCinemaSubtle: Boolean,
     mouthClearancePx: Float,
-    nominalTailReachPx: Float,
     maxTailReachPx: Float,
     minTailReachPx: Float,
 ): Path {
@@ -1073,13 +1054,7 @@ private fun buildPointedSpeechPath(
         mouthClearancePx = mouthClearancePx,
         minTailReachPx = minTailReachPx,
         maxTailReachPx = maxTailReachPx,
-        nominalTailReachPx = nominalTailReachPx,
     )
-    if (geom.tailLengthPx <= 1f) {
-        return Path().apply {
-            addRoundRect(RoundRect(bodyRect, CornerRadius(cornerR, cornerR)))
-        }
-    }
 
     val bodySpan = (geom.perimeterLength - 2f * geom.effectiveHalfThroatPx).coerceAtLeast(1f)
     val steps = 64
@@ -1118,29 +1093,50 @@ private fun buildJitteredShoutPath(
     spikeAmplitudePx: Float,
     jitterPhase: Float,
     mouthClearancePx: Float,
-    nominalTailReachPx: Float,
     maxTailReachPx: Float,
     minTailReachPx: Float,
 ): Path {
-    val vertices = TailGeometry.computeShoutBalloonVertices(
-        centerX = bodyRect.center.x,
-        centerY = bodyRect.center.y,
-        radiusX = (bodyRect.width * 0.54f).coerceAtLeast(24f),
-        radiusY = (bodyRect.height * 0.58f).coerceAtLeast(16f),
-        spikeAmplitudePx = spikeAmplitudePx,
-        jitterPhase = jitterPhase,
-        showPointerTail = showPointerTail,
-        aimAngleRad = aimAngleRad,
-        targetX = target?.x,
-        targetY = target?.y,
-        nominalReachPx = nominalTailReachPx,
-        maxReachPx = maxTailReachPx,
-        minReachPx = minTailReachPx,
-        mouthClearancePx = mouthClearancePx,
-    )
+    val cx = bodyRect.center.x
+    val cy = bodyRect.center.y
+    val rx = (bodyRect.width * 0.54f).coerceAtLeast(24f)
+    val ry = (bodyRect.height * 0.58f).coerceAtLeast(16f)
+    val steps = 32
+
+    val tailAngle = if (showPointerTail && target != null && !aimAngleRad.isNaN()) {
+        aimAngleRad
+    } else {
+        Float.NaN
+    }
+
+    val tailTip = if (showPointerTail && target != null && !tailAngle.isNaN()) {
+        val dx = target.x - cx
+        val dy = target.y - cy
+        val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(1f)
+        val edgeR = hypot((rx * cos(tailAngle)).toDouble(), (ry * sin(tailAngle)).toDouble()).toFloat()
+        val reach = (dist - mouthClearancePx).coerceIn(edgeR + minTailReachPx, edgeR + maxTailReachPx)
+        Offset(cx + cos(tailAngle) * reach, cy + sin(tailAngle) * reach)
+    } else {
+        null
+    }
+
     return Path().apply {
-        vertices.forEachIndexed { idx, pt ->
-            if (idx == 0) moveTo(pt.x, pt.y) else lineTo(pt.x, pt.y)
+        for (i in 0 until steps) {
+            val angle = (i.toFloat() / steps.toFloat()) * (2f * PI).toFloat()
+            var angDiff = if (!tailAngle.isNaN()) abs(shortestAngularDeltaRad(angle, tailAngle)) else Float.MAX_VALUE
+
+            if (tailTip != null && angDiff < 0.20f) {
+                if (angDiff < 0.08f) {
+                    lineTo(tailTip.x, tailTip.y)
+                    continue
+                }
+            }
+
+            val isSpike = i % 2 == 0
+            val phasePulse = 0.72f + 0.28f * sin(jitterPhase + i * 1.9f)
+            val radialDelta = if (isSpike) spikeAmplitudePx * phasePulse else -spikeAmplitudePx * 0.38f * phasePulse
+            val px = cx + (rx + radialDelta) * cos(angle)
+            val py = cy + (ry + radialDelta * 0.85f) * sin(angle)
+            if (i == 0) moveTo(px, py) else lineTo(px, py)
         }
         close()
     }
@@ -1187,8 +1183,6 @@ private fun BalloonContentColumn(
     isSilentTsubuyaki: Boolean,
     isHighEnergyShout: Boolean,
     maxBubbleWidthDp: Float,
-    displayMode: CaptionDisplayMode,
-    currentTimeMs: Long,
 ) {
     val event = placed.event
     val isUnknownSpeaker = !isNonSpeakerSpecificEvent(event) &&
@@ -1201,10 +1195,7 @@ private fun BalloonContentColumn(
         // Inspector / Edit metadata is strictly separated from pure story playback
         val showEditBadges = isEditMode && (isUnknownSpeaker || placed.isAmbiguousFallback || event.lockedByUser || style.showConfidenceIndicators)
         val showAutoSpeakerLabel = placed.speaker != null && !isSpecialNonSpoken && when (style.labelMode) {
-            SpeakerLabelMode.AUTO_FIRST_10 ->
-                placed.speakerLineOrdinal in 1..10 ||
-                    placed.isOffScreenEdge ||
-                    displayMode.normalizedPrimaryMode() == CaptionDisplayMode.BALLOONS
+            SpeakerLabelMode.AUTO_FIRST_10 -> placed.speakerLineOrdinal in 1..10
             SpeakerLabelMode.ALWAYS -> true
             SpeakerLabelMode.OFF -> false
         }
@@ -1281,9 +1272,8 @@ private fun BalloonContentColumn(
                         )
                     }
                     placed.speaker != null && showAutoSpeakerLabel -> {
-                        val visibleName = placed.speaker.visibleDisplayNameAt(currentTimeMs)
                         Text(
-                            text = if (isMangaStyle) visibleName.uppercase() else visibleName,
+                            text = if (isMangaStyle) placed.speaker.displayName.uppercase() else placed.speaker.displayName,
                             style = MaterialTheme.typography.labelMedium.copy(
                                 fontSize = (9.5f * style.fontScale).sp,
                                 fontWeight = FontWeight.Bold,
@@ -1342,7 +1332,7 @@ private fun BalloonContentColumn(
         }
         val finalDisplayText = balancedText
 
-        val activeFontFamily = resolveCaptionFontFamily(style.fontFamily, isMangaStyle)
+        val activeFontFamily = if (isMangaStyle) NunitoFamily else LexendFamily
         val legibilityShadow = if (textColor.red > 0.7f && !style.highContrastMode) {
             Shadow(
                 color = Color.Black.copy(alpha = 0.58f),
@@ -1742,11 +1732,9 @@ fun ClassicSubtitleBar(
     translationMode: TranslationMode,
     style: BalloonStyleSettings,
     onTapEvent: (String) -> Unit,
-    currentTimeMs: Long = placedBalloons.firstOrNull()?.event?.startTimeMs ?: 0L,
     modifier: Modifier = Modifier,
 ) {
     if (placedBalloons.isEmpty()) return
-    val activeFontFamily = resolveCaptionFontFamily(style.fontFamily, isMangaStyle = false)
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -1774,7 +1762,7 @@ fun ClassicSubtitleBar(
                     SpeakerLabelMode.OFF -> false
                 }
                 val spkPrefix = if (showClassicName) {
-                    "${placed.speaker!!.visibleDisplayNameAt(currentTimeMs)}: "
+                    "${placed.speaker!!.displayName}: "
                 } else {
                     ""
                 }
@@ -1790,27 +1778,11 @@ fun ClassicSubtitleBar(
                     SpeakerAccentPalette[it.accentIndex % SpeakerAccentPalette.size].copy(alpha = 0.85f)
                 } ?: UnknownSpeakerGray.copy(alpha = 0.88f)
             }
-            val baseClassicBg = if (style.highContrastMode) {
-                BalloonHighContrastSurface.copy(alpha = 0.98f)
-            } else {
-                CinemaObsidian.copy(alpha = if (isSfx) 0.66f else 0.82f)
-            }
-            val baseClassicInk = when {
-                style.highContrastMode -> BalloonHighContrastInk
-                isSfx -> Color(0xFFE2E8F0)
-                else -> Color.White
-            }
-            val (resolvedClassicBg, resolvedClassicInk) = resolveAccessibleCaptionColors(
-                defaultFill = baseClassicBg,
-                defaultInk = baseClassicInk,
-                style = style,
-                preferredAlpha = if (isSfx) 0.72f else style.balloonOpacity.coerceAtLeast(0.82f),
-            )
             val classicRadius = if (isSfx) 12.dp else 6.dp
             Box(
                 modifier = Modifier
                     .clip(RoundedCornerShape(classicRadius))
-                    .background(resolvedClassicBg)
+                    .background(CinemaObsidian.copy(alpha = if (isSfx) 0.56f else 0.78f))
                     .drawBehind {
                         val cornerPx = classicRadius.toPx()
                         val strokeW = if (style.highContrastMode) 1.5.dp.toPx() else if (isUnknown) 1.6.dp.toPx() else 1.dp.toPx()
@@ -1832,19 +1804,19 @@ fun ClassicSubtitleBar(
                 Text(
                     text = formattedText,
                     style = MaterialTheme.typography.bodyMedium.copy(
-                        fontFamily = activeFontFamily,
+                        fontFamily = LexendFamily,
                         fontSize = ((if (isSfx) 13.0f else 14.5f) * style.fontScale).sp,
                         lineHeight = ((if (isSfx) 17.0f else 19.0f) * style.fontScale).sp,
                         letterSpacing = if (isSfx) 0.25.sp else 0.15.sp,
                         fontWeight = if (isSfx) FontWeight.Normal else FontWeight.Medium,
                         fontStyle = if (isSfx) FontStyle.Italic else FontStyle.Normal,
-                        shadow = if (style.highContrastMode) null else Shadow(
+                        shadow = Shadow(
                             color = Color.Black.copy(alpha = 0.72f),
                             offset = Offset(0f, 1.2f),
                             blurRadius = 3.5f,
                         ),
                     ),
-                    color = resolvedClassicInk,
+                    color = if (isSfx) Color(0xFFE2E8F0).copy(alpha = 0.92f) else Color.White,
                     textAlign = TextAlign.Center,
                     softWrap = true,
                     maxLines = Int.MAX_VALUE,
@@ -1867,7 +1839,6 @@ fun SpatialSfxNoteView(
     onTap: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val activeFontFamily = resolveCaptionFontFamily(style.fontFamily, isMangaStyle = false)
     val event = placed.event
     val rawText = event.activeText(translationMode).trim()
     val formattedText = remember(rawText) {
@@ -1922,19 +1893,6 @@ fun SpatialSfxNoteView(
         }
     }
 
-    val baseSfxFill = if (style.highContrastMode) {
-        BalloonHighContrastSurface.copy(alpha = 0.98f)
-    } else {
-        CinemaObsidian.copy(alpha = 0.68f)
-    }
-    val baseSfxInk = if (style.highContrastMode) BalloonHighContrastInk else Color(0xFFE2E8F0)
-    val (resolvedSfxBg, resolvedSfxInk) = resolveAccessibleCaptionColors(
-        defaultFill = baseSfxFill,
-        defaultInk = baseSfxInk,
-        style = style,
-        preferredAlpha = style.balloonOpacity.coerceAtLeast(0.75f),
-    )
-
     Box(
         modifier = modifier
             .offset { IntOffset(sfxLeftPx.roundToInt(), sfxTopPx.roundToInt()) }
@@ -1942,7 +1900,13 @@ fun SpatialSfxNoteView(
             .widthIn(max = maxWidthDp)
             .onSizeChanged { measuredSize = it }
             .clip(RoundedCornerShape(12.dp))
-            .background(resolvedSfxBg)
+            .background(
+                if (style.highContrastMode) {
+                    BalloonHighContrastSurface.copy(alpha = 0.96f)
+                } else {
+                    CinemaObsidian.copy(alpha = 0.58f)
+                }
+            )
             .then(
                 if (style.highContrastMode) {
                     Modifier.border(1.5.dp, BalloonHighContrastBorder, RoundedCornerShape(12.dp))
@@ -1957,19 +1921,19 @@ fun SpatialSfxNoteView(
         Text(
             text = formattedText,
             style = MaterialTheme.typography.bodyMedium.copy(
-                fontFamily = activeFontFamily,
+                fontFamily = LexendFamily,
                 fontSize = (13.0f * style.fontScale).sp,
                 lineHeight = (17.0f * style.fontScale).sp,
                 letterSpacing = 0.25.sp,
                 fontWeight = FontWeight.Normal,
                 fontStyle = FontStyle.Italic,
-                shadow = if (style.highContrastMode) null else Shadow(
+                shadow = Shadow(
                     color = Color.Black.copy(alpha = 0.72f),
                     offset = Offset(0f, 1.2f),
                     blurRadius = 3.5f,
                 ),
             ),
-            color = resolvedSfxInk,
+            color = if (style.highContrastMode) BalloonHighContrastInk else Color(0xFFE2E8F0).copy(alpha = 0.94f),
             textAlign = TextAlign.Center,
             softWrap = true,
             maxLines = Int.MAX_VALUE,
@@ -2080,73 +2044,4 @@ private fun resolveSfxSafePixelPosition(
         val bubblePenalty = (if (bubbleOverlapNorm > 0f) 420f else 0f) + bubbleOverlapNorm * 10_000f
         facePenalty + bubblePenalty + distToBottomNorm * 1.4f
     } ?: (baseLeftPx to baseTopPx)
-}
-
-internal fun resolveCaptionFontFamily(
-    fontFamily: CaptionFontFamily,
-    isMangaStyle: Boolean,
-): FontFamily = when (fontFamily) {
-    CaptionFontFamily.DEFAULT_SANS -> if (isMangaStyle) NunitoFamily else LexendFamily
-    CaptionFontFamily.SERIF -> FontFamily.Serif
-    CaptionFontFamily.MONOSPACE -> JetBrainsMonoFamily
-    CaptionFontFamily.READABLE_ROUNDED -> NunitoFamily
-}
-
-internal fun colorToArgbLong(color: Color): Long {
-    val a = (color.alpha * 255f).roundToInt().coerceIn(0, 255)
-    val r = (color.red * 255f).roundToInt().coerceIn(0, 255)
-    val g = (color.green * 255f).roundToInt().coerceIn(0, 255)
-    val b = (color.blue * 255f).roundToInt().coerceIn(0, 255)
-    return (a.toLong() shl 24) or (r.toLong() shl 16) or (g.toLong() shl 8) or b.toLong()
-}
-
-internal fun resolveAccessibleCaptionColors(
-    defaultFill: Color,
-    defaultInk: Color,
-    style: BalloonStyleSettings,
-    preferredAlpha: Float,
-): Pair<Color, Color> {
-    if (style.highContrastMode) {
-        return BalloonHighContrastSurface.copy(alpha = 0.98f) to BalloonHighContrastInk
-    }
-    val fillAlpha = preferredAlpha.coerceIn(0.68f, 0.98f)
-    val customBgHex = style.customBackgroundColorHex
-    val customFgHex = style.customForegroundColorHex
-    val effectiveFill = if (customBgHex != null) {
-        Color((customBgHex and 0x00FFFFFFL) or (0xFFL shl 24)).copy(alpha = fillAlpha)
-    } else {
-        defaultFill
-    }
-    val fillHex = colorToArgbLong(effectiveFill) or 0xFF000000L
-    val candidateInk = if (customFgHex != null) {
-        Color((customFgHex and 0x00FFFFFFL) or (0xFFL shl 24))
-    } else {
-        defaultInk
-    }
-    val candidateInkHex = colorToArgbLong(candidateInk) or 0xFF000000L
-    val passesMid = CaptionAccessibilityContrast.meetsMinimumTextContrast(
-        fgArgb = candidateInkHex,
-        bgContainerArgb = fillHex,
-        bgAlpha = effectiveFill.alpha,
-        backdropArgb = 0xFF808080L,
-    )
-    if (passesMid) {
-        return effectiveFill to candidateInk
-    }
-    val boostAlpha = maxOf(effectiveFill.alpha, 0.92f)
-    val solidFill = effectiveFill.copy(alpha = boostAlpha)
-    val whiteOk = CaptionAccessibilityContrast.meetsMinimumTextContrast(0xFFF8FAFC, fillHex, boostAlpha, 0xFF808080L)
-    val darkOk = CaptionAccessibilityContrast.meetsMinimumTextContrast(0xFF0B0F17, fillHex, boostAlpha, 0xFF808080L)
-    val fallbackInk = when {
-        whiteOk && darkOk -> {
-            val wRatio = CaptionAccessibilityContrast.contrastRatio(0xFFF8FAFC, fillHex)
-            val dRatio = CaptionAccessibilityContrast.contrastRatio(0xFF0B0F17, fillHex)
-            if (wRatio >= dRatio) Color(0xFFF8FAFC) else Color(0xFF0B0F17)
-        }
-        whiteOk -> Color(0xFFF8FAFC)
-        darkOk -> Color(0xFF0B0F17)
-        else -> BalloonHighContrastInk
-    }
-    val finalFill = if (whiteOk || darkOk) solidFill else BalloonHighContrastSurface.copy(alpha = 0.96f)
-    return finalFill to fallbackInk
 }

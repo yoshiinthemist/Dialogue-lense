@@ -72,9 +72,8 @@ class OnDeviceTranslatorService {
             .setSourceLanguage(srcCode)
             .setTargetLanguage(tgtCode)
             .build()
-        var translator: com.google.mlkit.nl.translate.Translator? = null
+        val translator = Translation.getClient(options)
         return try {
-            translator = Translation.getClient(options)
             withTimeout(30_000L) {
                 val conditions = DownloadConditions.Builder().build()
                 translator.downloadModelIfNeeded(conditions).awaitTask()
@@ -93,11 +92,11 @@ class OnDeviceTranslatorService {
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Throwable) {
+        } catch (e: Exception) {
             Log.e(TAG, "Offline ML Kit translation failed ($srcCode -> $tgtCode)", e)
             Result.failure(e)
         } finally {
-            runCatching { translator?.close() }
+            runCatching { translator.close() }
         }
     }
 }

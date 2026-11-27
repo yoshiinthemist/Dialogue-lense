@@ -16,7 +16,6 @@ import com.example.data.model.BalloonStyleSettings
 import com.example.data.model.BubbleVisualStyle
 import com.example.data.model.CachedVideoTranscript
 import com.example.data.model.CaptionDisplayMode
-import com.example.data.model.CaptionFontFamily
 import com.example.data.model.DialogueLensProject
 import com.example.data.model.GlossaryEntry
 import com.example.data.model.QuotaSaverMode
@@ -83,10 +82,6 @@ class ProjectStore(private val context: Context) {
         val GLOSSARY_MEMORY = stringPreferencesKey("series_glossary_memory_json")
         val QUOTA_SAVER_MODE = stringPreferencesKey("quota_saver_mode")
         val HAS_COMPLETED_ONBOARDING = booleanPreferencesKey("has_completed_onboarding_v2")
-        val FONT_FAMILY = stringPreferencesKey("balloon_font_family")
-        val CUSTOM_FG_COLOR = stringPreferencesKey("balloon_custom_fg_color")
-        val CUSTOM_BG_COLOR = stringPreferencesKey("balloon_custom_bg_color")
-        val CAPTION_MODE_V5_MIGRATED = booleanPreferencesKey("caption_mode_v5_migrated")
     }
 
     private val defaultStyle = BalloonStyleSettings()
@@ -117,24 +112,13 @@ class ProjectStore(private val context: Context) {
             lipReadingSafeZone = prefs[Keys.LIP_READING_SAFE_ZONE] ?: defaultStyle.lipReadingSafeZone,
             offScreenEdgeGlow = prefs[Keys.OFF_SCREEN_EDGE_GLOW] ?: defaultStyle.offScreenEdgeGlow,
             ambientMoodBorder = prefs[Keys.AMBIENT_MOOD_BORDER] ?: defaultStyle.ambientMoodBorder,
-            fontFamily = CaptionFontFamily.entries.firstOrNull { it.name == prefs[Keys.FONT_FAMILY] }
-                ?: defaultStyle.fontFamily,
-            customForegroundColorHex = prefs[Keys.CUSTOM_FG_COLOR]?.toLongOrNull(),
-            customBackgroundColorHex = prefs[Keys.CUSTOM_BG_COLOR]?.toLongOrNull(),
         )
     }
 
     val displayModeFlow: Flow<CaptionDisplayMode> = context.settingsDataStore.data.map { prefs ->
         val raw = prefs[Keys.DISPLAY_MODE]
-        val parsed = CaptionDisplayMode.entries.firstOrNull { it.name == raw }
-            ?: CaptionDisplayMode.BUBBLES_WITH_TAILS
-        val migratedV5 = prefs[Keys.CAPTION_MODE_V5_MIGRATED] ?: false
-        val legacyShowTail = prefs[Keys.SHOW_TAIL] ?: defaultStyle.showTail
-        if (!migratedV5) {
-            CaptionDisplayMode.migrateLegacy(parsed, legacyShowTail)
-        } else {
-            parsed.normalizedPrimaryMode(legacyShowTail)
-        }
+        (CaptionDisplayMode.entries.firstOrNull { it.name == raw } ?: CaptionDisplayMode.BALLOONS)
+            .normalizedPrimaryMode()
     }
 
     val characterColorsFlow: Flow<Map<String, Int>> = context.settingsDataStore.data.map { prefs ->
@@ -199,30 +183,12 @@ class ProjectStore(private val context: Context) {
             prefs[Keys.LIP_READING_SAFE_ZONE] = settings.lipReadingSafeZone
             prefs[Keys.OFF_SCREEN_EDGE_GLOW] = settings.offScreenEdgeGlow
             prefs[Keys.AMBIENT_MOOD_BORDER] = settings.ambientMoodBorder
-            prefs[Keys.FONT_FAMILY] = settings.fontFamily.name
-            if (settings.customForegroundColorHex != null) {
-                prefs[Keys.CUSTOM_FG_COLOR] = settings.customForegroundColorHex.toString()
-            } else {
-                prefs.remove(Keys.CUSTOM_FG_COLOR)
-            }
-            if (settings.customBackgroundColorHex != null) {
-                prefs[Keys.CUSTOM_BG_COLOR] = settings.customBackgroundColorHex.toString()
-            } else {
-                prefs.remove(Keys.CUSTOM_BG_COLOR)
-            }
         }
     }
 
     suspend fun saveDisplayMode(mode: CaptionDisplayMode) {
-        val normalized = mode.normalizedPrimaryMode()
         context.settingsDataStore.edit { prefs ->
-            prefs[Keys.DISPLAY_MODE] = normalized.name
-            prefs[Keys.CAPTION_MODE_V5_MIGRATED] = true
-            if (normalized == CaptionDisplayMode.BALLOONS) {
-                prefs[Keys.SHOW_TAIL] = false
-            } else if (normalized == CaptionDisplayMode.BUBBLES_WITH_TAILS) {
-                prefs[Keys.SHOW_TAIL] = true
-            }
+            prefs[Keys.DISPLAY_MODE] = mode.normalizedPrimaryMode().name
         }
     }
 

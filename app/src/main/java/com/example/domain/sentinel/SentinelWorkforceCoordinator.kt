@@ -3,13 +3,11 @@ package com.example.domain.sentinel
 import com.example.data.model.ChapterSource
 import com.example.data.model.CoverageStatus
 import com.example.data.model.DialogueLensProject
-import com.example.data.model.HealBeacon
 import com.example.data.model.PersistedSchedulingState
 import com.example.data.model.QuotaSaverMode
 import com.example.data.model.VideoChapter
 import com.example.domain.analysis.LookaheadWindowPlanner
 import com.example.domain.analysis.TranscriptCoverageLedger
-import com.example.domain.pipeline.TimestampAdjustmentRecord
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -195,10 +193,6 @@ data class SentinelInspectorSnapshot(
     val totalLocalCleanChapterChecks: Int = 0,
     val totalCloudEscalatedChapterChecks: Int = 0,
     val schedulerState: SchedulerStateSnapshot = SchedulerStateSnapshot(),
-    val latestScout1ReportSummary: String = "",
-    val totalTimestampsVerified: Int = 0,
-    val totalTimestampsAdjusted: Int = 0,
-    val recentTimestampAdjustments: List<TimestampAdjustmentRecord> = emptyList(),
 )
 
 /**
@@ -235,15 +229,10 @@ class SentinelWorkforceCoordinator {
     private var totalCompletedRepairs: Int = 0
     private var totalLocalCleanChapterChecks: Int = 0
     private var totalCloudEscalatedChapterChecks: Int = 0
-    private var latestScout1ReportSummary: String = ""
-    private var totalTimestampsVerified: Int = 0
-    private var totalTimestampsAdjusted: Int = 0
-    private val recentTimestampAdjustments = mutableListOf<TimestampAdjustmentRecord>()
 
     // Single authoritative rolling 3-minute boundary & idle/wake state
     private var policy: RollingBoundaryPolicy = RollingBoundaryPolicy()
     private var boundaryAnchored: Boolean = false
-    private var pendingAsyncSeekAck: Boolean = false
     private var acknowledgedViewerPosMs: Long = 0L
     private var durationMs: Long = 0L
     private var boundaryEndMs: Long = 0L
@@ -317,10 +306,6 @@ class SentinelWorkforceCoordinator {
             totalCompletedRepairs = 0
             totalLocalCleanChapterChecks = 0
             totalCloudEscalatedChapterChecks = 0
-            latestScout1ReportSummary = ""
-            totalTimestampsVerified = 0
-            totalTimestampsAdjusted = 0
-            recentTimestampAdjustments.clear()
 
             val projDur = maxOf(
                 project.videoSource.durationMs,
@@ -379,7 +364,6 @@ class SentinelWorkforceCoordinator {
         playbackSpeed: Float = this.playbackSpeed,
         seekGeneration: Long = this.schedulingGeneration,
         nowEpochMs: Long = System.currentTimeMillis(),
-        seekAcknowledged: Boolean = false,
     ): Boolean = synchronized(lock) {
         if (isScrubberPreviewActive) return@synchronized false
         if (seekGeneration < schedulingGeneration) return@synchronized false
@@ -396,10 +380,8 @@ class SentinelWorkforceCoordinator {
             positionMs.coerceAtLeast(0L)
         }
 
-        val isSeekAckLanding = seekAcknowledged || pendingAsyncSeekAck
-        // Useful pausing rule: while paused without a landing seek acknowledgement,
-        // NEVER drift the anchored viewer position or boundary forward!
-        if (!isSeekAckLanding && !isPlaying && isViewerPaused && boundaryAnchored) {
+        // Useful pausing rule: while paused, NEVER drift the anchored viewer position or boundary forward!
+        if (!isPlaying && isViewerPaused && boundaryAnchored) {
             recomputeBoundaryLocked()
             return@synchronized false
         }
@@ -415,27 +397,8 @@ class SentinelWorkforceCoordinator {
         }
 
         acknowledgedViewerPosMs = clampedPos
-        pendingAsyncSeekAck = false
         boundaryAnchored = this.durationMs > 0L
         recomputeBoundaryLocked()
-        if (isSeekAckLanding) {
-            queue.removeAll { item ->
-                val outsideNewWindow = boundaryAnchored &&
-                    (item.endMs <= acknowledgedViewerPosMs || item.startMs >= boundaryEndMs)
-                item.kind != SentinelTaskKind.USER_HEAL_BEACON && outsideNewWindow
-            }
-            val obsoleteRes = reservations.values.filter { res ->
-                boundaryAnchored && (res.endMs <= acknowledgedViewerPosMs || res.startMs >= boundaryEndMs)
-            }.map { it.reservationId }
-            obsoleteRes.forEach { reservations.remove(it) }
-            isTemporarilyIdle = false
-            outcomeState = SchedulerOutcomeState.ACTIVE
-            idleReason = ""
-            lastIdleAnchorMs = -1L
-            lastIdleBoundaryEndMs = -1L
-            lastWakeReason = "seek_ack_${acknowledgedViewerPosMs / 1000L}s_gen$schedulingGeneration"
-            return@synchronized true
-        }
 
         // Hysteresis wake-up check when temporarily idle
         if (isTemporarilyIdle && outcomeState != SchedulerOutcomeState.WHOLE_VIDEO_COMPLETE) {
@@ -520,7 +483,6 @@ class SentinelWorkforceCoordinator {
         isPlaying: Boolean = !this.isViewerPaused,
         externalSeekGeneration: Long? = null,
         nowEpochMs: Long = System.currentTimeMillis(),
-        anchorBoundaryImmediately: Boolean = true,
     ): Long = synchronized(lock) {
         if (durationMs > 0L) this.durationMs = durationMs
         isScrubberPreviewActive = false
@@ -534,30 +496,22 @@ class SentinelWorkforceCoordinator {
         } else {
             targetPositionMs.coerceAtLeast(0L)
         }
-        if (anchorBoundaryImmediately) {
-            acknowledgedViewerPosMs = clamped
-            pendingAsyncSeekAck = false
-        } else {
-            pendingAsyncSeekAck = true
-        }
+        acknowledgedViewerPosMs = clamped
         isViewerPaused = !isPlaying
         pausedSinceEpochMs = if (isViewerPaused) nowEpochMs else 0L
         pausedDeadlineReached = false
         boundaryAnchored = this.durationMs > 0L
         recomputeBoundaryLocked()
 
-        // Cancel/prune obsolete queued items from prior generations (and outside anchored window)
+        // Cancel/prune obsolete queued items outside the new rolling boundary or from prior generations
         queue.removeAll { item ->
             val staleGen = item.schedulingGeneration > 0L && item.schedulingGeneration < schedulingGeneration
-            val outsideNewWindow = anchorBoundaryImmediately &&
-                boundaryAnchored &&
-                (item.endMs <= acknowledgedViewerPosMs || item.startMs >= boundaryEndMs)
+            val outsideNewWindow = boundaryAnchored && (item.endMs <= acknowledgedViewerPosMs || item.startMs >= boundaryEndMs)
             staleGen || (item.kind != SentinelTaskKind.USER_HEAL_BEACON && outsideNewWindow)
         }
         // Release stale reservations outside the new window
         val obsoleteRes = reservations.values.filter { res ->
-            anchorBoundaryImmediately && boundaryAnchored &&
-                (res.endMs <= acknowledgedViewerPosMs || res.startMs >= boundaryEndMs)
+            boundaryAnchored && (res.endMs <= acknowledgedViewerPosMs || res.startMs >= boundaryEndMs)
         }.map { it.reservationId }
         obsoleteRes.forEach { reservations.remove(it) }
 
@@ -1336,100 +1290,6 @@ class SentinelWorkforceCoordinator {
     }
 
     /**
-     * Enqueues a [HealBeacon] into the unified coordinator queue so repairs share priority tiers,
-     * reservations, generation tokens, and 3-minute boundary enforcement with Scout workers.
-     */
-    fun enqueueHealBeacon(
-        beacon: HealBeacon,
-        isUserDirected: Boolean = !beacon.autoTriggered,
-        generationToken: Long = schedulingGeneration,
-        nowEpochMs: Long = System.currentTimeMillis(),
-    ): SentinelWorkItem? = synchronized(lock) {
-        val tier = if (isUserDirected) {
-            SentinelPriorityTier.USER_DIRECTED_REPAIR
-        } else {
-            SentinelPriorityTier.PREVENTIVE_MAINTENANCE
-        }
-        val kind = if (isUserDirected) {
-            SentinelTaskKind.USER_HEAL_BEACON
-        } else {
-            SentinelTaskKind.CHAPTER_BOUNDARY_PATROL
-        }
-        val clippedEnd = if (!isUserDirected && boundaryAnchored) {
-            minOf(beacon.windowEndMs, boundaryEndMs)
-        } else {
-            beacon.windowEndMs
-        }
-        if (clippedEnd <= beacon.windowStartMs) return@synchronized null
-        val item = SentinelWorkItem(
-            id = beacon.coordinatorJobId.ifBlank { "heal_${beacon.id}_rev${beacon.repairRevision}" },
-            tier = tier,
-            kind = kind,
-            startMs = beacon.windowStartMs,
-            endMs = clippedEnd,
-            beaconId = beacon.id,
-            chapterId = beacon.patrolChapterId,
-            chapterTitle = if (isUserDirected) "Heal moment" else "Auto heal patrol",
-            draftRevision = beacon.repairRevision.toLong(),
-            createdAtEpochMs = nowEpochMs,
-            schedulingGeneration = generationToken,
-        )
-        enqueueLocked(item)
-        item
-    }
-
-    /**
-     * Claims a queued Heal Beacon task (for user-directed or patrol repair) through the shared
-     * reservation and worker table so Scouts and Heal workers never race on the same interval.
-     */
-    fun claimHealBeaconWork(
-        workerId: String = WORKER_2_ID,
-        targetBeaconId: String? = null,
-        nowEpochMs: Long = System.currentTimeMillis(),
-    ): Pair<SentinelWorkItem, IntervalReservation>? = synchronized(lock) {
-        val activeCount = workers.values.count { it.isActive }
-        val isWorkerAlreadyActive = workers[workerId]?.isActive == true
-        if (!isWorkerAlreadyActive && activeCount >= maxAllowedWorkersLocked()) {
-            return@synchronized null
-        }
-        val candidates = queue.filter { item ->
-            (item.kind == SentinelTaskKind.USER_HEAL_BEACON ||
-                (item.kind == SentinelTaskKind.CHAPTER_BOUNDARY_PATROL && item.beaconId != null)) &&
-                (targetBeaconId == null || item.beaconId == targetBeaconId) &&
-                (item.schedulingGeneration <= 0L || item.schedulingGeneration >= schedulingGeneration) &&
-                isWithinActiveBoundaryLocked(item)
-        }
-        for (item in candidates) {
-            val reservation = tryReserveInterval(workerId, item.startMs, item.endMs, item.tier, nowEpochMs)
-                ?: continue
-            queue.remove(item)
-            workers[workerId] = SentinelWorkerState(
-                workerId = workerId,
-                isActive = true,
-                currentTaskLabel = if (item.kind == SentinelTaskKind.USER_HEAL_BEACON) {
-                    "Healing marked moment"
-                } else {
-                    "Checking chapter moment"
-                },
-                activeStartMs = item.startMs,
-                activeEndMs = item.endMs,
-                tier = item.tier,
-            )
-            return@synchronized item to reservation
-        }
-        null
-    }
-
-    fun cancelOrSupersedeStaleHealTasks(activeGenerationToken: Long): Int = synchronized(lock) {
-        val before = queue.size
-        queue.removeAll { item ->
-            (item.kind == SentinelTaskKind.USER_HEAL_BEACON || item.beaconId != null) &&
-                item.schedulingGeneration in 1L until activeGenerationToken
-        }
-        before - queue.size
-    }
-
-    /**
      * Enqueues a task into the 4-tier unified queue, deduplicating against identical pending items.
      */
     fun enqueue(item: SentinelWorkItem): Boolean = synchronized(lock) {
@@ -1532,7 +1392,6 @@ class SentinelWorkforceCoordinator {
     fun claimNextWork(
         workerId: String,
         nowEpochMs: Long = System.currentTimeMillis(),
-        allowedKinds: Set<SentinelTaskKind>? = null,
     ): Pair<SentinelWorkItem, IntervalReservation>? = synchronized(lock) {
         val activeCount = workers.values.count { it.isActive }
         val isWorkerAlreadyActive = workers[workerId]?.isActive == true
@@ -1547,9 +1406,6 @@ class SentinelWorkforceCoordinator {
             val item = iterator.next()
             if (item.schedulingGeneration > 0L && item.schedulingGeneration < schedulingGeneration) {
                 iterator.remove()
-                continue
-            }
-            if (allowedKinds != null && item.kind !in allowedKinds) {
                 continue
             }
             if (!isWithinActiveBoundaryLocked(item)) {
@@ -1743,34 +1599,6 @@ class SentinelWorkforceCoordinator {
         }
     }
 
-    fun recordScout1TimestampReportSummary(summary: String) {
-        if (summary.isBlank()) return
-        synchronized(lock) {
-            latestScout1ReportSummary = summary
-        }
-    }
-
-    fun recordScoutTimestampAudit(
-        reportSummary: String,
-        verifiedCount: Int,
-        adjustedCount: Int,
-        adjustments: List<TimestampAdjustmentRecord>,
-    ) {
-        synchronized(lock) {
-            if (reportSummary.isNotBlank()) {
-                latestScout1ReportSummary = reportSummary
-            }
-            totalTimestampsVerified += verifiedCount.coerceAtLeast(0)
-            totalTimestampsAdjusted += adjustedCount.coerceAtLeast(0)
-            if (adjustments.isNotEmpty()) {
-                recentTimestampAdjustments.addAll(adjustments)
-                while (recentTimestampAdjustments.size > 12) {
-                    recentTimestampAdjustments.removeAt(0)
-                }
-            }
-        }
-    }
-
     fun inspectorSnapshot(): SentinelInspectorSnapshot = synchronized(lock) {
         val suspended = isPatrolSuspendedLocked()
         val suspensionReason = when {
@@ -1793,10 +1621,6 @@ class SentinelWorkforceCoordinator {
             totalLocalCleanChapterChecks = totalLocalCleanChapterChecks,
             totalCloudEscalatedChapterChecks = totalCloudEscalatedChapterChecks,
             schedulerState = buildSchedulerSnapshotLocked(),
-            latestScout1ReportSummary = latestScout1ReportSummary,
-            totalTimestampsVerified = totalTimestampsVerified,
-            totalTimestampsAdjusted = totalTimestampsAdjusted,
-            recentTimestampAdjustments = recentTimestampAdjustments.takeLast(6),
         )
     }
 

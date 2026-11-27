@@ -259,9 +259,7 @@ class DialogueLensAuditRepairsTest {
             project,
         )
         assertEquals("おはようございます", outcomeB.repairedEvents.first().sourceText)
-        assertEquals("Material source repair must invalidate obsolete English translation", "", outcomeB.repairedEvents.first().translatedText)
-        assertTrue(outcomeB.repairedEvents.first().needsTranslation)
-        assertEquals(2, outcomeB.repairedEvents.first().sourceTextRevision)
+        assertEquals("Hello everyone", outcomeB.repairedEvents.first().translatedText)
         assertFalse("Source-language repair cannot mark target translation verified", outcomeB.isTranslationVerified)
     }
 

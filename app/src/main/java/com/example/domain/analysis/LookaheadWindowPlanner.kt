@@ -443,63 +443,6 @@ object LookaheadWindowPlanner {
         }
     }
 
-    /**
-     * Coordinator-driven Scout WebView sync that honors the 180s RollingBoundary horizon and
-     * active work windows: advances Scout forward when work exists inside [viewerPosMs, boundaryEnd],
-     * follows a playing viewer without spurious rewinds, and idles cleanly when the horizon is complete.
-     */
-    fun computeCoordinatorScoutCommand(
-        viewerPosMs: Long,
-        scoutPosMs: Long,
-        durationMs: Long,
-        nextWorkWindow: TimeWindowRange?,
-        isViewerPlaying: Boolean,
-        isScoutPlaying: Boolean,
-        introRemainingMs: Long,
-        horizonMs: Long = 180_000L,
-    ): ScoutSyncCommand {
-        if (durationMs <= 0L) return ScoutSyncCommand.Hold
-        val safeViewerPos = viewerPosMs.coerceIn(0L, durationMs)
-        val boundaryEnd = (safeViewerPos + horizonMs.coerceAtLeast(LOOKAHEAD_LEAD_MS)).coerceAtMost(durationMs)
-
-        if (introRemainingMs > 0L) {
-            val leadTarget = clampScoutTargetMs(0L, durationMs)
-            if (scoutPosMs > leadTarget + DRIFT_TOLERANCE_MS) {
-                return ScoutSyncCommand.SeekAndPlay(0L)
-            }
-            return if (scoutPosMs < leadTarget - 400L) {
-                if (!isScoutPlaying) ScoutSyncCommand.PlayForward else ScoutSyncCommand.Hold
-            } else {
-                if (isScoutPlaying) ScoutSyncCommand.PauseWithLead else ScoutSyncCommand.Hold
-            }
-        }
-
-        if (nextWorkWindow != null) {
-            val winStart = nextWorkWindow.startMs.coerceIn(0L, boundaryEnd)
-            val winEnd = nextWorkWindow.endMs.coerceIn(winStart + 500L, maxOf(winStart + 500L, boundaryEnd))
-            return when {
-                scoutPosMs < winStart - 1_500L || scoutPosMs > winEnd + 1_500L ->
-                    ScoutSyncCommand.SeekAndPlay(winStart)
-                !isScoutPlaying && scoutPosMs < durationMs - 500L ->
-                    ScoutSyncCommand.PlayForward
-                else -> ScoutSyncCommand.Hold
-            }
-        }
-
-        // Horizon has no remaining work: never pull Scout backward from its hard-earned horizon!
-        return if (isViewerPlaying) {
-            if (scoutPosMs < safeViewerPos - 20_000L && safeViewerPos < durationMs - 800L) {
-                ScoutSyncCommand.SeekAndPlay(safeViewerPos)
-            } else if (!isScoutPlaying && scoutPosMs < boundaryEnd - 800L && scoutPosMs <= safeViewerPos + LOOKAHEAD_LEAD_MS) {
-                ScoutSyncCommand.PlayForward
-            } else {
-                ScoutSyncCommand.Hold
-            }
-        } else {
-            if (isScoutPlaying) ScoutSyncCommand.PauseWithLead else ScoutSyncCommand.Hold
-        }
-    }
-
     data class WindowMergeReport(
         val events: List<DialogueEvent>,
         val acceptedCount: Int,
@@ -526,12 +469,14 @@ object LookaheadWindowPlanner {
         windowEndMs: Long,
     ): WindowMergeReport {
         val incomingIds = incoming.map { it.id }.toSet()
-        val incomingKeys = incoming.map { it.canonicalIdentityKey }.toSet()
+        // Additive & idempotent merge: NEVER blindly wipe existing unlocked cues inside [windowStartMs, windowEndMs),
+        // because overlapping windows, bisected partial recoveries, or simultaneous speakers may contribute cues
+        // across passes. Only replace an existing unlocked event when an incoming event updates that exact ID.
         val keptExisting = existing.filter { evt ->
-            evt.lockedByUser || (evt.id !in incomingIds && evt.canonicalIdentityKey !in incomingKeys)
+            evt.lockedByUser || evt.id !in incomingIds
         }
         val lockedInWindow = keptExisting.filter { evt ->
-            evt.lockedByUser && evt.endTimeMs > windowStartMs && evt.startTimeMs < windowEndMs
+            evt.lockedByUser && evt.startTimeMs in windowStartMs until windowEndMs
         }
 
         val merged = keptExisting.toMutableList()
@@ -590,46 +535,21 @@ object LookaheadWindowPlanner {
                 continue
             }
 
-            val duplicateMatchIdx = merged.indexOfFirst { prev ->
-                prev.canonicalIdentityKey == candidate.canonicalIdentityKey ||
-                    areDuplicateUtterances(prev, candidate)
+            val duplicateMatch = merged.firstOrNull { prev ->
+                areDuplicateUtterances(prev, candidate)
             }
-            if (duplicateMatchIdx >= 0) {
-                val duplicateMatch = merged[duplicateMatchIdx]
-                val canReplaceWithImprovement = !duplicateMatch.lockedByUser && (
-                    candidate.sourceTextRevision > duplicateMatch.sourceTextRevision ||
-                        (candidate.translatedText.isNotBlank() && duplicateMatch.translatedText.isBlank()) ||
-                        (candidate.speakerId != null && duplicateMatch.speakerId == null &&
-                            candidate.speakerConfidence > duplicateMatch.speakerConfidence + 0.1f)
+            if (duplicateMatch != null) {
+                rejectedCount++
+                decisions.add(
+                    DuplicateDecisionRecord(
+                        accepted = false,
+                        reason = "TEMPORAL_OVERLAP_SAME_UTTERANCE",
+                        incomingTextPreview = candidate.sourceText.take(48),
+                        incomingStartMs = candidate.startTimeMs,
+                        matchedStartMs = duplicateMatch.startTimeMs,
+                        speakerId = candidate.speakerId,
                     )
-                if (canReplaceWithImprovement) {
-                    merged[duplicateMatchIdx] = candidate.copy(
-                        stableCueKey = duplicateMatch.canonicalIdentityKey,
-                    )
-                    acceptedCount++
-                    decisions.add(
-                        DuplicateDecisionRecord(
-                            accepted = true,
-                            reason = "REPLACED_WITH_IMPROVED_REVISION",
-                            incomingTextPreview = candidate.sourceText.take(48),
-                            incomingStartMs = candidate.startTimeMs,
-                            matchedStartMs = duplicateMatch.startTimeMs,
-                            speakerId = candidate.speakerId,
-                        )
-                    )
-                } else {
-                    rejectedCount++
-                    decisions.add(
-                        DuplicateDecisionRecord(
-                            accepted = false,
-                            reason = "TEMPORAL_OVERLAP_SAME_UTTERANCE",
-                            incomingTextPreview = candidate.sourceText.take(48),
-                            incomingStartMs = candidate.startTimeMs,
-                            matchedStartMs = duplicateMatch.startTimeMs,
-                            speakerId = candidate.speakerId,
-                        )
-                    )
-                }
+                )
                 continue
             }
 

@@ -104,7 +104,6 @@ import com.example.data.model.DialogueLensProject
 import com.example.data.model.DialogueType
 import com.example.data.model.NormalizedPoint
 import com.example.data.model.NormalizedRect
-import com.example.data.model.ScoutCaptureDiagnostics
 import com.example.data.model.VideoSourceKind
 import com.example.data.model.isBubbleSpeakerUnknown
 import com.example.data.project.DemoScenarioFactory
@@ -182,10 +181,8 @@ fun VideoPlayerStage(
     onYouTubePlaybackState: (Long, Long, Boolean) -> Unit,
     onYouTubeCaptionTrackStatus: (Int, String, Boolean, Boolean, Boolean) -> Unit = { _, _, _, _, _ -> },
     onYouTubeEmbedFallback: (Int) -> Unit = {},
-    onYouTubePlayerError: (Int) -> Unit = {},
     onYouTubeTimedTextCaptured: (String, String, String?, String?) -> Unit = { _, _, _, _ -> },
     onWebStreamPlaybackState: (Long, Long, Boolean) -> Unit = { _, _, _ -> },
-    onStreamPlayCommandResult: (seq: Int, playing: Boolean, rejected: Boolean, reason: String) -> Unit = { _, _, _, _ -> },
     onWebStreamCapturedCaptions: (String) -> Unit = {},
     onWebStreamPageMetadata: (String, String, String) -> Unit = { _, _, _ -> },
     viewerWebNavCommand: WebNavCommand? = null,
@@ -198,8 +195,7 @@ fun VideoPlayerStage(
     onScoutWebStreamPlaybackState: (Long, Long, Boolean) -> Unit = { _, _, _ -> },
     onScoutWebStreamDirectMediaUrl: (String) -> Unit = {},
     onWebStreamSniffedMediaStream: (SniffedWebMediaStream) -> Unit = {},
-    onScoutWebStreamAudioSlice: (Long, String, String, Long, Boolean) -> Unit = { _, _, _, _, _ -> },
-    onScoutCaptureDiagnostics: (ScoutCaptureDiagnostics) -> Unit = {},
+    onScoutWebStreamAudioSlice: (Long, String, String) -> Unit = { _, _, _ -> },
     onTapBalloon: (String) -> Unit,
     onTapFaceTrack: (String) -> Unit,
     onDragBalloonAnchor: (String, NormalizedPoint) -> Unit,
@@ -429,14 +425,12 @@ fun VideoPlayerStage(
                         playRequest = streamPlayRequest,
                         seekRequest = youtubeSeekRequest,
                         onPlaybackState = onYouTubePlaybackState,
-                        onPlayCommandResult = onStreamPlayCommandResult,
                         // Softly hide YouTube's default track ONLY when DialogueLens bubbles are loaded AND turned ON;
                         // when bubbles are absent or OFF, leave YouTube's native CC completely unblocked.
                         suppressNativeCaptions = hasRealSubtitles && displayMode != CaptionDisplayMode.OFF,
                         preferredCaptionLang = ytLangCode,
                         onCaptionTrackStatus = onYouTubeCaptionTrackStatus,
                         onEmbedFallback = onYouTubeEmbedFallback,
-                        onPlayerError = onYouTubePlayerError,
                         onCapturedTimedTextBody = onYouTubeTimedTextCaptured,
                         modifier = Modifier.fillMaxSize(),
                     )
@@ -449,7 +443,6 @@ fun VideoPlayerStage(
                         playRequest = streamPlayRequest,
                         seekRequest = youtubeSeekRequest,
                         onPlaybackState = onWebStreamPlaybackState,
-                        onPlayCommandResult = onStreamPlayCommandResult,
                         onCapturedCaptions = onWebStreamCapturedCaptions,
                         isolateVideoInViewport = true,
                         onDirectMediaUrl = onScoutWebStreamDirectMediaUrl,
@@ -875,13 +868,13 @@ fun VideoPlayerStage(
             val activeNonSfxIds = remember(placedBalloons) {
                 placedBalloons
                     .filter { it.event.dialogueType != DialogueType.SOUND_DESCRIPTION }
-                    .map { it.event.canonicalIdentityKey }
+                    .map { it.event.id }
                     .toSet()
             }
             val activeSfxIds = remember(placedBalloons) {
                 placedBalloons
                     .filter { it.event.dialogueType == DialogueType.SOUND_DESCRIPTION }
-                    .map { it.event.canonicalIdentityKey }
+                    .map { it.event.id }
                     .toSet()
             }
             LaunchedEffect(activeNonSfxIds, activeSfxIds) {
@@ -897,16 +890,16 @@ fun VideoPlayerStage(
                 }
             }
 
-            val activeDisplayMode = displayMode.normalizedPrimaryMode(project.styleSettings.showTail)
-            if (activeDisplayMode.shouldShowBubbles) {
+            val isFixedZonesMode = displayMode == CaptionDisplayMode.FIXED_ZONES
+            if (displayMode == CaptionDisplayMode.BALLOONS || isFixedZonesMode || displayMode == CaptionDisplayMode.BOTH) {
                 val nonSfxBalloons = placedBalloons
                     .filter { it.event.dialogueType != DialogueType.SOUND_DESCRIPTION }
                 nonSfxBalloons.forEachIndexed { idx, placed ->
-                    val persistentKey = placed.event.canonicalIdentityKey
+                    val persistentKey = placed.event.stableCueKey.ifBlank { placed.event.id }
                     key("${project.id}:$persistentKey") {
                         val priorBubbleRects = nonSfxBalloons
                             .take(idx)
-                            .mapNotNull { measuredBubbleBounds[it.event.canonicalIdentityKey] }
+                            .mapNotNull { measuredBubbleBounds[it.event.id] }
                         SpeechBalloonView(
                             placed = placed,
                             translationMode = project.translationMode,
@@ -918,9 +911,9 @@ fun VideoPlayerStage(
                             faceExclusionRects = activeFaceExclusions,
                             occupiedBubbleRects = priorBubbleRects,
                             onPixelBoundsResolved = { rect ->
-                                measuredBubbleBounds[persistentKey] = rect
+                                measuredBubbleBounds[placed.event.id] = rect
                                 if (widthPx > 1f && heightPx > 1f) {
-                                    renderedOverlayNormRects[persistentKey] = NormalizedRect(
+                                    renderedOverlayNormRects[placed.event.id] = NormalizedRect(
                                         left = (rect.left / widthPx).coerceIn(0f, 1f),
                                         top = (rect.top / heightPx).coerceIn(0f, 1f),
                                         right = (rect.right / widthPx).coerceIn(0f, 1f),
@@ -929,7 +922,7 @@ fun VideoPlayerStage(
                                 }
                             },
                             onMeasuredNormalizedSize = { normW, normH ->
-                                onMeasuredBubbleSize(persistentKey, normW, normH)
+                                onMeasuredBubbleSize(placed.event.id, normW, normH)
                             },
                             measurementEpoch = measurementEpoch,
                             onRenderedFrameReported = { cueKey, leftPx, topPx, wPx, hPx ->
@@ -938,19 +931,19 @@ fun VideoPlayerStage(
                             onEntryAnimationStarted = onBalloonEntryStarted,
                             onClick = { onTapBalloon(placed.event.id) },
                             onDragCommit = { newCenter -> onDragBalloonAnchor(placed.event.id, newCenter) },
-                            forceTaillessFixedZone = !activeDisplayMode.shouldShowTails,
-                            displayMode = activeDisplayMode,
-                            currentTimeMs = currentTimeMs,
+                            forceTaillessFixedZone = isFixedZonesMode,
                         )
                     }
                 }
+            }
 
+            // 4. SFX Spatial Notes (in BALLOONS / FIXED_ZONES mode) or Classic Subtitle Bar
+            if (displayMode == CaptionDisplayMode.BALLOONS || isFixedZonesMode) {
                 val bubbleObstacles = activeNonSfxIds.mapNotNull { measuredBubbleBounds[it] }
                 val sfxList = placedBalloons.filter { it.event.dialogueType == DialogueType.SOUND_DESCRIPTION }
                 sfxList.forEachIndexed { idx, sfxPlaced ->
-                    val sfxKey = sfxPlaced.event.canonicalIdentityKey
-                    key("${project.id}:sfx:$sfxKey") {
-                        val priorSfxObstacles = sfxList.take(idx).mapNotNull { measuredSfxBounds[it.event.canonicalIdentityKey] }
+                    key("${project.id}:sfx:${sfxPlaced.event.stableCueKey.ifBlank { sfxPlaced.event.id }}") {
+                        val priorSfxObstacles = sfxList.take(idx).mapNotNull { measuredSfxBounds[it.event.id] }
                         SpatialSfxNoteView(
                             placed = sfxPlaced,
                             translationMode = project.translationMode,
@@ -960,9 +953,9 @@ fun VideoPlayerStage(
                             faceExclusionRects = activeFaceExclusions,
                             occupiedBubbleRects = bubbleObstacles + priorSfxObstacles,
                             onPixelBoundsResolved = { rect ->
-                                measuredSfxBounds[sfxKey] = rect
+                                measuredSfxBounds[sfxPlaced.event.id] = rect
                                 if (widthPx > 1f && heightPx > 1f) {
-                                    renderedOverlayNormRects["sfx:$sfxKey"] = NormalizedRect(
+                                    renderedOverlayNormRects["sfx:${sfxPlaced.event.id}"] = NormalizedRect(
                                         left = (rect.left / widthPx).coerceIn(0f, 1f),
                                         top = (rect.top / heightPx).coerceIn(0f, 1f),
                                         right = (rect.right / widthPx).coerceIn(0f, 1f),
@@ -974,13 +967,12 @@ fun VideoPlayerStage(
                         )
                     }
                 }
-            } else if (activeDisplayMode.shouldShowClassic) {
+            } else if (displayMode == CaptionDisplayMode.CLASSIC || displayMode == CaptionDisplayMode.BOTH) {
                 ClassicSubtitleBar(
                     placedBalloons = placedBalloons,
                     translationMode = project.translationMode,
                     style = project.styleSettings,
                     onTapEvent = onTapBalloon,
-                    currentTimeMs = currentTimeMs,
                     modifier = Modifier.align(Alignment.BottomCenter),
                 )
             }
@@ -1175,7 +1167,6 @@ fun VideoPlayerStage(
                                 onDirectMediaUrl = onScoutWebStreamDirectMediaUrl,
                                 onSniffedMediaStream = onWebStreamSniffedMediaStream,
                                 onCapturedAudioSlice = onScoutWebStreamAudioSlice,
-                                onCaptureDiagnostics = onScoutCaptureDiagnostics,
                                 navCommand = scoutWebNavCommand,
                                 onNavigationStateChange = onScoutWebNavChanged,
                                 sessionHolder = scoutSessionHolder,
@@ -1255,7 +1246,6 @@ fun VideoPlayerStage(
                 bufferedWindows = scoutCompletedWindows,
                 totalWindows = scoutTotalWindows,
                 requiredOpeningWindows = requiredOpeningWindows,
-                currentTimeMs = currentTimeMs,
                 readinessSnapshot = readinessSnapshot,
                 onRetryBuffering = onRetryBuffering,
                 onOpenAttachCaptions = onOpenAttachCaptions,
@@ -1356,7 +1346,6 @@ fun VideoPlayerStage(
                 FloatingQuickSpeakerPicker(
                     event = pickerEvent,
                     speakers = project.speakers,
-                    currentTimeMs = currentTimeMs,
                     anchorBottom = bubbleInUpperHalf,
                     onAssignSpeaker = { spkId, applyAll ->
                         val scoped = onQuickAssignSpeakerScoped
@@ -1396,7 +1385,6 @@ fun VideoPlayerStage(
 private fun FloatingQuickSpeakerPicker(
     event: com.example.data.model.DialogueEvent,
     speakers: List<com.example.data.model.Speaker>,
-    currentTimeMs: Long,
     anchorBottom: Boolean,
     onAssignSpeaker: (String, Boolean) -> Unit,
     onNameSpeaker: (String?, String) -> Unit,
@@ -1414,11 +1402,7 @@ private fun FloatingQuickSpeakerPicker(
     var applyToAllLines by remember(event.id) { mutableStateOf(false) }
     var draftName by remember(event.id) {
         mutableStateOf(
-            if (currentSpeaker != null && currentSpeaker.hasVisibleCharacterNameAt(currentTimeMs)) {
-                currentSpeaker.visibleDisplayNameAt(currentTimeMs)
-            } else {
-                ""
-            }
+            if (currentSpeaker != null && currentSpeaker.isConfirmedCharacter) currentSpeaker.displayName else ""
         )
     }
 
@@ -1454,7 +1438,7 @@ private fun FloatingQuickSpeakerPicker(
                         text = if (isCurrentUnknown) {
                             "Who said this?"
                         } else {
-                            "Speaker · ${currentSpeaker?.visibleDisplayNameAt(currentTimeMs) ?: "Unassigned"}"
+                            "Speaker · ${currentSpeaker?.displayName ?: "Unassigned"}"
                         },
                         style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
                         color = if (isCurrentUnknown) LensAmber else LensSky,
@@ -1470,14 +1454,14 @@ private fun FloatingQuickSpeakerPicker(
                     IconButton(
                         onClick = onDismiss,
                         modifier = Modifier
-                            .size(48.dp)
+                            .size(36.dp)
                             .testTag("quick_picker_close_button"),
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Close,
                             contentDescription = "Close speaker picker and resume",
                             tint = Color.White.copy(alpha = 0.78f),
-                            modifier = Modifier.size(18.dp),
+                            modifier = Modifier.size(16.dp),
                         )
                     }
                 }
@@ -1503,7 +1487,7 @@ private fun FloatingQuickSpeakerPicker(
                             onClick = { applyToAllLines = true },
                             label = {
                                 Text(
-                                    "All lines by ${currentSpeaker.visibleDisplayNameAt(currentTimeMs).take(14)}",
+                                    "All lines by ${currentSpeaker.displayName.take(14)}",
                                     fontSize = 11.sp,
                                     maxLines = 1,
                                 )
@@ -1526,14 +1510,13 @@ private fun FloatingQuickSpeakerPicker(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     speakers.forEach { spk ->
-                        val visibleName = spk.visibleDisplayNameAt(currentTimeMs)
                         val confirmed = spk.isConfirmedCharacter
                         val chipAccent = if (confirmed) {
                             SpeakerAccentPalette[spk.accentIndex % SpeakerAccentPalette.size]
                         } else {
                             UnknownSpeakerGray
                         }
-                        val initials = visibleName
+                        val initials = spk.displayName
                             .split(" ")
                             .filter { it.isNotBlank() }
                             .take(2)
@@ -1545,7 +1528,7 @@ private fun FloatingQuickSpeakerPicker(
                             onClick = { onAssignSpeaker(spk.id, applyToAllLines) },
                             label = {
                                 Text(
-                                    text = visibleName,
+                                    text = spk.displayName,
                                     fontSize = 11.5.sp,
                                     maxLines = 1,
                                 )

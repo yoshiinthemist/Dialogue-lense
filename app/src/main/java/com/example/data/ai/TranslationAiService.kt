@@ -53,9 +53,6 @@ data class AiTranscribedCue(
     val anchorY: Float? = null,
     val deadSpaceZone: DeadSpaceZone = DeadSpaceZone.AUTO,
     val avoidBoxes: List<NormalizedRect> = emptyList(),
-    val rawStartSec: Double? = null,
-    val rawEndSec: Double? = null,
-    val appliedClockOffsetMs: Long = 0L,
 )
 
 data class AiCastSlotAssignment(
@@ -92,7 +89,6 @@ data class AiYouTubeTranscriptionResult(
 
 data class AiAudioTranscriptionResult(
     val cues: List<AiTranscribedCue> = emptyList(),
-    val speakerUpdates: List<AiCastSlotAssignment> = emptyList(),
     val outcome: TranscriptionOutcome = if (cues.isNotEmpty()) {
         TranscriptionOutcome.DIALOGUE_DETECTED
     } else {
@@ -113,13 +109,13 @@ class TranslationAiService {
                     description = "Speaker slot (A-L) matching session roster"
                 ),
                 "displayName" to Schema.string(
-                    description = "Inferred real name when spoken/shown/implied, OR crisp 1-3 word contextual role (max 24 chars, e.g., 'Co-Host', 'Guest', 'Panelist', 'Interviewer', 'Caller'). Never output 'Speaker A/B/C' or 'Unknown'."
+                    description = "Real name when spoken/shown/implied, OR concise 1-3 word role (max 22 chars, e.g., 'Scooter Driver', 'Radio Host', 'News Anchor')"
                 ),
                 "isRolePlaceholder" to Schema.boolean(
-                    description = "True if descriptive contextual role or unconfirmed inference, false ONLY if confirmed real character/person name"
+                    description = "True if descriptive role/unconfirmed appearance, false if confirmed real character/person name"
                 ),
                 "isVisuallyConfirmed" to Schema.boolean(
-                    description = "True when the speaker's real name is visibly shown on a lower-third/chyron/title card, explicitly spoken/addressed in dialogue, or unmistakably visually confirmed on camera; false when contextual role or unconfirmed inference."
+                    description = "True ONLY when the speaker's real name is visibly shown on a lower-third/chyron/title card, explicitly spoken/addressed in dialogue, or unmistakably visually confirmed on camera. NEVER guess from video title alone; set false if unconfirmed so the speaker stays dotted gray until confirmed."
                 ),
                 "rationale" to Schema.string(
                     description = "Brief 3-8 word reason from on-screen visuals, chyron, or spoken dialogue clues"
@@ -129,7 +125,7 @@ class TranslationAiService {
                 ),
             ),
         ),
-        description = "Cast names or contextual roles for EVERY active speaker in this segment (A-L), including second/third speakers and newly entering voices, plus real-name upgrades when visually confirmed"
+        description = "Newly spotted speakers (isVisuallyConfirmed=false until name is proven on screen/audio) or mid-video real-name visual confirmations"
     )
 
     private val translationResponseSchema = Schema.obj(
@@ -199,7 +195,7 @@ class TranslationAiService {
                             description = "Dialogue or ambient sound classification"
                         ),
                         "speakerSlot" to Schema.enumeration(
-                            values = listOf("A", "B", "C", "D", "E", "F", "G", "H", "UNCERTAIN"),
+                            values = listOf("A", "B", "C", "D", "UNCERTAIN"),
                             description = "Consistent speaker label across lines in this clip"
                         ),
                         "contextReason" to Schema.string(description = "Short 4-8 word acoustic/context clue"),
@@ -207,8 +203,7 @@ class TranslationAiService {
                     ),
                 ),
                 description = "Chronological timed speech & SFX cues extracted from the audio"
-            ),
-            "speakerUpdates" to speakerUpdatesProperty,
+            )
         )
     )
 
@@ -548,8 +543,8 @@ class TranslationAiService {
                     knownSpeakers.take(12).forEachIndexed { idx, spk ->
                         val slot = ('A' + idx).toString()
                         val tag = when {
-                            !spk.hasDistinctCharacterName -> " [NEEDS NAME — emit inferred real name or crisp contextual role in speakerUpdates]"
-                            spk.isRolePlaceholder -> " [contextual role — KEEP or UPGRADE with isVisuallyConfirmed=true if real name is visibly shown or spoken]"
+                            !spk.isConfirmedCharacter -> " [UNCONFIRMED dotted gray — set isVisuallyConfirmed=true ONLY when real name is visibly shown or spoken for this exact person]"
+                            spk.isRolePlaceholder -> " [placeholder role — UPGRADE with isVisuallyConfirmed=true if real name is visibly shown or spoken]"
                             else -> " [CONFIRMED]"
                         }
                         val notes = if (spk.visualVoiceNotes.isNotBlank()) " · ${spk.visualVoiceNotes}" else ""
@@ -596,7 +591,7 @@ class TranslationAiService {
                 appendLine("2. Break speech into crisp, compact 1-2 line speech-balloon cues (ideally 6-14 words, 1.4s to 4.0s each) matching exact speech timing with no missing stretches.")
                 appendLine("3. STRICT SPEAKER CONSISTENCY: Match each line to speakerSlot (A-L) by face/lip movement and voice timbre. NEVER assign a new person (such as someone in an embedded news/podcast/video clip) to a slot already occupied by a different person! Either assign them the next unused slot letter (up to L) and register them in speakerUpdates, OR output speakerSlot=UNCERTAIN if they only speak briefly or all 12 slots are taken.")
                 appendLine("4. ACCURATE LIPS/MOUTH POSITION & DEAD SPACE: Report the speaking person's actual LIPS/MOUTH center via speakerPosition AND anchorX (0.12..0.88) and anchorY (typically 0.18..0.38 in seated panel/medium shots; NEVER report chest/suit/tie coordinates below the chin) ONLY when you visually confirm THAT person's lips are moving in sync with those words. Also set deadSpaceZone to the cleanest unobstructed background pocket (empty wall/margin/upper corner) that avoids ALL faces, hair/foreheads, hands, and on-screen graphics, and populate avoidBoxes with bounding boxes for ALL visible heads/faces (speaker + bystanders) and lower-third chyrons/text banners so bubbles never clip anyone.")
-                appendLine("5. COMPLETE MULTI-SPEAKER NAMING (ALL SPEAKERS A-L!): Always emit a speakerUpdates entry for EVERY active speaker slot in this window (not just Speaker A!). When an on-screen lower-third/chyron/title card or explicit spoken introduction confirms their real name, set isVisuallyConfirmed=true, isRolePlaceholder=false, and displayName to that real name. When a second, third, or later speaker has NOT yet shown a name card, still supply either an inferred name from context/dialogue or a crisp 1-3 word contextual role (e.g., 'Co-Host', 'Guest', 'Panelist', 'Interviewer', 'Caller') with isRolePlaceholder=true, isVisuallyConfirmed=false, and concise appearance/voice notes in visualVoiceNotes — NEVER leave later speakers unnamed as 'Speaker B' or 'Speaker C'!")
+                appendLine("5. STRICT VISUAL CONFIRMATION (NO MISATTRIBUTIONS!): In speakerUpdates, set isVisuallyConfirmed=true and isRolePlaceholder=false ONLY when you have DIRECT in-video proof of that specific person's real name (an on-screen lower-third/chyron/title card, explicit spoken introduction/address like 'Welcome Michael' or 'I'm Roy', or unmistakable visual match). NEVER guess or stamp a celebrity name from the video title onto a panelist/host who is NOT that person! Until visually confirmed, set isVisuallyConfirmed=false, isRolePlaceholder=true, give a brief appearance/role note in visualVoiceNotes (e.g. 'Man in brown blazer, right seat') so the app keeps them dotted gray until visually confirmed in this or a later window.")
                 appendLine("6. Mark non-speech sound/music cues (e.g. '[applause]', '[♪ upbeat synth music]') with dialogueType=SOUND_DESCRIPTION and speakerSlot=UNCERTAIN.")
                 appendLine("7. CUTAWAY & REACTION-SHOT CONTINUITY (CRITICAL!): Whenever the camera shows a host or panelist LISTENING SILENTLY, smiling, nodding, or holding cards while a DIFFERENT person's voice speaks off-screen (or during B-roll), NEVER output dialogueType=SPOKEN or point anchorX/anchorY at the silent listener! SPLIT at the exact cut timestamp, KEEP the actual voice's speakerSlot, and tag the cutaway portion as OFF_SCREEN_LEFT, OFF_SCREEN_RIGHT, or OFF_SCREEN_BEHIND.")
                 appendLine("8. ONLY if there is genuinely zero audible speech or meaningful sound anywhere in ${windowStartSec}s–${windowEndSec}s, return an empty cues array AND set noSpeechConfirmed=true. Otherwise set noSpeechConfirmed=false.")
@@ -651,7 +646,7 @@ class TranslationAiService {
             val sampleText = transcriptSample.take(16).joinToString("\n") { evt ->
                 "  [${evt.startTimeMs / 1000}s] (${evt.speakerId ?: "?"}) ${evt.sourceText}"
             }
-            val slotHints = speakers.take(8).mapIndexed { idx, spk ->
+            val slotHints = speakers.take(4).mapIndexed { idx, spk ->
                 "Slot ${('A' + idx)}: current=\"${spk.displayName}\", locked=${spk.isLocked}"
             }.joinToString("\n")
 
@@ -699,7 +694,7 @@ class TranslationAiService {
             }
 
             val extractionPrompt = buildString {
-                appendLine("Map slots A through H to speaker names inspired by movie cast credits.")
+                appendLine("Map slots A, B, C, D to speaker names inspired by movie cast credits.")
                 if (title.isNotBlank()) appendLine("Video Title: $title")
                 if (channelName.isNotBlank()) appendLine("Channel/Creator: $channelName")
                 if (description.isNotBlank()) appendLine("Description: ${description.take(600)}")
@@ -718,7 +713,7 @@ class TranslationAiService {
                 appendLine("Rules:")
                 appendLine("1. If a real name/channel host/character name is confidently known from title, metadata, search, dialogue intro ('I'm Maya'), or nameplate visible in a frame, use that concise name (1-3 words max) and set isRolePlaceholder=false.")
                 appendLine("2. If the speaker is unnamed or incidental, take inspiration from movie cast credits and assign a crisp descriptive role such as 'Host', 'Hot Dog Vendor', 'Civilian Woman 1', 'Interviewer', 'Security Guard', 'Caller' and set isRolePlaceholder=true.")
-                appendLine("3. Never output 'Speaker A', 'Speaker B', or 'Unknown'. Always give EVERY active slot (A-H) either a real name or a movie-credit role.")
+                appendLine("3. Never output 'Speaker A', 'Speaker B', or 'Unknown'. Always give each active slot either a real name or a movie-credit role.")
             }
             val extractionContent = content {
                 shotKeyframes.take(3).forEach { (shotId, bmp) ->
@@ -741,23 +736,19 @@ class TranslationAiService {
             val root = JSONObject(rawJson)
             val summary = root.optString("summary", "").trim()
             val arr = root.optJSONArray("assignments")
-            val validDiscoverySlots = setOf("A", "B", "C", "D", "E", "F", "G", "H")
             val assignments = buildList {
                 if (arr != null) {
                     for (i in 0 until arr.length()) {
                         val obj = arr.getJSONObject(i)
-                        val slot = obj.optString("slot", "").trim().uppercase()
+                        val slot = obj.optString("slot", "").trim()
                         val displayName = obj.optString("displayName", "").trim()
-                        if (slot in validDiscoverySlots && displayName.isNotBlank()) {
-                            val isRole = obj.optBoolean("isRolePlaceholder", false)
+                        if (slot in listOf("A", "B", "C", "D") && displayName.isNotBlank()) {
                             add(
                                 AiCastSlotAssignment(
                                     slot = slot,
                                     displayName = displayName.take(28),
-                                    isRolePlaceholder = isRole,
+                                    isRolePlaceholder = obj.optBoolean("isRolePlaceholder", false),
                                     rationale = obj.optString("rationale", "").trim(),
-                                    visualVoiceNotes = obj.optString("visualVoiceNotes", "").trim(),
-                                    isVisuallyConfirmed = !isRole,
                                 )
                             )
                         }
@@ -846,8 +837,7 @@ class TranslationAiService {
                 - Keep naturalTranslation concise and evocative for Deaf/hard-of-hearing cinema viewers reading inside spatial speech balloons.
                 - Use SOUND_DESCRIPTION for impactful ambient SFX, music shifts, and emotional vocal non-speech sounds (e.g. "[rain patters softly]", "[♪ tense strings swell]", "[door slams]", "[sighs quietly]") so viewers feel the sonic atmosphere.
                 - Prefix softly murmured lines with calm natural wording and flag clear off-screen voices as OFF_SCREEN_BEHIND.
-                - Assign consistent speakerSlot (A-H) by vocal timbre & turn-taking. Preserve legitimate repeated phrases at distinct timestamps.
-                - In speakerUpdates, emit an inferred name or crisp 1-3 word contextual role (e.g. 'Host', 'Guest', 'Co-Host', 'Interviewer', 'Caller') for EVERY active speaker slot (A-H), never 'Speaker A' or 'Speaker B'.
+                - Assign consistent speakerSlot (A/B/C/D) by vocal timbre & turn-taking. Preserve legitimate repeated phrases at distinct timestamps.
                 - ONLY set noSpeechConfirmed=true if the entire audio clip genuinely contains zero audible speech or meaningful sound. Otherwise set noSpeechConfirmed=false.
                 - Include a brief culturalNote only if there is an idiom, honorific nuance, or slang worth noting.
             """.trimIndent()
@@ -1413,9 +1403,6 @@ class TranslationAiService {
                         anchorY = resolvedY,
                         deadSpaceZone = resolvedDeadSpace,
                         avoidBoxes = parsedAvoidBoxes,
-                        rawStartSec = rawStartSec,
-                        rawEndSec = safeRawEndSec,
-                        appliedClockOffsetMs = (timestampOffsetSec * 1000.0).toLong(),
                     )
                 )
             }
@@ -1462,10 +1449,8 @@ class TranslationAiService {
                     diagnosticNote = "Malformed audio transcript JSON",
                 )
             val noSpeechConfirmed = root.jsonBoolean("noSpeechConfirmed", false)
-            val speakerUpdates = parseSpeakerUpdatesStatic(root)
             val cuesList = root.jsonList("cues")
                 ?: return AiAudioTranscriptionResult(
-                    speakerUpdates = speakerUpdates,
                     outcome = TranscriptionOutcome.INVALID_AI_RESPONSE,
                     diagnosticNote = "Missing cues array in audio transcript JSON",
                 )
@@ -1520,9 +1505,6 @@ class TranslationAiService {
                             suggestedSpeakerSlot = obj.jsonString("speakerSlot", "UNCERTAIN"),
                             contextReason = obj.jsonString("contextReason", ""),
                             culturalNote = obj.jsonString("culturalNote", ""),
-                            rawStartSec = startOffsetSec,
-                            rawEndSec = safeEndOffset,
-                            appliedClockOffsetMs = chunkStartMs,
                         )
                     )
                 }
@@ -1537,7 +1519,6 @@ class TranslationAiService {
             }
             return AiAudioTranscriptionResult(
                 cues = parsed,
-                speakerUpdates = speakerUpdates,
                 outcome = outcome,
                 noSpeechConfirmed = noSpeechConfirmed && parsed.isEmpty(),
                 invalidCueCount = invalidCueCount,

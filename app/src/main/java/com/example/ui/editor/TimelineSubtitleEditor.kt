@@ -1938,36 +1938,6 @@ private fun StudioDiagnosticsTab(
                             else -> "Active (${sentinelSnapshot.chapterPatrolRecords.size} chapters)"
                         },
                     )
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 4.dp)
-                            .testTag("sentinel_timestamp_audit"),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Text(
-                            text = "Scout 1 → 2 Timestamp Audit",
-                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                            color = LensSky,
-                        )
-                        DiagnosticMetricRow(
-                            "Latest Scout 1 report",
-                            sentinelSnapshot.latestScout1ReportSummary.ifBlank { "Awaiting first Scout 1 timestamp report" },
-                        )
-                        DiagnosticMetricRow(
-                            "Verified / snapped",
-                            "${sentinelSnapshot.totalTimestampsVerified} ok · ${sentinelSnapshot.totalTimestampsAdjusted} snapped",
-                        )
-                        sentinelSnapshot.recentTimestampAdjustments.takeLast(4).asReversed().forEach { adj ->
-                            Text(
-                                text = "${SubtitleParser.formatCompactTime(adj.scout1StartMs)} → ${SubtitleParser.formatCompactTime(adj.adjustedStartMs)} (${adj.reason})",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                    }
                     if (sentinelSnapshot.chapterPatrolRecords.isNotEmpty()) {
                         sentinelSnapshot.chapterPatrolRecords.take(6).forEach { entry ->
                             Row(

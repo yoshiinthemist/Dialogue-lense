@@ -73,7 +73,6 @@ import com.example.data.model.ProcessingQualityMode
 import com.example.data.model.SubtitleSourceKind
 import com.example.data.model.TranslationMode
 import com.example.data.subtitle.SubtitleParser
-import com.example.domain.media.MediaActivationDecision
 import com.example.domain.media.MediaProviderKind
 import com.example.domain.media.MediaSourceAdapterRegistry
 import com.example.ui.player.formatBeaconTimestamp
@@ -206,11 +205,15 @@ fun StartLauncherScreen(
         }
     }
 
-    val activationDecision = remember(urlInput) { MediaSourceAdapterRegistry.default.resolveForActivation(urlInput) }
     val resolvedMedia = remember(urlInput) { MediaSourceAdapterRegistry.default.resolveInput(urlInput) }
-    val extractedYoutubeId = (activationDecision as? MediaActivationDecision.YouTube)?.videoId
-    val isDrmRestricted = activationDecision is MediaActivationDecision.Rejected && activationDecision.isDrm
-    val isUrlReady = activationDecision !is MediaActivationDecision.Rejected
+    val extractedYoutubeId = remember(resolvedMedia, urlInput) {
+        resolvedMedia?.youtubeVideoId?.takeIf { it.isNotBlank() } ?: extractYouTubeId(urlInput)
+    }
+    val normalizedWebUrl = remember(resolvedMedia, urlInput) {
+        resolvedMedia?.normalizedUri?.takeIf { resolvedMedia.isSupported } ?: normalizeWebStreamUrl(urlInput)
+    }
+    val isDrmRestricted = resolvedMedia?.capabilities?.isDrmRestricted == true
+    val isUrlReady = !isDrmRestricted && (resolvedMedia?.isSupported == true || extractedYoutubeId != null || normalizedWebUrl != null)
 
     val contentBlock: @Composable (Modifier) -> Unit = { containerModifier ->
         Box(
@@ -394,11 +397,11 @@ fun StartLauncherScreen(
                         Button(
                             enabled = isUrlReady,
                             onClick = {
-                                when (activationDecision) {
-                                    is MediaActivationDecision.YouTube -> {
+                                when (resolvedMedia?.providerKind) {
+                                    MediaProviderKind.YOUTUBE_EMBED -> {
                                         onStartYouTubeProject(
-                                            activationDecision.normalizedUrl,
-                                            activationDecision.videoId,
+                                            resolvedMedia.normalizedUri,
+                                            resolvedMedia.youtubeVideoId,
                                             selectedSubtitleUri,
                                             selectedSubtitleName,
                                             sourceLanguage,
@@ -407,9 +410,9 @@ fun StartLauncherScreen(
                                             pastedTranscriptInput,
                                         )
                                     }
-                                    is MediaActivationDecision.DirectStream -> {
+                                    MediaProviderKind.DIRECT_MEDIA_URL -> {
                                         onStartDirectMediaUrl(
-                                            activationDecision.normalizedUrl,
+                                            resolvedMedia.normalizedUri,
                                             selectedSubtitleUri,
                                             selectedSubtitleName,
                                             sourceLanguage,
@@ -418,34 +421,30 @@ fun StartLauncherScreen(
                                             pastedTranscriptInput,
                                         )
                                     }
-                                    is MediaActivationDecision.WebStream -> {
-                                        onStartWebStreamProject(
-                                            activationDecision.normalizedUrl,
-                                            selectedSubtitleUri,
-                                            selectedSubtitleName,
-                                            sourceLanguage,
-                                            targetLanguage,
-                                            translationMode,
-                                            pastedTranscriptInput,
-                                        )
+                                    else -> {
+                                        if (extractedYoutubeId != null) {
+                                            onStartYouTubeProject(
+                                                urlInput,
+                                                extractedYoutubeId,
+                                                selectedSubtitleUri,
+                                                selectedSubtitleName,
+                                                sourceLanguage,
+                                                targetLanguage,
+                                                translationMode,
+                                                pastedTranscriptInput,
+                                            )
+                                        } else if (normalizedWebUrl != null) {
+                                            onStartWebStreamProject(
+                                                normalizedWebUrl,
+                                                selectedSubtitleUri,
+                                                selectedSubtitleName,
+                                                sourceLanguage,
+                                                targetLanguage,
+                                                translationMode,
+                                                pastedTranscriptInput,
+                                            )
+                                        }
                                     }
-                                    is MediaActivationDecision.LocalFile -> {
-                                        onStartLocalProject(
-                                            Uri.parse(activationDecision.normalizedUri),
-                                            activationDecision.resolved.suggestedTitle.ifBlank { "Local Video" },
-                                            selectedSubtitleUri,
-                                            selectedSubtitleName,
-                                            sourceLanguage,
-                                            targetLanguage,
-                                            translationMode,
-                                            if (selectedSubtitleUri != null) SubtitleSourceKind.UPLOADED_FILE else SubtitleSourceKind.AI_DRAFT,
-                                            ProcessingQualityMode.BALANCED,
-                                        )
-                                    }
-                                    is MediaActivationDecision.Demo -> {
-                                        onLoadDemoScenario()
-                                    }
-                                    is MediaActivationDecision.Rejected -> Unit
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(

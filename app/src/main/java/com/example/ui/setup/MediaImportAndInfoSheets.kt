@@ -59,7 +59,6 @@ import com.example.data.model.ProcessingQualityMode
 import com.example.data.model.SubtitleSourceKind
 import com.example.data.model.TranslationMode
 import com.example.data.model.VideoSourceKind
-import com.example.domain.media.MediaActivationDecision
 import com.example.domain.media.MediaProviderKind
 import com.example.domain.media.MediaSourceAdapterRegistry
 import com.example.ui.theme.CinemaElevated
@@ -153,17 +152,14 @@ fun MediaImportSheet(
         }
     }
 
-    val activationDecision = remember(youtubeUrlInput) {
-        MediaSourceAdapterRegistry.default.resolveForActivation(youtubeUrlInput)
-    }
     val resolvedMedia = remember(youtubeUrlInput) {
         MediaSourceAdapterRegistry.default.resolveInput(youtubeUrlInput)
     }
-    val extractedYoutubeId = (activationDecision as? MediaActivationDecision.YouTube)?.videoId
-    val normalizedWebUrl = when (activationDecision) {
-        is MediaActivationDecision.DirectStream -> activationDecision.normalizedUrl
-        is MediaActivationDecision.WebStream -> activationDecision.normalizedUrl
-        else -> null
+    val extractedYoutubeId = resolvedMedia?.youtubeVideoId
+        ?: remember(youtubeUrlInput) { extractYouTubeId(youtubeUrlInput) }
+    val normalizedWebUrl = remember(youtubeUrlInput, resolvedMedia) {
+        resolvedMedia?.normalizedUri?.takeIf { it.startsWith("http", ignoreCase = true) }
+            ?: normalizeWebStreamUrl(youtubeUrlInput)
     }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
@@ -289,14 +285,13 @@ fun MediaImportSheet(
             }
 
             if (youtubeUrlInput.isNotBlank()) {
-                val isDrmBlocked = activationDecision is MediaActivationDecision.Rejected && activationDecision.isDrm
-                val isDirectStream = activationDecision is MediaActivationDecision.DirectStream
-                val isGenericWeb = activationDecision is MediaActivationDecision.WebStream
+                val isDrmBlocked = resolvedMedia?.providerKind == MediaProviderKind.UNSUPPORTED_DRM_PLATFORM
+                val isDirectStream = resolvedMedia?.providerKind == MediaProviderKind.DIRECT_MEDIA_URL
+                val isGenericWeb = extractedYoutubeId == null && normalizedWebUrl != null && !isDrmBlocked
                 val accentColor = when {
                     isDrmBlocked -> MaterialTheme.colorScheme.error
                     isDirectStream -> LensMint
                     isGenericWeb -> LensSky
-                    extractedYoutubeId != null -> LensSky
                     else -> LensAmber
                 }
                 Surface(
@@ -322,16 +317,11 @@ fun MediaImportSheet(
                                 modifier = Modifier.size(16.dp),
                             )
                             Text(
-                                text = when (activationDecision) {
-                                    is MediaActivationDecision.Rejected ->
-                                        if (activationDecision.isDrm) {
-                                            "${activationDecision.providerName.ifBlank { "DRM Service" }} · Not Supported"
-                                        } else {
-                                            "Enter a valid YouTube, direct media, or https:// web link"
-                                        }
-                                    is MediaActivationDecision.YouTube -> "YouTube Video ID: ${activationDecision.videoId}"
-                                    is MediaActivationDecision.DirectStream -> "Direct Media Stream (Native Player)"
-                                    is MediaActivationDecision.WebStream -> "HTML5 Web Embed Ready"
+                                text = when {
+                                    isDrmBlocked -> "${resolvedMedia?.providerName ?: "DRM Service"} · Not Supported"
+                                    extractedYoutubeId != null -> "YouTube Video ID: $extractedYoutubeId"
+                                    isDirectStream -> "Direct Media Stream (Native Player)"
+                                    normalizedWebUrl != null -> "HTML5 Web Embed Ready"
                                     else -> "Enter a valid YouTube, direct media, or https:// web link"
                                 },
                                 style = MaterialTheme.typography.labelMedium,
@@ -341,9 +331,9 @@ fun MediaImportSheet(
                         Text(
                             text = when {
                                 isDrmBlocked ->
-                                    (activationDecision as MediaActivationDecision.Rejected).reason.ifBlank {
+                                    resolvedMedia?.userNotice?.ifBlank {
                                         "This service uses DRM protection. DialogueLens respects DRM and cannot read or play protected streams."
-                                    }
+                                    } ?: "DRM-protected streams are not supported."
                                 extractedYoutubeId != null ->
                                     "Plays via YouTube's official embedded IFrame player. Attach SRT/VTT or paste transcript below for spatial balloons (creators can restrict embedding on specific uploads)."
                                 isDirectStream ->
@@ -355,9 +345,7 @@ fun MediaImportSheet(
                                         "Opens in Web Cinema: captures available HTML5 captions and overlays speaker-aware bubbles. Cross-origin sites may limit audio extraction."
                                     } ?: "HTML5 web playback ready."
                                 else ->
-                                    (activationDecision as? MediaActivationDecision.Rejected)?.reason?.ifBlank {
-                                        "Paste a full http:// or https:// web video link, direct .mp4/.m3u8 URL, YouTube URL, or pick a local video."
-                                    } ?: "Paste a full http:// or https:// web video link, direct .mp4/.m3u8 URL, YouTube URL, or pick a local video."
+                                    "Paste a full http:// or https:// web video link, direct .mp4/.m3u8 URL, YouTube URL, or pick a local video."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -373,7 +361,7 @@ fun MediaImportSheet(
                                     .testTag("youtube_paste_transcript_input"),
                             )
                         }
-                        if (activationDecision is MediaActivationDecision.YouTube) {
+                        if (!isDrmBlocked && extractedYoutubeId != null) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -382,8 +370,8 @@ fun MediaImportSheet(
                                 Button(
                                     onClick = {
                                         onStartYouTubeProject(
-                                            activationDecision.normalizedUrl,
-                                            activationDecision.videoId,
+                                            youtubeUrlInput,
+                                            extractedYoutubeId,
                                             selectedSubtitleUri,
                                             selectedSubtitleName,
                                             sourceLanguage,
@@ -401,7 +389,7 @@ fun MediaImportSheet(
                                     onClick = {
                                         val intent = Intent(
                                             Intent.ACTION_VIEW,
-                                            Uri.parse("https://www.youtube.com/watch?v=${activationDecision.videoId}")
+                                            Uri.parse("https://www.youtube.com/watch?v=$extractedYoutubeId")
                                         )
                                         context.startActivity(intent)
                                     }
@@ -771,13 +759,31 @@ fun ProjectAndPrivacySheet(
     }
 }
 
-internal fun extractYouTubeId(url: String): String? =
-    MediaSourceAdapterRegistry.default.extractValidYouTubeId(url)
+internal fun extractYouTubeId(url: String): String? {
+    val trimmed = url.trim()
+    if (trimmed.isEmpty()) return null
+    val patterns = listOf(
+        Regex("""(?:v=|/)([0-9A-Za-z_-]{11})(?:[?&/#]|$)"""),
+        Regex("""youtu\.be/([0-9A-Za-z_-]{11})"""),
+        Regex("""shorts/([0-9A-Za-z_-]{11})"""),
+        Regex("""live/([0-9A-Za-z_-]{11})"""),
+    )
+    return patterns.firstNotNullOfOrNull { it.find(trimmed)?.groupValues?.getOrNull(1) }
+}
 
 internal fun normalizeWebStreamUrl(raw: String): String? {
-    return when (val decision = MediaSourceAdapterRegistry.default.resolveForActivation(raw)) {
-        is MediaActivationDecision.DirectStream -> decision.normalizedUrl
-        is MediaActivationDecision.WebStream -> decision.normalizedUrl
-        else -> null
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return null
+    val candidate = if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
+        trimmed
+    } else if (trimmed.contains('.') && !trimmed.contains(' ')) {
+        "https://$trimmed"
+    } else {
+        return null
+    }
+    return if (Regex("""^https?://[A-Za-z0-9.-]+\.[A-Za-z]{2,}.*$""").matches(candidate)) {
+        candidate
+    } else {
+        null
     }
 }

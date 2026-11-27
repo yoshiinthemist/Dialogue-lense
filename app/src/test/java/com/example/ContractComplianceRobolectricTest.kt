@@ -149,11 +149,8 @@ class ContractComplianceRobolectricTest {
         }
         assertTrue(vm.uiState.value.youtubeCapabilities.hasProgrammaticCaptions)
         vm.seekTo(11_000L)
-        assertNotEquals("seekTo must not self-acknowledge currentTimeMs before player feedback", 11_000L, vm.uiState.value.currentTimeMs)
-        vm.onYouTubePlaybackState(positionMs = 11_000L, durationMs = 120_000L, isPlaying = false)
         assertEquals(YouTubeNativeCcState.ENABLED_ACTIVE_CUES, vm.uiState.value.youtubeNativeCcState)
         vm.seekTo(50_000L)
-        vm.onYouTubePlaybackState(positionMs = 50_000L, durationMs = 120_000L, isPlaying = false)
         assertEquals(YouTubeNativeCcState.ENABLED_NO_CURRENT_CUE, vm.uiState.value.youtubeNativeCcState)
     }
 

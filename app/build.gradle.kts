@@ -16,8 +16,8 @@ android {
     applicationId = "com.aistudio.dialoguelens.vkpzmx"
     minSdk = 24
     targetSdk = 36
-    versionCode = 36
-    versionName = "36.0"
+    versionCode = 34
+    versionName = "34.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

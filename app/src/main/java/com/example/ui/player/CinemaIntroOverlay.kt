@@ -77,16 +77,13 @@ fun CinemaIntroOverlay(
     bufferedWindows: Int = 0,
     totalWindows: Int = 0,
     requiredOpeningWindows: Int = 1,
-    currentTimeMs: Long = 0L,
     readinessSnapshot: PlaybackReadinessSnapshot? = null,
     onRetryBuffering: () -> Unit = {},
     onOpenAttachCaptions: () -> Unit = {},
     onSkipIntro: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val isMediaHardwareError = readinessSnapshot?.diagnostics?.isMediaHardwareError == true
     val isErrorOrTimeout = readinessSnapshot?.state == PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR ||
-        isMediaHardwareError ||
         readinessSnapshot?.waitTimedOut == true
     val isSeekBuffer = readinessSnapshot?.state == PlaybackReadinessState.BUFFERING_FOR_SEEK
     val targetMs = readinessSnapshot?.targetPositionMs ?: 0L
@@ -130,7 +127,7 @@ fun CinemaIntroOverlay(
                     if (isErrorOrTimeout) {
                         Icon(
                             imageVector = Icons.Filled.WarningAmber,
-                            contentDescription = if (isMediaHardwareError) "Video playback error" else "Dialogue preparation attention",
+                            contentDescription = "Dialogue preparation attention",
                             tint = WarmAmber,
                             modifier = Modifier.size(28.dp),
                         )
@@ -145,7 +142,6 @@ fun CinemaIntroOverlay(
 
                     Text(
                         text = when {
-                            isMediaHardwareError -> "Video failed to load"
                             isErrorOrTimeout -> "Dialogue unavailable here"
                             isSeekBuffer -> "Preparing dialogue at ${SubtitleParser.formatCompactTime(targetMs)}"
                             else -> "Preparing dialogue"
@@ -157,9 +153,6 @@ fun CinemaIntroOverlay(
 
                     Text(
                         text = when {
-                            isMediaHardwareError -> readinessSnapshot?.failureReason?.ifBlank {
-                                "The video stream could not be loaded. Check your connection or retry."
-                            } ?: "The video stream could not be loaded. Check your connection or retry."
                             isErrorOrTimeout -> readinessSnapshot?.failureReason?.ifBlank {
                                 "This section could not be prepared in time."
                             } ?: "This section could not be prepared in time."
@@ -171,9 +164,7 @@ fun CinemaIntroOverlay(
                         textAlign = TextAlign.Center,
                     )
 
-                    val displaySpeakers = speakers.filter {
-                        it.isLocked || (it.isIdentityConfirmed && it.hasVisibleCharacterNameAt(currentTimeMs))
-                    }.take(4)
+                    val displaySpeakers = speakers.filter { it.isConfirmedCharacter }.take(4)
                     if (displaySpeakers.isNotEmpty() && !isErrorOrTimeout) {
                         FlowRow(
                             horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
@@ -199,7 +190,7 @@ fun CinemaIntroOverlay(
                                                 .background(chipTint)
                                         )
                                         Text(
-                                            text = spk.visibleDisplayNameAt(currentTimeMs),
+                                            text = spk.displayName,
                                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                             color = InkPrimary,
                                             maxLines = 1,

@@ -39,7 +39,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.material.icons.filled.ChatBubble
-import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
@@ -380,7 +379,6 @@ fun DialogueLensScreen(
             onScoutDirectMediaUrl = viewModel::onScoutWebStreamDirectMediaUrl,
             onScoutSniffedMediaStream = viewModel::onWebStreamSniffedMediaStream,
             onScoutAudioSlice = viewModel::onScoutWebStreamAudioSlice,
-            onScoutCaptureDiagnostics = viewModel::onScoutCaptureDiagnosticsUpdated,
             onScoutNavChanged = viewModel::onScoutWebNavChanged,
             onScoutBack = viewModel::scoutWebGoBack,
             onScoutForward = viewModel::scoutWebGoForward,
@@ -476,10 +474,8 @@ fun DialogueLensScreen(
                 onYouTubePlaybackState = viewModel::onYouTubePlaybackState,
                 onYouTubeCaptionTrackStatus = viewModel::onYouTubeCaptionTrackStatus,
                 onYouTubeEmbedFallback = viewModel::onYouTubeEmbedFallback,
-                onYouTubePlayerError = viewModel::onYouTubePlayerError,
                 onYouTubeTimedTextCaptured = viewModel::onYouTubeTimedTextCaptured,
                 onWebStreamPlaybackState = viewModel::onWebStreamPlaybackState,
-                onStreamPlayCommandResult = viewModel::onStreamPlayCommandResult,
                 onWebStreamCapturedCaptions = viewModel::onWebStreamCapturedCaptions,
                 onWebStreamPageMetadata = viewModel::onWebStreamPageMetadata,
                 viewerWebNavCommand = state.viewerWebNavCommand,
@@ -493,7 +489,6 @@ fun DialogueLensScreen(
                 onScoutWebStreamDirectMediaUrl = viewModel::onScoutWebStreamDirectMediaUrl,
                 onWebStreamSniffedMediaStream = viewModel::onWebStreamSniffedMediaStream,
                 onScoutWebStreamAudioSlice = viewModel::onScoutWebStreamAudioSlice,
-                onScoutCaptureDiagnostics = viewModel::onScoutCaptureDiagnosticsUpdated,
                 onTapBalloon = { eventId -> viewModel.openQuickSpeakerPicker(eventId) },
                 onTapFaceTrack = viewModel::assignActiveDialogueToFaceTrack,
                 onDragBalloonAnchor = viewModel::overrideBalloonAnchor,
@@ -624,18 +619,18 @@ fun DialogueLensScreen(
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
-                            val activeMode = state.displayMode.normalizedPrimaryMode(state.styleSettings.showTail)
+                            val activeMode = state.displayMode.normalizedPrimaryMode()
                             listOf(
-                                Triple(CaptionDisplayMode.BUBBLES_WITH_TAILS, Icons.Filled.ChatBubble, "Bubbles with tails"),
-                                Triple(CaptionDisplayMode.BALLOONS, Icons.Filled.ChatBubbleOutline, "Bubble captions (no tails)"),
-                                Triple(CaptionDisplayMode.CLASSIC, Icons.Filled.Subtitles, "Classic captions"),
-                                Triple(CaptionDisplayMode.OFF, Icons.Filled.SubtitlesOff, "No captions"),
+                                Triple(CaptionDisplayMode.BALLOONS, Icons.Filled.ChatBubble, "Speech bubbles"),
+                                Triple(CaptionDisplayMode.FIXED_ZONES, Icons.Filled.ViewAgenda, "Fixed zones (no tails)"),
+                                Triple(CaptionDisplayMode.CLASSIC, Icons.Filled.Subtitles, "Subtitles"),
+                                Triple(CaptionDisplayMode.OFF, Icons.Filled.SubtitlesOff, "Dialogue off"),
                             ).forEach { (mode, icon, label) ->
                                 val selected = activeMode == mode
                                 IconButton(
                                     onClick = { viewModel.setDisplayMode(mode) },
                                     modifier = Modifier
-                                        .size(48.dp)
+                                        .size(40.dp)
                                         .clip(CircleShape)
                                         .background(if (selected) LensSky else Color.Transparent)
                                         .testTag("theater_mode_${mode.name.lowercase()}"),
@@ -1002,10 +997,8 @@ fun DialogueLensScreen(
                                             onYouTubePlaybackState = viewModel::onYouTubePlaybackState,
                                             onYouTubeCaptionTrackStatus = viewModel::onYouTubeCaptionTrackStatus,
                                             onYouTubeEmbedFallback = viewModel::onYouTubeEmbedFallback,
-                                            onYouTubePlayerError = viewModel::onYouTubePlayerError,
                                             onYouTubeTimedTextCaptured = viewModel::onYouTubeTimedTextCaptured,
                                             onWebStreamPlaybackState = viewModel::onWebStreamPlaybackState,
-                                            onStreamPlayCommandResult = viewModel::onStreamPlayCommandResult,
                                             onWebStreamCapturedCaptions = viewModel::onWebStreamCapturedCaptions,
                                             onWebStreamPageMetadata = viewModel::onWebStreamPageMetadata,
                                             viewerWebNavCommand = state.viewerWebNavCommand,
@@ -1019,7 +1012,6 @@ fun DialogueLensScreen(
                                             onScoutWebStreamDirectMediaUrl = viewModel::onScoutWebStreamDirectMediaUrl,
                                             onWebStreamSniffedMediaStream = viewModel::onWebStreamSniffedMediaStream,
                                             onScoutWebStreamAudioSlice = viewModel::onScoutWebStreamAudioSlice,
-                                            onScoutCaptureDiagnostics = viewModel::onScoutCaptureDiagnosticsUpdated,
                                             onTapBalloon = { eventId -> viewModel.openQuickSpeakerPicker(eventId) },
                                             onTapFaceTrack = viewModel::assignActiveDialogueToFaceTrack,
                                             onDragBalloonAnchor = viewModel::overrideBalloonAnchor,
@@ -1217,10 +1209,8 @@ fun DialogueLensScreen(
                                         onYouTubePlaybackState = viewModel::onYouTubePlaybackState,
                                         onYouTubeCaptionTrackStatus = viewModel::onYouTubeCaptionTrackStatus,
                                         onYouTubeEmbedFallback = viewModel::onYouTubeEmbedFallback,
-                                        onYouTubePlayerError = viewModel::onYouTubePlayerError,
                                         onYouTubeTimedTextCaptured = viewModel::onYouTubeTimedTextCaptured,
                                         onWebStreamPlaybackState = viewModel::onWebStreamPlaybackState,
-                                        onStreamPlayCommandResult = viewModel::onStreamPlayCommandResult,
                                         onWebStreamCapturedCaptions = viewModel::onWebStreamCapturedCaptions,
                                         onWebStreamPageMetadata = viewModel::onWebStreamPageMetadata,
                                         viewerWebNavCommand = state.viewerWebNavCommand,
@@ -1234,7 +1224,6 @@ fun DialogueLensScreen(
                                         onScoutWebStreamDirectMediaUrl = viewModel::onScoutWebStreamDirectMediaUrl,
                                         onWebStreamSniffedMediaStream = viewModel::onWebStreamSniffedMediaStream,
                                         onScoutWebStreamAudioSlice = viewModel::onScoutWebStreamAudioSlice,
-                                        onScoutCaptureDiagnostics = viewModel::onScoutCaptureDiagnosticsUpdated,
                                         onTapBalloon = { eventId -> viewModel.openQuickSpeakerPicker(eventId) },
                                         onTapFaceTrack = viewModel::assignActiveDialogueToFaceTrack,
                                         onDragBalloonAnchor = viewModel::overrideBalloonAnchor,
@@ -1722,7 +1711,7 @@ private fun AmbientNowSpeakingDock(
                                 } else if (isBubbleSpeakerUnknown(activeCue, activeSpeaker)) {
                                     "Unconfirmed · Tap to name"
                                 } else {
-                                    activeSpeaker?.visibleDisplayNameAt(state.currentTimeMs) ?: "Speaker"
+                                    activeSpeaker?.displayName ?: "Speaker"
                                 },
                                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
                                 color = activeAccent,
@@ -1774,7 +1763,7 @@ private fun AmbientNowSpeakingDock(
                                                 .background(accent)
                                         )
                                         Text(
-                                            text = spk.visibleDisplayNameAt(state.currentTimeMs),
+                                            text = spk.displayName,
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurface,
                                             maxLines = 1,

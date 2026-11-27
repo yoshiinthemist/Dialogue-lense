@@ -62,7 +62,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import com.example.data.model.ScoutCaptureDiagnostics
 import com.example.data.subtitle.SubtitleParser
 import com.example.domain.analysis.SniffedWebMediaStream
 import com.example.domain.analysis.WebNavCommand
@@ -380,8 +379,7 @@ fun ScoutBrowserInspectorModal(
     onCapturedCaptions: (String) -> Unit,
     onScoutDirectMediaUrl: (String) -> Unit,
     onScoutSniffedMediaStream: (SniffedWebMediaStream) -> Unit = {},
-    onScoutAudioSlice: (Long, String, String, Long, Boolean) -> Unit,
-    onScoutCaptureDiagnostics: (ScoutCaptureDiagnostics) -> Unit = {},
+    onScoutAudioSlice: (Long, String, String) -> Unit,
     onScoutNavChanged: (WebNavigationState) -> Unit,
     onScoutBack: () -> Unit,
     onScoutForward: () -> Unit,
@@ -560,7 +558,6 @@ fun ScoutBrowserInspectorModal(
                             onDirectMediaUrl = onScoutDirectMediaUrl,
                             onSniffedMediaStream = onScoutSniffedMediaStream,
                             onCapturedAudioSlice = onScoutAudioSlice,
-                            onCaptureDiagnostics = onScoutCaptureDiagnostics,
                             navCommand = scoutNavCommand,
                             onNavigationStateChange = onScoutNavChanged,
                             sessionHolder = scoutSessionHolder,

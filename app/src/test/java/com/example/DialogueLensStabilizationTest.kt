@@ -147,19 +147,17 @@ class DialogueLensStabilizationTest {
     }
 
     @Test
-    fun legacyFixedZonesMigratesToBalloonsAndSharesBodyAnchorWithoutPointerTail() {
-        assertEquals(4, CaptionDisplayMode.primaryModes.size)
-        assertFalse(CaptionDisplayMode.FIXED_ZONES in CaptionDisplayMode.primaryModes)
-        assertFalse(CaptionDisplayMode.BOTH in CaptionDisplayMode.primaryModes)
-        assertEquals(CaptionDisplayMode.BALLOONS, CaptionDisplayMode.FIXED_ZONES.normalizedPrimaryMode())
+    fun fixedZonesModeLocksCalmZonesAndNeverEmitsPointerTail() {
+        assertTrue(CaptionDisplayMode.FIXED_ZONES in CaptionDisplayMode.primaryModes)
+        assertEquals(CaptionDisplayMode.FIXED_ZONES, CaptionDisplayMode.FIXED_ZONES.normalizedPrimaryMode())
 
         val engine = BalloonLayoutEngine()
         val evt1 = DialogueEvent(
             id = "evt_fz_1",
             startTimeMs = 1_000L,
             endTimeMs = 6_000L,
-            sourceText = "First calm bubble line.",
-            translatedText = "First calm bubble line.",
+            sourceText = "First calm fixed-zone line.",
+            translatedText = "First calm fixed-zone line.",
             speakerId = "spk_a",
             speakerConfidence = 0.95f,
             faceTrackId = null,
@@ -186,13 +184,13 @@ class DialogueLensStabilizationTest {
             ),
             sceneEpoch = 1,
             hasLiveVisionSignal = true,
-            displayMode = CaptionDisplayMode.BALLOONS,
+            fixedZoneTaillessMode = true,
         ).single()
 
-        assertNull("BALLOONS (tailless) mode must never attach a pointer tail", first.tailTarget)
+        assertNull("FIXED_ZONES mode must never attach a pointer tail", first.tailTarget)
         assertEquals(TailDirection.NONE, first.tailDirection)
 
-        // Switching to BUBBLES_WITH_TAILS with the same face keeps the committed body anchor and adds a tail
+        // Move the live face all the way across the frame; fixed zone must stay locked and tailless
         val second = engine.computeLayout(
             project = project,
             currentMs = 3_000L,
@@ -200,18 +198,19 @@ class DialogueLensStabilizationTest {
             liveFaces = listOf(
                 LiveFaceObservation(
                     trackingId = 1,
-                    boundingBox = NormalizedRect(0.21f, 0.29f, 0.37f, 0.57f),
-                    mouthPoint = NormalizedPoint(0.29f, 0.48f),
-                    headYawDeg = 6f,
+                    boundingBox = NormalizedRect(0.68f, 0.25f, 0.86f, 0.55f),
+                    mouthPoint = NormalizedPoint(0.77f, 0.47f),
+                    headYawDeg = 0f,
                     capturedAtMs = 3_000L,
                 )
             ),
             sceneEpoch = 1,
             hasLiveVisionSignal = true,
-            displayMode = CaptionDisplayMode.BUBBLES_WITH_TAILS,
+            fixedZoneTaillessMode = true,
         ).single()
 
-        assertNotNull("BUBBLES_WITH_TAILS must attach a pointer tail for a visible speaker", second.tailTarget)
+        assertNull(second.tailTarget)
+        assertEquals(TailDirection.NONE, second.tailDirection)
         assertEquals(first.rect.left, second.rect.left, 0.001f)
         assertEquals(first.rect.top, second.rect.top, 0.001f)
     }

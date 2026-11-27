@@ -10,7 +10,6 @@ import com.example.domain.layout.BalloonLayoutEngine
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -838,12 +837,9 @@ class DialogueLensEngineTest {
         )
         val b1 = engine.computeLayout(ytProject, 1500L).first()
         val b2 = engine.computeLayout(ytProject, 4000L).first()
-        assertEquals(PlacementMode.NEUTRAL_FALLBACK, b1.placementMode)
-        assertEquals(PlacementMode.NEUTRAL_FALLBACK, b2.placementMode)
-        assertTrue(
-            "Color/accent parity alone must not yank sequential neutral fallback bubbles across screen",
-            kotlin.math.abs(b1.rect.centerX - b2.rect.centerX) < 0.05f,
-        )
+        assertFalse(b1.isAmbiguousFallback)
+        assertFalse(b2.isAmbiguousFallback)
+        assertTrue(kotlin.math.abs(b1.rect.centerX - b2.rect.centerX) > 0.20f)
     }
 
     @Test
@@ -1522,31 +1518,23 @@ class DialogueLensEngineTest {
     }
 
     @Test
-    fun captionDisplayModePrimaryPickerHasFourExclusiveModesAndMigratesLegacySettings() {
+    fun captionDisplayModePrimaryPickerStreamlinesToThreeAndMigratesBoth() {
         assertEquals(
             listOf(
-                com.example.data.model.CaptionDisplayMode.OFF,
-                com.example.data.model.CaptionDisplayMode.CLASSIC,
                 com.example.data.model.CaptionDisplayMode.BALLOONS,
-                com.example.data.model.CaptionDisplayMode.BUBBLES_WITH_TAILS,
+                com.example.data.model.CaptionDisplayMode.FIXED_ZONES,
+                com.example.data.model.CaptionDisplayMode.CLASSIC,
+                com.example.data.model.CaptionDisplayMode.OFF,
             ),
             com.example.data.model.CaptionDisplayMode.primaryModes,
         )
         assertEquals(
             com.example.data.model.CaptionDisplayMode.BALLOONS,
-            com.example.data.model.CaptionDisplayMode.BOTH.normalizedPrimaryMode(previousShowTail = false),
+            com.example.data.model.CaptionDisplayMode.BOTH.normalizedPrimaryMode(),
         )
         assertEquals(
-            com.example.data.model.CaptionDisplayMode.BUBBLES_WITH_TAILS,
-            com.example.data.model.CaptionDisplayMode.BOTH.normalizedPrimaryMode(previousShowTail = true),
-        )
-        assertEquals(
-            com.example.data.model.CaptionDisplayMode.BALLOONS,
+            com.example.data.model.CaptionDisplayMode.FIXED_ZONES,
             com.example.data.model.CaptionDisplayMode.FIXED_ZONES.normalizedPrimaryMode(),
-        )
-        assertEquals(
-            com.example.data.model.CaptionDisplayMode.BUBBLES_WITH_TAILS,
-            com.example.data.model.CaptionDisplayMode.BUBBLES_WITH_TAILS.normalizedPrimaryMode(),
         )
         assertEquals(
             com.example.data.model.CaptionDisplayMode.CLASSIC,
@@ -1726,7 +1714,7 @@ class DialogueLensEngineTest {
     }
 
     @Test
-    fun unconfirmedScoutSpeakerAppliesContextualNameImmediatelyThenUpgradesInPlaceOnVisualConfirmation() {
+    fun unconfirmedScoutSpeakerStaysDottedGrayThenRetroactivelyUpdatesAllVideoCuesOnConfirmation() {
         val attribution = SpeakerAttributionEngine()
         val layoutEngine = BalloonLayoutEngine()
         val baseProject = DemoScenarioFactory.createDemoProject().copy(
@@ -1741,7 +1729,7 @@ class DialogueLensEngineTest {
                     sourceText = "Let's look at the latest numbers.",
                     translatedText = "Let's look at the latest numbers.",
                     speakerId = "spk_b",
-                    speakerConfidence = 0.78f,
+                    speakerConfidence = 0.48f,
                     faceTrackId = null,
                     faceConfidence = 0.72f,
                     shotId = "shot_1",
@@ -1756,7 +1744,7 @@ class DialogueLensEngineTest {
                     sourceText = "That's the exact trend we saw last week.",
                     translatedText = "That's the exact trend we saw last week.",
                     speakerId = "spk_b",
-                    speakerConfidence = 0.78f,
+                    speakerConfidence = 0.75f,
                     faceTrackId = null,
                     faceConfidence = 0.80f,
                     shotId = "shot_1",
@@ -1764,25 +1752,11 @@ class DialogueLensEngineTest {
                     placementMode = PlacementMode.AUTO,
                     anchorPosition = com.example.data.model.NormalizedPoint(0.74f, 0.32f),
                 ),
-                com.example.data.model.DialogueEvent(
-                    id = "cue_3",
-                    startTimeMs = 20_000L,
-                    endTimeMs = 22_000L,
-                    sourceText = "And someone offstage muttered.",
-                    translatedText = "And someone offstage muttered.",
-                    speakerId = "spk_c",
-                    speakerConfidence = 0.42f,
-                    faceTrackId = null,
-                    faceConfidence = 0f,
-                    shotId = "shot_1",
-                    dialogueType = DialogueType.SPOKEN,
-                    placementMode = PlacementMode.NEUTRAL_FALLBACK,
-                ),
             ),
         )
 
-        // Step 1: Inferred/contextual label ("Panelist") on B applies immediately while generic label on C stays dotted gray
-        val (inferredProject, memoryAfterStep1) = com.example.ui.state.mergeCastSlotAssignments(
+        // Step 1: Unconfirmed Scout observation — must stay dotted gray and NOT consume Primary color 0
+        val (unconfirmedProject, memoryAfterStep1) = com.example.ui.state.mergeCastSlotAssignments(
             project = baseProject,
             assignments = listOf(
                 com.example.data.ai.AiCastSlotAssignment(
@@ -1793,45 +1767,31 @@ class DialogueLensEngineTest {
                     visualVoiceNotes = "Brown blazer, right panel desk",
                     isVisuallyConfirmed = false,
                 ),
-                com.example.data.ai.AiCastSlotAssignment(
-                    slot = "C",
-                    displayName = "Speaker C",
-                    rationale = "Generic voice label",
-                    isRolePlaceholder = true,
-                    visualVoiceNotes = "Offstage baritone",
-                    isVisuallyConfirmed = false,
-                ),
             ),
             rememberedColors = emptyMap(),
             reconcileColors = { spks, evts, mem -> attribution.reconcileCharacterColors(spks, evts, mem) },
-            discoveryTimestampMs = 15_000L,
+            discoveryTimestampMs = 1_000L,
         )
 
-        val spkBInferred = inferredProject.speakers.first { it.id == "spk_b" }
-        assertTrue("Contextual/inferred Scout speaker must be named immediately", spkBInferred.isConfirmedCharacter)
-        assertEquals("Panelist", spkBInferred.visibleDisplayNameAt(1_000L))
-        assertEquals("SCOUT_INFERRED", spkBInferred.revealProvenance)
-        assertNull("nameRevealedAtMs stays null so early cues display inferred name immediately", spkBInferred.nameRevealedAtMs)
-        assertFalse(
-            "Inferred named speaker cues must NOT render dotted gray",
-            com.example.data.model.isBubbleSpeakerUnknown(inferredProject.dialogueEvents.first(), spkBInferred),
-        )
+        val spkBUnconfirmed = unconfirmedProject.speakers.first { it.id == "spk_b" }
+        assertFalse("Unconfirmed Scout speaker must remain unconfirmed", spkBUnconfirmed.isConfirmedCharacter)
         assertTrue(
-            "Visual/voice notes must be preserved",
-            spkBInferred.visualVoiceNotes.contains("Brown blazer"),
+            "Unconfirmed Scout speaker cues must render dotted gray",
+            com.example.data.model.isBubbleSpeakerUnknown(unconfirmedProject.dialogueEvents.first(), spkBUnconfirmed),
         )
-        val spkCGeneric = inferredProject.speakers.first { it.id == "spk_c" }
-        assertFalse("Generic Speaker C label must remain unconfirmed dotted gray", spkCGeneric.isConfirmedCharacter)
+        assertFalse("Unconfirmed speaker must NOT claim a remembered Primary color", spkBUnconfirmed.colorRemembered)
         assertTrue(
-            "Generic Speaker C cue stays dotted gray",
-            com.example.data.model.isBubbleSpeakerUnknown(inferredProject.dialogueEvents.last(), spkCGeneric),
+            "Visual/voice notes must be preserved privately while unconfirmed",
+            spkBUnconfirmed.visualVoiceNotes.contains("Brown blazer"),
         )
+        val unconfirmedBalloons = layoutEngine.computeLayout(unconfirmedProject, 2_000L)
+        assertEquals(1, unconfirmedBalloons.size)
+        assertTrue("Placed balloon stays dotted gray before visual confirmation", unconfirmedBalloons.first().isUnknownSpeaker)
 
-        // Step 2: Later window visually confirms Michael Ian Black -> reconciles in-place onto spk_b and upgrades!
-        val (reconciledCues, reconciledUpdates, remap) = com.example.ui.state.reconcileWindowOutcomeSpeakersAndCues(
-            existingSpeakers = inferredProject.speakers,
-            cues = emptyList(),
-            speakerUpdates = listOf(
+        // Step 2: Later window visually confirms the speaker via lower-third chyron -> retroactive update!
+        val (confirmedProject, memoryAfterStep2) = com.example.ui.state.mergeCastSlotAssignments(
+            project = unconfirmedProject,
+            assignments = listOf(
                 com.example.data.ai.AiCastSlotAssignment(
                     slot = "B",
                     displayName = "Michael Ian Black",
@@ -1841,25 +1801,17 @@ class DialogueLensEngineTest {
                     isVisuallyConfirmed = true,
                 ),
             ),
-        )
-        assertTrue(reconciledCues.isEmpty())
-        assertEquals("B", remap["B"])
-
-        val (confirmedProject, memoryAfterStep2) = com.example.ui.state.mergeCastSlotAssignments(
-            project = inferredProject,
-            assignments = reconciledUpdates,
             rememberedColors = memoryAfterStep1,
             reconcileColors = { spks, evts, mem -> attribution.reconcileCharacterColors(spks, evts, mem) },
-            discoveryTimestampMs = 45_000L,
+            discoveryTimestampMs = 15_000L,
         )
 
         val spkBConfirmed = confirmedProject.speakers.first { it.id == "spk_b" }
-        assertTrue("Speaker must remain confirmed after visual verification", spkBConfirmed.isConfirmedCharacter)
-        assertFalse("Role placeholder flag must clear upon real name confirmation", spkBConfirmed.isRolePlaceholder)
-        assertEquals("Michael Ian Black", spkBConfirmed.visibleDisplayNameAt(1_000L))
-        assertEquals("SCOUT_DISCOVERY", spkBConfirmed.revealProvenance)
+        assertTrue("Speaker must become confirmed once visually verified", spkBConfirmed.isConfirmedCharacter)
+        assertEquals("Michael Ian Black", spkBConfirmed.displayName)
+        assertEquals("First confirmed character claims Primary color 0", 0, spkBConfirmed.accentIndex)
         assertTrue("Confirmed speaker reserves remembered color", spkBConfirmed.colorRemembered)
-        assertNotNull(memoryAfterStep2["michael ian black"])
+        assertEquals(0, memoryAfterStep2["michael ian black"])
 
         // Verify ALL earlier cues were retroactively upgraded across the user's video data
         val cue1After = confirmedProject.dialogueEvents.first { it.id == "cue_1" }
@@ -2055,7 +2007,7 @@ class DialogueLensEngineTest {
 
     @Test
     fun tailLineOfSightCheckRejectsBubblePocketsWhoseTailCrossesBystanderFace() {
-        val centerBystander = com.example.data.model.NormalizedRect(0.44f, 0.12f, 0.60f, 0.72f)
+        val centerBystander = com.example.data.model.NormalizedRect(0.36f, 0.12f, 0.60f, 0.72f)
         // Direct segment test: slicing straight across the bystander vs staying cleanly to the right
         assertTrue(
             "Segment slicing across bystander face must be detected",
@@ -2106,23 +2058,13 @@ class DialogueLensEngineTest {
             dialogueEvents = listOf(event),
         )
 
-        val placedWithPref = BalloonLayoutEngine().computeLayout(project, 3_000L)
-        assertEquals(1, placedWithPref.size)
-        val balloonPref = placedWithPref.first()
-        assertNotNull(
-            "Distant on-screen speaker mouth remains a valid aim target when drawn short pointer is unobstructed",
-            balloonPref.tailTarget,
-        )
-
-        // When no conflicting TOP_LEFT zone forces placement across the bystander, bubble stays near speaker on the right
-        val autoEvent = event.copy(preferredDeadSpaceZone = com.example.data.model.DeadSpaceZone.AUTO)
-        val placedAuto = BalloonLayoutEngine().computeLayout(project.copy(dialogueEvents = listOf(autoEvent)), 3_000L)
-        assertEquals(1, placedAuto.size)
-        val balloon = placedAuto.first()
+        val placed = BalloonLayoutEngine().computeLayout(project, 3_000L)
+        assertEquals(1, placed.size)
+        val balloon = placed.first()
         val tail = balloon.tailTarget
         assertNotNull("Confirmed panelist bubble must have a tailTarget", tail)
         assertFalse(
-            "Short pointer from right-side bubble to right-side mouth must NOT slice across bystander face (rect=${balloon.rect})",
+            "Tail ray from bubble center to speaker mouth must NOT slice across bystander face (rect=${balloon.rect})",
             com.example.domain.layout.segmentIntersectsRect(
                 p1 = com.example.data.model.NormalizedPoint(balloon.rect.centerX, balloon.rect.centerY),
                 p2 = tail!!,
@@ -2130,7 +2072,7 @@ class DialogueLensEngineTest {
             ),
         )
         assertTrue(
-            "Bubble must choose right-side clear pocket near speaker (centerX=${balloon.rect.centerX})",
+            "Bubble must choose right-side clear pocket instead of TOP_LEFT across bystander (centerX=${balloon.rect.centerX})",
             balloon.rect.centerX > 0.56f,
         )
     }

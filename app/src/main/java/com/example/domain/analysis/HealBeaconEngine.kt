@@ -183,8 +183,6 @@ object HealBeaconEngine {
         autoTriggered: Boolean = false,
         problemHint: HealProblemHint = HealProblemHint.NONE,
         patrolChapterId: String? = null,
-        generationToken: Long = 0L,
-        coordinatorJobId: String = "",
         nowEpochMs: Long = System.currentTimeMillis(),
     ): Pair<DialogueLensProject, HealBeacon> {
         val window = computeWindow(timestampMs, scope, project)
@@ -226,8 +224,6 @@ object HealBeaconEngine {
                     autoTriggered = autoTriggered,
                     problemHint = problemHint,
                     patrolChapterId = patrolChapterId,
-                    generationToken = generationToken,
-                    coordinatorJobId = coordinatorJobId,
                 )
                 val updated = (project.healBeacons + followUp).sortedBy { it.timestampMs }
                 return project.copy(healBeacons = updated) to followUp
@@ -249,8 +245,6 @@ object HealBeaconEngine {
                 autoTriggered = overlappingMarked.autoTriggered && autoTriggered,
                 problemHint = if (problemHint != HealProblemHint.NONE) problemHint else overlappingMarked.problemHint,
                 statusNote = "Queued for localized repair",
-                generationToken = maxOf(overlappingMarked.generationToken, generationToken),
-                coordinatorJobId = coordinatorJobId.ifBlank { overlappingMarked.coordinatorJobId },
             )
             val updatedBeacons = project.healBeacons.map { if (it.id == merged.id) merged else it }
             return project.copy(healBeacons = updatedBeacons) to merged
@@ -270,8 +264,6 @@ object HealBeaconEngine {
             autoTriggered = autoTriggered,
             problemHint = problemHint,
             patrolChapterId = patrolChapterId,
-            generationToken = generationToken,
-            coordinatorJobId = coordinatorJobId,
         )
         val updatedBeacons = (project.healBeacons + beacon).sortedBy { it.timestampMs }
         return project.copy(healBeacons = updatedBeacons) to beacon
@@ -311,7 +303,6 @@ object HealBeaconEngine {
         silenceExplicitlyConfirmed: Boolean = false,
         verifiedSubRanges: List<TimeWindowRange>? = null,
         expectedRepairRevision: Int? = null,
-        expectedGenerationToken: Long? = null,
         nowEpochMs: Long = System.currentTimeMillis(),
     ): LocalizedRepairOutcome {
         val beacon = project.healBeacons.firstOrNull { it.id == beaconId }
@@ -330,38 +321,6 @@ object HealBeaconEngine {
                 preservedLockedCount = 0,
                 reason = "Beacon not found",
             )
-
-        if (beacon.status == HealBeaconStatus.SUPERSEDED || beacon.status == HealBeaconStatus.CANCELLED) {
-            return LocalizedRepairOutcome(
-                updatedProject = project,
-                updatedBeacon = beacon,
-                applied = false,
-                replacedCount = 0,
-                preservedLockedCount = 0,
-                reason = "Beacon already ${beacon.status.name.lowercase()}",
-            )
-        }
-
-        if (expectedGenerationToken != null &&
-            beacon.generationToken > 0L &&
-            beacon.generationToken != expectedGenerationToken
-        ) {
-            val superseded = beacon.copy(
-                status = HealBeaconStatus.SUPERSEDED,
-                updatedAtEpochMs = nowEpochMs,
-                statusNote = "Superseded by newer scheduling generation",
-            )
-            return LocalizedRepairOutcome(
-                updatedProject = project.copy(
-                    healBeacons = project.healBeacons.map { if (it.id == beaconId) superseded else it },
-                ),
-                updatedBeacon = superseded,
-                applied = false,
-                replacedCount = 0,
-                preservedLockedCount = 0,
-                reason = "Stale generation token rejected",
-            )
-        }
 
         if (expectedRepairRevision != null && beacon.repairRevision != expectedRepairRevision) {
             return LocalizedRepairOutcome(
@@ -566,54 +525,6 @@ object HealBeaconEngine {
             dialogueEvents = mergedEvents,
             healBeacons = project.healBeacons.map { if (it.id == beaconId) revertedBeacon else it },
         )
-    }
-
-    fun markBeaconSuperseded(
-        project: DialogueLensProject,
-        beaconId: String,
-        cancelled: Boolean = false,
-        reason: String = if (cancelled) "Repair cancelled" else "Superseded by newer playback context",
-        nowEpochMs: Long = System.currentTimeMillis(),
-    ): DialogueLensProject {
-        val nextStatus = if (cancelled) HealBeaconStatus.CANCELLED else HealBeaconStatus.SUPERSEDED
-        val updated = project.healBeacons.map { b ->
-            if (b.id == beaconId && (b.status == HealBeaconStatus.MARKED || b.status == HealBeaconStatus.HEALING)) {
-                b.copy(
-                    status = nextStatus,
-                    updatedAtEpochMs = nowEpochMs,
-                    statusNote = reason,
-                )
-            } else {
-                b
-            }
-        }
-        return project.copy(healBeacons = updated)
-    }
-
-    fun supersedeOrCancelStaleBeacons(
-        project: DialogueLensProject,
-        activeGenerationToken: Long,
-        cancelActiveHealing: Boolean = false,
-        reason: String = "Superseded after seek or configuration change",
-        nowEpochMs: Long = System.currentTimeMillis(),
-    ): DialogueLensProject {
-        var changed = false
-        val updated = project.healBeacons.map { b ->
-            val isPending = b.status == HealBeaconStatus.MARKED ||
-                (cancelActiveHealing && b.status == HealBeaconStatus.HEALING)
-            val isStale = b.generationToken in 1L until activeGenerationToken
-            if (isPending && isStale) {
-                changed = true
-                b.copy(
-                    status = if (b.status == HealBeaconStatus.HEALING) HealBeaconStatus.CANCELLED else HealBeaconStatus.SUPERSEDED,
-                    updatedAtEpochMs = nowEpochMs,
-                    statusNote = reason,
-                )
-            } else {
-                b
-            }
-        }
-        return if (changed) project.copy(healBeacons = updated) else project
     }
 
     fun dismissBeacon(project: DialogueLensProject, beaconId: String): DialogueLensProject =
