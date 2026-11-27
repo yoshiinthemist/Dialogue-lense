@@ -54,6 +54,7 @@ object LookaheadWindowPlanner {
     const val WINDOW_STEP_MS = 7_000L
     const val WINDOW_OVERLAP_MS = 450L
     const val MAX_PREFETCH_HORIZON_MS = 28_000L
+    const val ROLLING_BOUNDARY_HORIZON_MS = 180_000L
     const val DRIFT_TOLERANCE_MS = 2_400L
 
     fun initialExecutionTier(
@@ -145,9 +146,25 @@ object LookaheadWindowPlanner {
         completedStarts: Set<Int>,
         inFlightStarts: Set<Int>,
         playheadSec: Int,
+        horizonSec: Int? = null,
     ): List<Pair<Int, Int>> {
         val pending = windows.filter { (ws, _) ->
             ws !in completedStarts && ws !in inFlightStarts
+        }
+        if (horizonSec != null) {
+            val safeHorizon = horizonSec.coerceAtLeast(1)
+            val boundaryEndSec = playheadSec.coerceAtLeast(0) + safeHorizon
+            return pending
+                .mapNotNull { (ws, we) ->
+                    if (ws >= boundaryEndSec || we <= playheadSec) return@mapNotNull null
+                    val clippedEnd = minOf(we, boundaryEndSec)
+                    if (clippedEnd <= ws) null else (ws to clippedEnd)
+                }
+                .sortedWith(
+                    compareBy<Pair<Int, Int>> { (ws, we) -> if (playheadSec in ws until we) 0 else 1 }
+                        .thenBy { it.first }
+                )
+                .distinctBy { it.first }
         }
         val activeAtPlayhead = pending.filter { (ws, we) -> playheadSec in ws until we }
         val forward = pending.filter { (ws, _) -> ws > playheadSec }.sortedBy { it.first }
@@ -311,16 +328,22 @@ object LookaheadWindowPlanner {
         viewerPosMs: Long,
         durationMs: Long,
         completedWindowStarts: Set<Long>,
+        horizonMs: Long = ROLLING_BOUNDARY_HORIZON_MS,
+        enforceHardHorizon: Boolean = true,
     ): TimeWindowRange? {
         if (durationMs <= 0L) return null
         val safeViewer = viewerPosMs.coerceIn(0L, durationMs)
         val anchorStart = (safeViewer / WINDOW_STEP_MS) * WINDOW_STEP_MS
-        val horizonEnd = minOf(durationMs, anchorStart + MAX_PREFETCH_HORIZON_MS)
+        val effectiveHorizonEnd = if (enforceHardHorizon) {
+            minOf(durationMs, safeViewer + horizonMs.coerceAtLeast(WINDOW_STEP_MS))
+        } else {
+            minOf(durationMs, anchorStart + MAX_PREFETCH_HORIZON_MS)
+        }
 
         var candidate = anchorStart
-        while (candidate < horizonEnd) {
+        while (candidate < effectiveHorizonEnd) {
             if (candidate !in completedWindowStarts) {
-                val end = minOf(durationMs, candidate + WINDOW_STEP_MS)
+                val end = minOf(effectiveHorizonEnd, candidate + WINDOW_STEP_MS)
                 if (end > candidate + 250L) {
                     return TimeWindowRange(startMs = candidate, endMs = end)
                 }
@@ -328,16 +351,17 @@ object LookaheadWindowPlanner {
             candidate += WINDOW_STEP_MS
         }
 
-        // If the 28s lookahead buffer is already complete, continue ahead linearly through the video
-        var tail = horizonEnd - (horizonEnd % WINDOW_STEP_MS)
-        while (tail < durationMs) {
-            if (tail !in completedWindowStarts) {
-                val end = minOf(durationMs, tail + WINDOW_STEP_MS)
-                if (end > tail + 250L) {
-                    return TimeWindowRange(startMs = tail, endMs = end)
+        if (!enforceHardHorizon) {
+            var tail = effectiveHorizonEnd - (effectiveHorizonEnd % WINDOW_STEP_MS)
+            while (tail < durationMs) {
+                if (tail !in completedWindowStarts) {
+                    val end = minOf(durationMs, tail + WINDOW_STEP_MS)
+                    if (end > tail + 250L) {
+                        return TimeWindowRange(startMs = tail, endMs = end)
+                    }
                 }
+                tail += WINDOW_STEP_MS
             }
-            tail += WINDOW_STEP_MS
         }
         return null
     }

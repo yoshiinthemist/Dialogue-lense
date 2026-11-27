@@ -38,6 +38,10 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -96,6 +100,9 @@ fun PlayerControlsBar(
     analysisStatus: AnalysisStatus,
     onTogglePlayPause: () -> Unit,
     onSeekTo: (Long) -> Unit,
+    onScrubberPreviewStart: () -> Unit = {},
+    onScrubberPreviewChange: (Long) -> Unit = {},
+    onScrubberPreviewEnd: (Long) -> Unit = {},
     onToggleMute: () -> Unit,
     onCyclePlaybackSpeed: () -> Unit = {},
     onToggleFullscreenTheater: () -> Unit = {},
@@ -118,6 +125,8 @@ fun PlayerControlsBar(
     val duration = project.videoSource.durationMs.coerceAtLeast(1000L)
     val unconfirmedCount = project.speakers.count { !it.isConfirmedCharacter }
     val hasActiveToolBadges = isEditMode || playbackSpeed != 1.0f
+    var dragPreviewMs by remember { mutableStateOf<Long?>(null) }
+    val displayTimeMs = dragPreviewMs ?: currentTimeMs
 
     Surface(
         color = CinemaSurface,
@@ -203,11 +212,36 @@ fun PlayerControlsBar(
                             }
                         }
                         .pointerInput(duration) {
-                            detectHorizontalDragGestures { change, _ ->
-                                change.consume()
-                                val frac = (change.position.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
-                                onSeekTo((frac * duration).toLong())
-                            }
+                            detectHorizontalDragGestures(
+                                onDragStart = { startOffset ->
+                                    val frac = (startOffset.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                    val preview = (frac * duration).toLong()
+                                    dragPreviewMs = preview
+                                    onScrubberPreviewStart()
+                                    onScrubberPreviewChange(preview)
+                                },
+                                onHorizontalDrag = { change, _ ->
+                                    change.consume()
+                                    val frac = (change.position.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                    val preview = (frac * duration).toLong()
+                                    dragPreviewMs = preview
+                                    onScrubberPreviewChange(preview)
+                                },
+                                onDragEnd = {
+                                    val committed = dragPreviewMs
+                                    dragPreviewMs = null
+                                    if (committed != null) {
+                                        onScrubberPreviewEnd(committed)
+                                        onSeekTo(committed)
+                                    } else {
+                                        onScrubberPreviewEnd(-1L)
+                                    }
+                                },
+                                onDragCancel = {
+                                    dragPreviewMs = null
+                                    onScrubberPreviewEnd(-1L)
+                                },
+                            )
                         }
                         .semantics {
                             contentDescription = "Video timeline scrubber"
@@ -352,8 +386,8 @@ fun PlayerControlsBar(
                             }
                         }
 
-                        // Played progress bar
-                        val headFrac = (currentTimeMs.toFloat() / durF).coerceIn(0f, 1f)
+                        // Played progress bar (tracks local preview thumb during drag without moving boundary)
+                        val headFrac = (displayTimeMs.toFloat() / durF).coerceIn(0f, 1f)
                         val headX = headFrac * size.width
                         if (headX > 0f) {
                             drawRoundRect(
@@ -413,9 +447,9 @@ fun PlayerControlsBar(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = SubtitleParser.formatCompactTime(currentTimeMs),
+                        text = SubtitleParser.formatCompactTime(displayTimeMs),
                         style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
-                        color = MaterialTheme.colorScheme.onSurface,
+                        color = if (dragPreviewMs != null) LensSky else MaterialTheme.colorScheme.onSurface,
                     )
                     if (isEditMode) {
                         Text(

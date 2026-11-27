@@ -8,6 +8,8 @@ import com.example.domain.analysis.CoverageSummary
 import com.example.domain.pipeline.ReleasedPlaybackSnapshot
 import com.example.domain.playback.PlaybackReadinessSnapshot
 import com.example.domain.playback.PlaybackReadinessState
+import com.example.domain.sentinel.SchedulerOutcomeState
+import com.example.domain.sentinel.SentinelInspectorSnapshot
 
 enum class ReadinessTone {
     READY,
@@ -25,8 +27,8 @@ data class HumanReadableReadiness(
 )
 
 /**
- * Translates structured playback readiness, coverage ledger state, and Heal Beacon activity into
- * calm, plain-language viewer states for the Watch and Library interfaces.
+ * Translates structured playback readiness, coverage ledger state, rolling-window scheduler
+ * outcomes, and Heal Beacon activity into calm, plain-language viewer states for Watch and Library.
  * Technical diagnostics remain accessible exclusively inside Studio -> Diagnostics.
  */
 object HumanReadableStatus {
@@ -38,6 +40,7 @@ object HumanReadableStatus {
         isOfflineReady: Boolean = false,
         readinessSnapshot: PlaybackReadinessSnapshot? = null,
         releaseSnapshot: ReleasedPlaybackSnapshot? = null,
+        sentinelSnapshot: SentinelInspectorSnapshot? = null,
     ): HumanReadableReadiness {
         if (project == null) {
             return HumanReadableReadiness(
@@ -53,11 +56,7 @@ object HumanReadableStatus {
                 PlaybackReadinessState.BUFFERING_INITIAL_WINDOW,
                 PlaybackReadinessState.BUFFERING_FOR_SEEK,
                 PlaybackReadinessState.BUFFERING_MID_PLAYBACK -> {
-                    val label = if (readinessSnapshot.state == PlaybackReadinessState.BUFFERING_FOR_SEEK) {
-                        "Preparing captions"
-                    } else {
-                        "Preparing captions"
-                    }
+                    val label = "Preparing captions"
                     val detail = if (readinessSnapshot.willAutoResumeWhenReady) {
                         "Playback will resume automatically once captions are ready."
                     } else {
@@ -119,6 +118,65 @@ object HumanReadableStatus {
             )
         }
 
+        val schedState = sentinelSnapshot?.schedulerState
+        if (schedState != null) {
+            when (schedState.outcomeState) {
+                SchedulerOutcomeState.WINDOW_READY_IDLE -> {
+                    val reserveSec = (schedState.viewingTimeReserveMs / 1000L).coerceAtLeast(0L)
+                    val speedSuffix = if (kotlin.math.abs(schedState.playbackSpeed - 1.0f) >= 0.05f && reserveSec > 0L) {
+                        " (~${reserveSec}s at ${schedState.playbackSpeed}x)"
+                    } else {
+                        ""
+                    }
+                    return HumanReadableReadiness(
+                        label = "Current window ready",
+                        detail = "Upcoming 3-minute window prepared$speedSuffix. More loads automatically as you watch.",
+                        tone = ReadinessTone.READY,
+                        isInProgress = false,
+                    )
+                }
+                SchedulerOutcomeState.WAITING_FOR_EVIDENCE_OR_CAPABILITY -> {
+                    return HumanReadableReadiness(
+                        label = "Waiting for captions",
+                        detail = schedState.idleReason.ifBlank {
+                            "Waiting for caption evidence or cloud capability."
+                        },
+                        tone = ReadinessTone.WARNING,
+                        isInProgress = false,
+                    )
+                }
+                SchedulerOutcomeState.UNRESOLVED_AFTER_BOUNDED_RECOVERY -> {
+                    return HumanReadableReadiness(
+                        label = "Some dialogue is unavailable",
+                        detail = schedState.idleReason.ifBlank {
+                            "Bounded recovery finished with an unresolved section. You can retry or attach captions."
+                        },
+                        tone = ReadinessTone.WARNING,
+                        isInProgress = false,
+                    )
+                }
+                SchedulerOutcomeState.WHOLE_VIDEO_COMPLETE -> {
+                    val offlineCapable = isOfflineReady ||
+                        project.videoSource.kind == VideoSourceKind.DEMO_SCENARIO ||
+                        project.videoSource.kind == VideoSourceKind.LOCAL_MP4
+                    return if (offlineCapable) {
+                        HumanReadableReadiness(
+                            label = "Ready offline",
+                            detail = "Full video captions are verified and saved.",
+                            tone = ReadinessTone.OFFLINE,
+                        )
+                    } else {
+                        HumanReadableReadiness(
+                            label = "Ready",
+                            detail = "Full video captions and speakers are verified.",
+                            tone = ReadinessTone.READY,
+                        )
+                    }
+                }
+                SchedulerOutcomeState.ACTIVE -> Unit
+            }
+        }
+
         val isScoutingNow = scoutState is ScoutCaptionState.FetchingCaptions ||
             scoutState is ScoutCaptionState.AiTranscribing
         if (isScoutingNow) {
@@ -126,7 +184,7 @@ object HumanReadableStatus {
             return if (hasDialogue) {
                 HumanReadableReadiness(
                     label = "Checking upcoming dialogue",
-                    detail = "Upcoming lines are being checked smoothly as you watch.",
+                    detail = "Upcoming lines are being checked smoothly within the next 3 minutes.",
                     tone = ReadinessTone.ACTIVE,
                     isInProgress = true,
                 )
@@ -178,9 +236,9 @@ object HumanReadableStatus {
 
         if (!isComplete && project.dialogueEvents.isNotEmpty()) {
             return HumanReadableReadiness(
-                label = "Checking upcoming dialogue",
-                detail = "Captions are ready here and continue preparing ahead.",
-                tone = ReadinessTone.ACTIVE,
+                label = "Current window ready",
+                detail = "Captions are ready here and prepare ahead as you watch.",
+                tone = ReadinessTone.READY,
             )
         }
 

@@ -763,13 +763,15 @@ class TranscriptCoverageLedger(
     }
 
     /**
-     * Selects the highest-priority unverified interval to process or heal next relative to [playheadMs]:
-     * 1. Interval currently containing [playheadMs]
-     * 2. Intervals immediately ahead in [playheadMs, playheadMs + lookaheadHorizonMs]
-     * 3. Remaining intervals ahead toward end of video
-     * 4. Earlier gaps behind [playheadMs]
+     * Selects the highest-priority unverified interval to process or heal next strictly inside
+     * the rolling boundary `[playheadMs, min(duration, playheadMs + lookaheadHorizonMs)]`:
+     * 1. Missing/failed/unverified interval currently containing [playheadMs]
+     * 2. Earliest unverified/retryable interval in `[playheadMs, boundaryEndMs)`, prioritizing
+     *    confirmed missing/failed dialogue immediately ahead of the viewer before fresh prep.
      *
-     * Respects [maxRetryAttempts] for previously `FAILED` intervals so healing is always bounded.
+     * Never escapes past `boundaryEndMs` when [enforceHardHorizon] is true, and clips/defers any
+     * chunk whose submitted end (including [chunkOverlapMs] and optional ceiling-to-second rounding)
+     * would cross `boundaryEndMs`.
      */
     fun nextPriorityInterval(
         playheadMs: Long,
@@ -779,9 +781,32 @@ class TranscriptCoverageLedger(
         rollingWindowMs: Long = LookaheadWindowPlanner.ROLLING_SCOUT_WINDOW_SEC * 1000L,
         allowUploadedCaptionGapRecovery: Boolean = true,
         minRecoverableUploadedGapMs: Long = 15_000L,
+        enforceHardHorizon: Boolean = true,
+        chunkOverlapMs: Long = 0L,
+        roundingUpToSecond: Boolean = false,
+        minSliceMs: Long = 1_000L,
     ): CoverageInterval? = synchronized(lock) {
         if (totalDurationMs <= 0L) return@synchronized null
         val safePlayhead = playheadMs.coerceIn(0L, totalDurationMs)
+        val safeHorizon = lookaheadHorizonMs.coerceAtLeast(1_000L)
+        val boundaryEndMs = if (enforceHardHorizon) {
+            minOf(totalDurationMs, safePlayhead + safeHorizon)
+        } else {
+            totalDurationMs
+        }
+        val safeOverlap = chunkOverlapMs.coerceAtLeast(0L)
+        val maxRawEndMs = if (enforceHardHorizon) {
+            val roundedCap = if (roundingUpToSecond) {
+                (boundaryEndMs / 1_000L) * 1_000L
+            } else {
+                boundaryEndMs
+            }
+            (roundedCap - safeOverlap).coerceAtLeast(0L)
+        } else {
+            totalDurationMs
+        }
+        if (enforceHardHorizon && safePlayhead >= maxRawEndMs) return@synchronized null
+
         val candidates = intervals.filter { iv ->
             val withinRetryBudget = when (iv.status) {
                 CoverageStatus.FAILED,
@@ -796,11 +821,17 @@ class TranscriptCoverageLedger(
             } else {
                 true
             }
+            val insideBoundary = if (enforceHardHorizon) {
+                iv.startMs < maxRawEndMs && iv.endMs > safePlayhead
+            } else {
+                true
+            }
             !iv.verified &&
                 iv.status != CoverageStatus.IN_PROGRESS &&
                 iv.status != CoverageStatus.UNAVAILABLE_EVIDENCE &&
                 iv.status != CoverageStatus.RELEASED_FALLBACK &&
                 uploadedGapEligible &&
+                insideBoundary &&
                 iv.endMs > iv.startMs &&
                 withinRetryBudget
         }
@@ -808,17 +839,26 @@ class TranscriptCoverageLedger(
 
         val chosen = candidates.firstOrNull { safePlayhead in it.startMs until it.endMs }
             ?: candidates
-                .filter { it.startMs >= safePlayhead && it.startMs <= safePlayhead + lookaheadHorizonMs }
-                .minWithOrNull(compareBy<CoverageInterval> { it.startMs }.thenBy { retryWeight(it) })
-            ?: candidates
-                .filter { it.startMs > safePlayhead }
-                .minWithOrNull(compareBy<CoverageInterval> { it.startMs }.thenBy { retryWeight(it) })
-            ?: candidates
-                .filter { it.endMs <= safePlayhead || it.startMs < safePlayhead }
-                .maxWithOrNull(compareBy<CoverageInterval> { it.startMs }.thenByDescending { -retryWeight(it) })
-            ?: candidates.first()
+                .filter { it.startMs >= safePlayhead && it.startMs < maxRawEndMs }
+                .minWithOrNull(
+                    compareBy<CoverageInterval> { immediateDefectPriority(it, safePlayhead) }
+                        .thenBy { it.startMs }
+                        .thenBy { retryWeight(it) }
+                )
+            ?: if (!enforceHardHorizon) {
+                candidates
+                    .filter { it.startMs > safePlayhead }
+                    .minWithOrNull(compareBy<CoverageInterval> { it.startMs }.thenBy { retryWeight(it) })
+                    ?: candidates
+                        .filter { it.endMs <= safePlayhead || it.startMs < safePlayhead }
+                        .maxWithOrNull(compareBy<CoverageInterval> { it.startMs }.thenByDescending { -retryWeight(it) })
+                    ?: candidates.first()
+            } else {
+                null
+            }
+            ?: return@synchronized null
 
-        val maxChunkMs = if (chosen.startMs == 0L) openingWindowMs else rollingWindowMs
+        val maxChunkMs = if (chosen.startMs == 0L && safePlayhead < openingWindowMs) openingWindowMs else rollingWindowMs
         val sliceStart = if (safePlayhead in chosen.startMs until chosen.endMs &&
             (chosen.endMs - chosen.startMs) > maxChunkMs &&
             chosen.status != CoverageStatus.FAILED
@@ -830,13 +870,90 @@ class TranscriptCoverageLedger(
         } else {
             chosen.startMs
         }
-        val sliceEnd = minOf(chosen.endMs, sliceStart + maxChunkMs)
-        chosen.copy(startMs = sliceStart, endMs = sliceEnd.coerceAtLeast(sliceStart))
+        val rawSliceEnd = minOf(chosen.endMs, sliceStart + maxChunkMs)
+        val clippedEnd = if (enforceHardHorizon) {
+            minOf(rawSliceEnd, maxRawEndMs)
+        } else {
+            rawSliceEnd
+        }
+        val spanMs = clippedEnd - sliceStart
+        val reachesExactVideoEnd = clippedEnd >= totalDurationMs && spanMs > 0L
+        if (spanMs <= 0L || (enforceHardHorizon && !reachesExactVideoEnd && spanMs < minSliceMs)) {
+            return@synchronized null
+        }
+        chosen.copy(startMs = sliceStart, endMs = clippedEnd)
+    }
+
+    fun totalDurationMs(): Long = synchronized(lock) { totalDurationMs }
+
+    /**
+     * Returns true iff every millisecond inside `[windowStartMs, windowEndMs)` is strictly verified
+     * (`VERIFIED_DIALOGUE` or `VERIFIED_SILENCE`), never treating gaps or fallback as verified.
+     */
+    fun isWindowVerified(windowStartMs: Long, windowEndMs: Long): Boolean = synchronized(lock) {
+        if (totalDurationMs <= 0L) return@synchronized false
+        val start = windowStartMs.coerceIn(0L, totalDurationMs)
+        val end = windowEndMs.coerceIn(start, totalDurationMs)
+        if (end <= start) return@synchronized true
+        var cursor = start
+        for (iv in intervals) {
+            if (iv.endMs <= start) continue
+            if (iv.startMs >= end) break
+            if (iv.startMs > cursor) return@synchronized false
+            if (!iv.status.isVerified) return@synchronized false
+            cursor = minOf(iv.endMs, end)
+        }
+        cursor >= end
+    }
+
+    /**
+     * Returns all non-verified intervals overlapping `[windowStartMs, windowEndMs)`.
+     */
+    fun unresolvedIntervalsInWindow(windowStartMs: Long, windowEndMs: Long): List<CoverageInterval> = synchronized(lock) {
+        if (totalDurationMs <= 0L) return@synchronized emptyList()
+        val start = windowStartMs.coerceIn(0L, totalDurationMs)
+        val end = windowEndMs.coerceIn(start, totalDurationMs)
+        if (end <= start) return@synchronized emptyList()
+        intervals.filter { iv ->
+            !iv.status.isVerified && iv.startMs < end && iv.endMs > start
+        }
+    }
+
+    /**
+     * Returns true when any interval inside `[windowStartMs, windowEndMs)` is failed/partial/missing
+     * and has exhausted [maxRetryAttempts] (or is explicitly unavailable).
+     */
+    fun hasExhaustedUnresolvedInWindow(
+        windowStartMs: Long,
+        windowEndMs: Long,
+        maxRetryAttempts: Int = 3,
+    ): Boolean = synchronized(lock) {
+        if (totalDurationMs <= 0L) return@synchronized false
+        val start = windowStartMs.coerceIn(0L, totalDurationMs)
+        val end = windowEndMs.coerceIn(start, totalDurationMs)
+        if (end <= start) return@synchronized false
+        intervals.any { iv ->
+            iv.startMs < end && iv.endMs > start && (
+                iv.status == CoverageStatus.UNAVAILABLE_EVIDENCE ||
+                    ((iv.status == CoverageStatus.FAILED ||
+                        iv.status == CoverageStatus.PARTIAL_RECOVERY ||
+                        iv.status == CoverageStatus.SUSPECTED_MISSING_DIALOGUE) &&
+                        iv.retryAttempts >= maxRetryAttempts)
+                )
+        }
+    }
+
+    private fun immediateDefectPriority(iv: CoverageInterval, playheadMs: Long): Int {
+        val isImmediateAhead = iv.startMs <= playheadMs + 30_000L
+        val isKnownDefect = iv.status == CoverageStatus.SUSPECTED_MISSING_DIALOGUE ||
+            iv.status == CoverageStatus.FAILED ||
+            iv.status == CoverageStatus.PARTIAL_RECOVERY
+        return if (isImmediateAhead && isKnownDefect) 0 else 1
     }
 
     private fun retryWeight(iv: CoverageInterval): Int = when (iv.status) {
-        CoverageStatus.PENDING -> 0
-        CoverageStatus.SUSPECTED_MISSING_DIALOGUE -> 1
+        CoverageStatus.SUSPECTED_MISSING_DIALOGUE -> 0
+        CoverageStatus.PENDING -> 1
         CoverageStatus.LEGACY_UNVERIFIED -> 1
         CoverageStatus.CAPTION_GAP -> 2
         CoverageStatus.PARTIAL_RECOVERY -> 2

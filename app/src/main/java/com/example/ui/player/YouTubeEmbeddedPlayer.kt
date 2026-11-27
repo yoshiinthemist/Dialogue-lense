@@ -368,9 +368,11 @@ private fun buildYouTubeIframeHtml(
     val safeOrigin = packageOrigin.replace("'", "")
     val safeLang = preferredCaptionLang.lowercase().replace(Regex("[^a-z-]"), "").ifBlank { "en" }
     val controlsParam = if (isScoutInstance) 0 else 1
-    val ccLoadParam = if (suppressNativeCaptions) 0 else 1
+    // Scout 1's viewing path MUST enable available native YouTube CC to collect real caption evidence.
+    val effectiveSuppress = if (isScoutInstance) false else suppressNativeCaptions
+    val ccLoadParam = if (effectiveSuppress) 0 else 1
     val forceMuteFlag = if (isScoutInstance) "true" else "false"
-    val initialSuppressFlag = if (suppressNativeCaptions) "true" else "false"
+    val initialSuppressFlag = if (effectiveSuppress) "true" else "false"
     return """
         <!DOCTYPE html>
         <html>
@@ -472,7 +474,16 @@ private fun buildYouTubeIframeHtml(
                     if (forceScoutMute && ytPlayer.getCurrentTime && ytPlayer.getCurrentTime() > 4 && ytPlayer.seekTo) {
                       ytPlayer.seekTo(0, true);
                     }
-                    if (suppressCc) applySoftCaptionMuteOnce();
+                    if (forceScoutMute) {
+                      try {
+                        if (typeof ytPlayer.loadModule === 'function') ytPlayer.loadModule('captions');
+                        if (typeof ytPlayer.setOption === 'function') {
+                          ytPlayer.setOption('captions', 'track', { languageCode: '$safeLang' });
+                        }
+                      } catch (e) {}
+                    } else if (suppressCc) {
+                      applySoftCaptionMuteOnce();
+                    }
                     if (window.DialogueLensYt) window.DialogueLensYt.onReady();
                     setTimeout(reportNativeCaptionTracks, 900);
                     if (pendingDesiredPlay === true && ytPlayer.playVideo) {

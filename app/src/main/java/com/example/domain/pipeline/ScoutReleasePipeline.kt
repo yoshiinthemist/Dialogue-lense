@@ -1144,6 +1144,14 @@ class ReleasedTimelineStore {
         workingDrafts.values.sortedBy { it.startMs }
     }
 
+    fun pendingDraftCount(): Int = synchronized(lock) {
+        workingDrafts.size
+    }
+
+    fun hasPendingDraftsInWindow(startMs: Long, endMs: Long): Boolean = synchronized(lock) {
+        workingDrafts.values.any { it.startMs < endMs && it.endMs > startMs }
+    }
+
     /**
      * Atomically publishes a Scout 2 reviewed interval (text + timing + attribution + placement)
      * into the released playback timeline as one consistent revision.

@@ -3,11 +3,14 @@ package com.example.domain.sentinel
 import com.example.data.model.ChapterSource
 import com.example.data.model.CoverageStatus
 import com.example.data.model.DialogueLensProject
+import com.example.data.model.PersistedSchedulingState
 import com.example.data.model.QuotaSaverMode
 import com.example.data.model.VideoChapter
 import com.example.domain.analysis.LookaheadWindowPlanner
 import com.example.domain.analysis.TranscriptCoverageLedger
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * 4-tier unified priority queue across Scout and Sentinel workers (DialogueLens 2.0 Section 16).
@@ -49,6 +52,72 @@ enum class ChapterBoundaryAnomalyKind(val label: String) {
     LOW_CONFIDENCE_OR_COVERAGE_DROP("Low confidence or coverage drop"),
 }
 
+/**
+ * Configurable scheduling policy owned by [SentinelWorkforceCoordinator].
+ * Keeps all automatic expensive Scout 1 / Scout 2 / patrol / repair work strictly bounded to
+ * `min(durationMs, acknowledgedViewerPosMs + horizonMs)` (default 180 seconds).
+ */
+data class RollingBoundaryPolicy(
+    val horizonMs: Long = 180_000L,
+    val refillAdvanceMs: Long = 15_000L,
+    val refillLeadThresholdMs: Long = 150_000L,
+    val stopThresholdMs: Long = 180_000L,
+    val minSubmittableSliceMs: Long = 2_000L,
+    val chunkOverlapMs: Long = 0L,
+    val maxPendingReviewDrafts: Int = 2,
+    val maxRetriesPerInterval: Int = 3,
+    val pausedQualityDeadlineMs: Long = 60_000L,
+)
+
+/**
+ * Distinct, honest scheduler outcomes — reaching the 3-minute boundary is NEVER reported as
+ * whole-video completion.
+ */
+enum class SchedulerOutcomeState(val label: String) {
+    ACTIVE("Active within 3-min window"),
+    WINDOW_READY_IDLE("Current window ready"),
+    WAITING_FOR_EVIDENCE_OR_CAPABILITY("Waiting for evidence or capability"),
+    UNRESOLVED_AFTER_BOUNDED_RECOVERY("Unresolved after bounded recovery"),
+    WHOLE_VIDEO_COMPLETE("Whole video complete"),
+}
+
+sealed interface BoundarySubmissionDecision {
+    data class Allowed(
+        val startMs: Long,
+        val endMs: Long,
+        val wasClipped: Boolean,
+        val effectiveSubmittedEndMs: Long,
+        val schedulingGeneration: Long,
+    ) : BoundarySubmissionDecision
+
+    data class DeferredOutsideBoundary(
+        val reason: String,
+        val boundaryEndMs: Long,
+    ) : BoundarySubmissionDecision
+}
+
+data class SchedulerStateSnapshot(
+    val acknowledgedViewerPosMs: Long = 0L,
+    val durationMs: Long = 0L,
+    val boundaryEndMs: Long = 0L,
+    val schedulingGeneration: Long = 0L,
+    val isViewerPaused: Boolean = false,
+    val isScrubberPreviewActive: Boolean = false,
+    val playbackSpeed: Float = 1.0f,
+    val continuousVerifiedLeadMs: Long = 0L,
+    val viewingTimeReserveMs: Long = 0L,
+    val pendingReviewDraftCount: Int = 0,
+    val isScout1ThrottledForReviewBackpressure: Boolean = false,
+    val outcomeState: SchedulerOutcomeState = SchedulerOutcomeState.ACTIVE,
+    val isTemporarilyIdle: Boolean = false,
+    val lastIdleAnchorMs: Long = -1L,
+    val lastIdleBoundaryEndMs: Long = -1L,
+    val lastWakeReason: String = "",
+    val idleReason: String = "",
+    val pausedDeadlineReached: Boolean = false,
+    val policy: RollingBoundaryPolicy = RollingBoundaryPolicy(),
+)
+
 data class SentinelWorkItem(
     val id: String,
     val tier: SentinelPriorityTier,
@@ -60,6 +129,7 @@ data class SentinelWorkItem(
     val chapterTitle: String? = null,
     val draftRevision: Long = 0L,
     val createdAtEpochMs: Long = System.currentTimeMillis(),
+    val schedulingGeneration: Long = 0L,
 )
 
 data class IntervalReservation(
@@ -122,6 +192,7 @@ data class SentinelInspectorSnapshot(
     val totalCompletedRepairs: Int = 0,
     val totalLocalCleanChapterChecks: Int = 0,
     val totalCloudEscalatedChapterChecks: Int = 0,
+    val schedulerState: SchedulerStateSnapshot = SchedulerStateSnapshot(),
 )
 
 /**
@@ -159,6 +230,69 @@ class SentinelWorkforceCoordinator {
     private var totalLocalCleanChapterChecks: Int = 0
     private var totalCloudEscalatedChapterChecks: Int = 0
 
+    // Single authoritative rolling 3-minute boundary & idle/wake state
+    private var policy: RollingBoundaryPolicy = RollingBoundaryPolicy()
+    private var boundaryAnchored: Boolean = false
+    private var acknowledgedViewerPosMs: Long = 0L
+    private var durationMs: Long = 0L
+    private var boundaryEndMs: Long = 0L
+    private var schedulingGeneration: Long = 0L
+    private var isViewerPaused: Boolean = false
+    private var pausedSinceEpochMs: Long = 0L
+    private var isScrubberPreviewActive: Boolean = false
+    private var playbackSpeed: Float = 1.0f
+    private var pendingReviewDraftCount: Int = 0
+    private var outcomeState: SchedulerOutcomeState = SchedulerOutcomeState.ACTIVE
+    private var isTemporarilyIdle: Boolean = false
+    private var lastIdleAnchorMs: Long = -1L
+    private var lastIdleBoundaryEndMs: Long = -1L
+    private var lastWakeReason: String = ""
+    private var idleReason: String = ""
+    private var pausedDeadlineReached: Boolean = false
+
+    fun configurePolicy(newPolicy: RollingBoundaryPolicy) {
+        synchronized(lock) {
+            policy = newPolicy.copy(
+                horizonMs = newPolicy.horizonMs.coerceAtLeast(15_000L),
+                refillAdvanceMs = newPolicy.refillAdvanceMs.coerceAtLeast(1_000L),
+                maxPendingReviewDrafts = newPolicy.maxPendingReviewDrafts.coerceAtLeast(1),
+                maxRetriesPerInterval = newPolicy.maxRetriesPerInterval.coerceAtLeast(1),
+            )
+            recomputeBoundaryLocked()
+        }
+    }
+
+    fun currentPolicy(): RollingBoundaryPolicy = synchronized(lock) { policy }
+
+    fun currentSchedulingGeneration(): Long = synchronized(lock) { schedulingGeneration }
+
+    fun currentBoundaryEndMs(): Long = synchronized(lock) {
+        if (boundaryAnchored) boundaryEndMs else minOf(durationMs.takeIf { it > 0L } ?: policy.horizonMs, acknowledgedViewerPosMs + policy.horizonMs)
+    }
+
+    fun currentAcknowledgedViewerPosMs(): Long = synchronized(lock) { acknowledgedViewerPosMs }
+
+    fun isScrubberPreviewActive(): Boolean = synchronized(lock) { isScrubberPreviewActive }
+
+    fun isAnalysisDispatchAllowed(): Boolean = synchronized(lock) {
+        !isScrubberPreviewActive && quotaMode != QuotaSaverMode.ZERO_CLOUD
+    }
+
+    fun updatePendingReviewCount(count: Int) {
+        synchronized(lock) {
+            pendingReviewDraftCount = count.coerceAtLeast(0)
+        }
+    }
+
+    /**
+     * Backpressure guard: when Scout 1 gets ahead of Scout 2 and pending drafts hit
+     * [RollingBoundaryPolicy.maxPendingReviewDrafts], throttle/pause new Scout 1 preparation
+     * until Scout 2 drains review work.
+     */
+    fun shouldThrottleScout1ForReviewBackpressure(): Boolean = synchronized(lock) {
+        pendingReviewDraftCount >= policy.maxPendingReviewDrafts
+    }
+
     fun resetForProject(project: DialogueLensProject) {
         synchronized(lock) {
             projectId = project.id
@@ -172,8 +306,524 @@ class SentinelWorkforceCoordinator {
             totalCompletedRepairs = 0
             totalLocalCleanChapterChecks = 0
             totalCloudEscalatedChapterChecks = 0
+
+            val projDur = maxOf(
+                project.videoSource.durationMs,
+                project.chapters.maxOfOrNull { it.endMs } ?: 0L,
+                project.dialogueEvents.maxOfOrNull { it.endTimeMs } ?: 0L,
+            ).coerceAtLeast(0L)
+            durationMs = projDur
+            val persisted = project.schedulingState
+            if (persisted != null) {
+                acknowledgedViewerPosMs = persisted.acknowledgedViewerPosMs.coerceIn(0L, projDur.coerceAtLeast(0L))
+                schedulingGeneration = persisted.schedulingGeneration.coerceAtLeast(0L)
+                isViewerPaused = persisted.isViewerPaused
+                lastIdleAnchorMs = persisted.lastIdleAnchorMs
+                lastIdleBoundaryEndMs = persisted.lastIdleBoundaryEndMs
+                outcomeState = SchedulerOutcomeState.entries.firstOrNull { it.name == persisted.schedulerOutcome }
+                    ?: SchedulerOutcomeState.ACTIVE
+                isTemporarilyIdle = outcomeState == SchedulerOutcomeState.WINDOW_READY_IDLE ||
+                    outcomeState == SchedulerOutcomeState.UNRESOLVED_AFTER_BOUNDED_RECOVERY ||
+                    outcomeState == SchedulerOutcomeState.WHOLE_VIDEO_COMPLETE
+            } else {
+                acknowledgedViewerPosMs = project.lastPlaybackPositionMs.coerceIn(0L, projDur.coerceAtLeast(0L))
+                schedulingGeneration = 0L
+                isViewerPaused = false
+                lastIdleAnchorMs = -1L
+                lastIdleBoundaryEndMs = -1L
+                outcomeState = SchedulerOutcomeState.ACTIVE
+                isTemporarilyIdle = false
+            }
+            boundaryAnchored = projDur > 0L
+            isScrubberPreviewActive = false
+            pendingReviewDraftCount = 0
+            pausedSinceEpochMs = 0L
+            pausedDeadlineReached = false
+            idleReason = ""
+            lastWakeReason = "project_reset"
+            recomputeBoundaryLocked()
             planDefaultChapterPatrolLocked(project)
         }
+    }
+
+    /**
+     * Updates the rolling boundary from the viewer's ACTUAL acknowledged playback position.
+     * - Ignored while [isScrubberPreviewActive] is true so preview drags NEVER move the boundary.
+     * - Rejects stale callbacks carrying an older [seekGeneration].
+     * - While viewer is intentionally paused, the boundary stays strictly pinned to the paused
+     *   anchor and NEVER drifts forward as scouts advance.
+     *
+     * Returns `true` iff the scheduler transitioned from idle -> active due to meaningful playback
+     * advancement (hysteresis refill threshold crossed), so the worker loop wakes cleanly without
+     * timer-tick or self-publication churn.
+     */
+    fun updateAcknowledgedViewerPosition(
+        positionMs: Long,
+        durationMs: Long = this.durationMs,
+        isPlaying: Boolean = !this.isViewerPaused,
+        playbackSpeed: Float = this.playbackSpeed,
+        seekGeneration: Long = this.schedulingGeneration,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): Boolean = synchronized(lock) {
+        if (isScrubberPreviewActive) return@synchronized false
+        if (seekGeneration < schedulingGeneration) return@synchronized false
+
+        val nextDur = maxOf(durationMs, 0L)
+        if (nextDur > 0L) {
+            this.durationMs = nextDur
+        }
+        this.playbackSpeed = playbackSpeed.coerceIn(0.25f, 4.0f)
+
+        val clampedPos = if (this.durationMs > 0L) {
+            positionMs.coerceIn(0L, this.durationMs)
+        } else {
+            positionMs.coerceAtLeast(0L)
+        }
+
+        // Useful pausing rule: while paused, NEVER drift the anchored viewer position or boundary forward!
+        if (!isPlaying && isViewerPaused && boundaryAnchored) {
+            recomputeBoundaryLocked()
+            return@synchronized false
+        }
+
+        val wasPaused = isViewerPaused
+        isViewerPaused = !isPlaying
+        if (isViewerPaused && !wasPaused) {
+            pausedSinceEpochMs = nowEpochMs
+            pausedDeadlineReached = false
+        } else if (!isViewerPaused) {
+            pausedSinceEpochMs = 0L
+            pausedDeadlineReached = false
+        }
+
+        acknowledgedViewerPosMs = clampedPos
+        boundaryAnchored = this.durationMs > 0L
+        recomputeBoundaryLocked()
+
+        // Hysteresis wake-up check when temporarily idle
+        if (isTemporarilyIdle && outcomeState != SchedulerOutcomeState.WHOLE_VIDEO_COMPLETE) {
+            val anchorAdvance = if (lastIdleAnchorMs >= 0L) {
+                abs(acknowledgedViewerPosMs - lastIdleAnchorMs)
+            } else {
+                Long.MAX_VALUE
+            }
+            val boundaryAdvance = if (lastIdleBoundaryEndMs >= 0L) {
+                boundaryEndMs - lastIdleBoundaryEndMs
+            } else {
+                0L
+            }
+            val reachedVideoEndDelta = this.durationMs > 0L &&
+                boundaryEndMs >= this.durationMs &&
+                lastIdleBoundaryEndMs in 0L until this.durationMs
+            val leadDroppedBelowRefill = contiguousPlayheadLeadMs < policy.refillLeadThresholdMs &&
+                boundaryAdvance >= policy.minSubmittableSliceMs
+
+            if (anchorAdvance >= policy.refillAdvanceMs ||
+                boundaryAdvance >= policy.refillAdvanceMs ||
+                reachedVideoEndDelta ||
+                leadDroppedBelowRefill
+            ) {
+                isTemporarilyIdle = false
+                outcomeState = SchedulerOutcomeState.ACTIVE
+                idleReason = ""
+                lastWakeReason = "playback_advance_${acknowledgedViewerPosMs / 1000L}s"
+                return@synchronized true
+            }
+        }
+        false
+    }
+
+    fun onViewerPauseChanged(
+        paused: Boolean,
+        acknowledgedPositionMs: Long,
+        durationMs: Long = this.durationMs,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ) {
+        synchronized(lock) {
+            if (durationMs > 0L) this.durationMs = durationMs
+            val clamped = if (this.durationMs > 0L) {
+                acknowledgedPositionMs.coerceIn(0L, this.durationMs)
+            } else {
+                acknowledgedPositionMs.coerceAtLeast(0L)
+            }
+            isViewerPaused = paused
+            acknowledgedViewerPosMs = clamped
+            boundaryAnchored = this.durationMs > 0L
+            if (paused) {
+                pausedSinceEpochMs = nowEpochMs
+                pausedDeadlineReached = false
+            } else {
+                pausedSinceEpochMs = 0L
+                pausedDeadlineReached = false
+            }
+            recomputeBoundaryLocked()
+        }
+    }
+
+    fun onPlaybackSpeedChanged(speed: Float) {
+        synchronized(lock) {
+            playbackSpeed = speed.coerceIn(0.25f, 4.0f)
+        }
+    }
+
+    fun onScrubberPreviewStateChanged(isPreviewing: Boolean) {
+        synchronized(lock) {
+            isScrubberPreviewActive = isPreviewing
+        }
+    }
+
+    /**
+     * Committed seek: bumps [schedulingGeneration], clears preview mode, re-anchors the rolling
+     * 3-minute boundary to [targetPositionMs], prunes obsolete queued work outside the new
+     * boundary or from older generations, and wakes the scheduler cleanly.
+     */
+    fun onCommittedSeek(
+        targetPositionMs: Long,
+        durationMs: Long = this.durationMs,
+        isPlaying: Boolean = !this.isViewerPaused,
+        externalSeekGeneration: Long? = null,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): Long = synchronized(lock) {
+        if (durationMs > 0L) this.durationMs = durationMs
+        isScrubberPreviewActive = false
+        schedulingGeneration = if (externalSeekGeneration != null && externalSeekGeneration > schedulingGeneration) {
+            externalSeekGeneration
+        } else {
+            schedulingGeneration + 1L
+        }
+        val clamped = if (this.durationMs > 0L) {
+            targetPositionMs.coerceIn(0L, this.durationMs)
+        } else {
+            targetPositionMs.coerceAtLeast(0L)
+        }
+        acknowledgedViewerPosMs = clamped
+        isViewerPaused = !isPlaying
+        pausedSinceEpochMs = if (isViewerPaused) nowEpochMs else 0L
+        pausedDeadlineReached = false
+        boundaryAnchored = this.durationMs > 0L
+        recomputeBoundaryLocked()
+
+        // Cancel/prune obsolete queued items outside the new rolling boundary or from prior generations
+        queue.removeAll { item ->
+            val staleGen = item.schedulingGeneration > 0L && item.schedulingGeneration < schedulingGeneration
+            val outsideNewWindow = boundaryAnchored && (item.endMs <= acknowledgedViewerPosMs || item.startMs >= boundaryEndMs)
+            staleGen || (item.kind != SentinelTaskKind.USER_HEAL_BEACON && outsideNewWindow)
+        }
+        // Release stale reservations outside the new window
+        val obsoleteRes = reservations.values.filter { res ->
+            boundaryAnchored && (res.endMs <= acknowledgedViewerPosMs || res.startMs >= boundaryEndMs)
+        }.map { it.reservationId }
+        obsoleteRes.forEach { reservations.remove(it) }
+
+        isTemporarilyIdle = false
+        outcomeState = SchedulerOutcomeState.ACTIVE
+        idleReason = ""
+        lastIdleAnchorMs = -1L
+        lastIdleBoundaryEndMs = -1L
+        lastWakeReason = "committed_seek_${clamped / 1000L}s_gen$schedulingGeneration"
+        schedulingGeneration
+    }
+
+    /**
+     * Explicit external wake (new caption evidence, language/mode change, manual user repair/retry,
+     * restored network/quota capability). Never called by timer ticks or scout self-publication.
+     */
+    fun wakeForReason(reason: String, nowEpochMs: Long = System.currentTimeMillis()) {
+        synchronized(lock) {
+            isTemporarilyIdle = false
+            pausedDeadlineReached = false
+            if (isViewerPaused && pausedSinceEpochMs > 0L) {
+                pausedSinceEpochMs = nowEpochMs
+            }
+            if (outcomeState != SchedulerOutcomeState.WHOLE_VIDEO_COMPLETE) {
+                outcomeState = SchedulerOutcomeState.ACTIVE
+            }
+            idleReason = ""
+            lastWakeReason = reason
+        }
+    }
+
+    /**
+     * Authoritative submission gate checked before ANY preparation, review, changeover pre-listen,
+     * patrol, or automatic repair request is dispatched.
+     * Accounts for [overlapMs] and optional ceiling-to-second rounding so the ACTUAL submitted
+     * interval end NEVER crosses `min(durationMs, acknowledgedViewerPosMs + policy.horizonMs)`.
+     */
+    fun clipOrDeferToBoundary(
+        startMs: Long,
+        endMs: Long,
+        overlapMs: Long = policy.chunkOverlapMs,
+        roundingUpToSec: Boolean = true,
+        minSliceMs: Long = policy.minSubmittableSliceMs,
+    ): BoundarySubmissionDecision = synchronized(lock) {
+        if (isScrubberPreviewActive) {
+            return@synchronized BoundarySubmissionDecision.DeferredOutsideBoundary(
+                reason = "Scrubber drag preview active; boundary locked at ${acknowledgedViewerPosMs / 1000L}s",
+                boundaryEndMs = boundaryEndMs,
+            )
+        }
+        val capMs = if (boundaryAnchored) {
+            boundaryEndMs
+        } else {
+            val dur = durationMs.takeIf { it > 0L } ?: maxOf(endMs, acknowledgedViewerPosMs + policy.horizonMs)
+            minOf(dur, acknowledgedViewerPosMs + policy.horizonMs)
+        }
+        val safeStart = startMs.coerceAtLeast(0L)
+        if (safeStart >= capMs) {
+            return@synchronized BoundarySubmissionDecision.DeferredOutsideBoundary(
+                reason = "Interval start ${safeStart}ms is at or beyond 3-minute boundary ${capMs}ms",
+                boundaryEndMs = capMs,
+            )
+        }
+        val safeOverlap = overlapMs.coerceAtLeast(0L)
+        val roundedCapMs = if (roundingUpToSec) {
+            (capMs / 1_000L) * 1_000L
+        } else {
+            capMs
+        }
+        val maxRawEndMs = (roundedCapMs - safeOverlap).coerceAtLeast(0L)
+        val clippedEnd = minOf(endMs, maxRawEndMs)
+        val spanMs = clippedEnd - safeStart
+        val reachesActualEnd = durationMs > 0L && clippedEnd >= durationMs && spanMs > 0L
+        if (spanMs <= 0L || (!reachesActualEnd && spanMs < minSliceMs)) {
+            return@synchronized BoundarySubmissionDecision.DeferredOutsideBoundary(
+                reason = "Clipped span ${spanMs}ms below minimum slice ${minSliceMs}ms at boundary ${capMs}ms",
+                boundaryEndMs = capMs,
+            )
+        }
+        val effectiveSubmittedEnd = if (roundingUpToSec) {
+            val endSec = ((clippedEnd + safeOverlap + 999L) / 1_000L)
+            endSec * 1_000L
+        } else {
+            clippedEnd + safeOverlap
+        }
+        if (effectiveSubmittedEnd > capMs) {
+            // Double-check safety invariant: never allow rounded+overlapped end to cross capMs
+            val safeEndSec = (capMs / 1_000L)
+            val tightenedRawEnd = (safeEndSec * 1_000L - safeOverlap).coerceAtLeast(safeStart)
+            val tightenedSpan = tightenedRawEnd - safeStart
+            if (tightenedSpan <= 0L || (!reachesActualEnd && tightenedSpan < minSliceMs)) {
+                return@synchronized BoundarySubmissionDecision.DeferredOutsideBoundary(
+                    reason = "Rounded/overlapped submission would cross boundary ${capMs}ms",
+                    boundaryEndMs = capMs,
+                )
+            }
+            return@synchronized BoundarySubmissionDecision.Allowed(
+                startMs = safeStart,
+                endMs = tightenedRawEnd,
+                wasClipped = tightenedRawEnd < endMs,
+                effectiveSubmittedEndMs = minOf(capMs, tightenedRawEnd + safeOverlap),
+                schedulingGeneration = schedulingGeneration,
+            )
+        }
+        BoundarySubmissionDecision.Allowed(
+            startMs = safeStart,
+            endMs = clippedEnd,
+            wasClipped = clippedEnd < endMs,
+            effectiveSubmittedEndMs = effectiveSubmittedEnd,
+            schedulingGeneration = schedulingGeneration,
+        )
+    }
+
+    /**
+     * Evaluates the honest, terminal or temporary-idle state inside the active 3-minute window:
+     * 1. [SchedulerOutcomeState.WHOLE_VIDEO_COMPLETE] ONLY when the entire video is verified.
+     * 2. [SchedulerOutcomeState.WAITING_FOR_EVIDENCE_OR_CAPABILITY] when ZERO_CLOUD / quota-limited
+     *    and unverified work remains inside the window.
+     * 3. [SchedulerOutcomeState.UNRESOLVED_AFTER_BOUNDED_RECOVERY] when retries or paused deadline
+     *    are exhausted and unresolved gaps remain in `[acknowledgedViewerPosMs, boundaryEndMs]`.
+     * 4. [SchedulerOutcomeState.WINDOW_READY_IDLE] when `[acknowledgedViewerPosMs, boundaryEndMs]`
+     *    has no remaining eligible prep/review/repair work, while remaining video past boundary exists.
+     * 5. [SchedulerOutcomeState.ACTIVE] otherwise.
+     */
+    fun evaluateSchedulerOutcome(
+        ledger: TranscriptCoverageLedger,
+        quotaMode: QuotaSaverMode = this.quotaMode,
+        quotaExhausted: Boolean = false,
+        hasPendingReviews: Boolean = pendingReviewDraftCount > 0,
+        hasEligibleQualityWork: Boolean = false,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): SchedulerStateSnapshot = synchronized(lock) {
+        this.quotaMode = quotaMode
+        val ledgerDur = ledger.totalDurationMs()
+        if (ledgerDur > 0L) {
+            durationMs = maxOf(durationMs, ledgerDur)
+            boundaryAnchored = true
+            recomputeBoundaryLocked()
+        }
+        val leadMs = ledger.continuousVerifiedLeadFrom(acknowledgedViewerPosMs)
+        contiguousPlayheadLeadMs = leadMs
+
+        val windowStart = acknowledgedViewerPosMs.coerceIn(0L, durationMs.coerceAtLeast(0L))
+        val windowEnd = boundaryEndMs.coerceIn(windowStart, durationMs.coerceAtLeast(0L))
+
+        val pausedDeadlineExpired = isViewerPaused &&
+            pausedSinceEpochMs > 0L &&
+            (nowEpochMs - pausedSinceEpochMs) >= policy.pausedQualityDeadlineMs
+        pausedDeadlineReached = pausedDeadlineExpired
+
+        val nextWorkInWindow = ledger.nextPriorityInterval(
+            playheadMs = windowStart,
+            maxRetryAttempts = policy.maxRetriesPerInterval,
+            lookaheadHorizonMs = policy.horizonMs,
+            enforceHardHorizon = true,
+            chunkOverlapMs = policy.chunkOverlapMs,
+            roundingUpToSecond = true,
+            minSliceMs = policy.minSubmittableSliceMs,
+        )
+        val wholeVideoVerified = durationMs > 0L &&
+            windowEnd >= durationMs &&
+            ledger.isFullyVerified() &&
+            !hasPendingReviews
+        val windowVerified = durationMs > 0L &&
+            ledger.isWindowVerified(windowStart, windowEnd) &&
+            !hasPendingReviews
+        val unresolvedInWindow = ledger.unresolvedIntervalsInWindow(windowStart, windowEnd)
+        val hasExhaustedUnresolved = ledger.hasExhaustedUnresolvedInWindow(
+            windowStartMs = windowStart,
+            windowEndMs = windowEnd,
+            maxRetryAttempts = policy.maxRetriesPerInterval,
+        )
+
+        val nextOutcome: SchedulerOutcomeState
+        val nextIdle: Boolean
+        val nextIdleReason: String
+
+        when {
+            wholeVideoVerified -> {
+                nextOutcome = SchedulerOutcomeState.WHOLE_VIDEO_COMPLETE
+                nextIdle = true
+                nextIdleReason = "Entire video verified"
+            }
+            (quotaMode == QuotaSaverMode.ZERO_CLOUD || quotaExhausted) && !windowVerified && !hasPendingReviews -> {
+                nextOutcome = SchedulerOutcomeState.WAITING_FOR_EVIDENCE_OR_CAPABILITY
+                nextIdle = true
+                nextIdleReason = if (quotaMode == QuotaSaverMode.ZERO_CLOUD) {
+                    "Free CC Only mode active (0 AI requests)"
+                } else {
+                    "Cloud quota exhausted; waiting for captions or capability"
+                }
+            }
+            unresolvedInWindow.isNotEmpty() && !hasPendingReviews &&
+                (nextWorkInWindow == null || hasExhaustedUnresolved || pausedDeadlineExpired) -> {
+                nextOutcome = SchedulerOutcomeState.UNRESOLVED_AFTER_BOUNDED_RECOVERY
+                nextIdle = true
+                nextIdleReason = if (pausedDeadlineExpired) {
+                    "Paused recovery deadline reached with ${unresolvedInWindow.size} unresolved span(s)"
+                } else {
+                    "Bounded retries exhausted for ${unresolvedInWindow.size} unresolved span(s)"
+                }
+            }
+            windowVerified && !hasEligibleQualityWork -> {
+                nextOutcome = SchedulerOutcomeState.WINDOW_READY_IDLE
+                nextIdle = true
+                nextIdleReason = "Current window ready through ${windowEnd / 1000L}s"
+            }
+            nextWorkInWindow == null && !hasPendingReviews && !hasEligibleQualityWork -> {
+                nextOutcome = if (unresolvedInWindow.isEmpty()) {
+                    SchedulerOutcomeState.WINDOW_READY_IDLE
+                } else {
+                    SchedulerOutcomeState.UNRESOLVED_AFTER_BOUNDED_RECOVERY
+                }
+                nextIdle = true
+                nextIdleReason = if (unresolvedInWindow.isEmpty()) {
+                    "No eligible work inside boundary (${windowEnd / 1000L}s)"
+                } else {
+                    "Unresolved gap(s) remain after bounded recovery"
+                }
+            }
+            else -> {
+                nextOutcome = SchedulerOutcomeState.ACTIVE
+                nextIdle = false
+                nextIdleReason = ""
+            }
+        }
+
+        if (nextIdle && (!isTemporarilyIdle || outcomeState != nextOutcome)) {
+            lastIdleAnchorMs = windowStart
+            lastIdleBoundaryEndMs = windowEnd
+        }
+        outcomeState = nextOutcome
+        isTemporarilyIdle = nextIdle
+        idleReason = nextIdleReason
+        buildSchedulerSnapshotLocked()
+    }
+
+    fun schedulerSnapshot(): SchedulerStateSnapshot = synchronized(lock) {
+        buildSchedulerSnapshotLocked()
+    }
+
+    fun exportPersistedState(nowEpochMs: Long = System.currentTimeMillis()): PersistedSchedulingState = synchronized(lock) {
+        PersistedSchedulingState(
+            acknowledgedViewerPosMs = acknowledgedViewerPosMs,
+            horizonMs = policy.horizonMs,
+            schedulingGeneration = schedulingGeneration,
+            isViewerPaused = isViewerPaused,
+            lastIdleAnchorMs = lastIdleAnchorMs,
+            lastIdleBoundaryEndMs = lastIdleBoundaryEndMs,
+            schedulerOutcome = outcomeState.name,
+            savedAtEpochMs = nowEpochMs,
+        )
+    }
+
+    fun restorePersistedState(persisted: PersistedSchedulingState, mediaDurationMs: Long) {
+        synchronized(lock) {
+            durationMs = mediaDurationMs.coerceAtLeast(0L)
+            policy = policy.copy(horizonMs = persisted.horizonMs.coerceAtLeast(15_000L))
+            acknowledgedViewerPosMs = persisted.acknowledgedViewerPosMs.coerceIn(0L, durationMs.coerceAtLeast(0L))
+            schedulingGeneration = persisted.schedulingGeneration.coerceAtLeast(0L)
+            isViewerPaused = persisted.isViewerPaused
+            lastIdleAnchorMs = persisted.lastIdleAnchorMs
+            lastIdleBoundaryEndMs = persisted.lastIdleBoundaryEndMs
+            outcomeState = SchedulerOutcomeState.entries.firstOrNull { it.name == persisted.schedulerOutcome }
+                ?: SchedulerOutcomeState.ACTIVE
+            isTemporarilyIdle = outcomeState == SchedulerOutcomeState.WINDOW_READY_IDLE ||
+                outcomeState == SchedulerOutcomeState.UNRESOLVED_AFTER_BOUNDED_RECOVERY ||
+                outcomeState == SchedulerOutcomeState.WHOLE_VIDEO_COMPLETE
+            boundaryAnchored = durationMs > 0L
+            recomputeBoundaryLocked()
+        }
+    }
+
+    private fun recomputeBoundaryLocked() {
+        boundaryEndMs = if (durationMs > 0L) {
+            minOf(durationMs, acknowledgedViewerPosMs + policy.horizonMs)
+        } else {
+            acknowledgedViewerPosMs + policy.horizonMs
+        }
+    }
+
+    private fun buildSchedulerSnapshotLocked(): SchedulerStateSnapshot {
+        val safeSpeed = playbackSpeed.coerceIn(0.25f, 4.0f)
+        val viewingReserveMs = (contiguousPlayheadLeadMs.toDouble() / safeSpeed.toDouble()).toLong().coerceAtLeast(0L)
+        return SchedulerStateSnapshot(
+            acknowledgedViewerPosMs = acknowledgedViewerPosMs,
+            durationMs = durationMs,
+            boundaryEndMs = boundaryEndMs,
+            schedulingGeneration = schedulingGeneration,
+            isViewerPaused = isViewerPaused,
+            isScrubberPreviewActive = isScrubberPreviewActive,
+            playbackSpeed = safeSpeed,
+            continuousVerifiedLeadMs = contiguousPlayheadLeadMs,
+            viewingTimeReserveMs = viewingReserveMs,
+            pendingReviewDraftCount = pendingReviewDraftCount,
+            isScout1ThrottledForReviewBackpressure = pendingReviewDraftCount >= policy.maxPendingReviewDrafts,
+            outcomeState = outcomeState,
+            isTemporarilyIdle = isTemporarilyIdle,
+            lastIdleAnchorMs = lastIdleAnchorMs,
+            lastIdleBoundaryEndMs = lastIdleBoundaryEndMs,
+            lastWakeReason = lastWakeReason,
+            idleReason = idleReason,
+            pausedDeadlineReached = pausedDeadlineReached,
+            policy = policy,
+        )
+    }
+
+    private fun isWithinActiveBoundaryLocked(item: SentinelWorkItem): Boolean {
+        if (!boundaryAnchored) return true
+        if (item.kind == SentinelTaskKind.USER_HEAL_BEACON) return true
+        // Must overlap [acknowledgedViewerPosMs, boundaryEndMs) and not extend past boundaryEndMs
+        return item.startMs < boundaryEndMs && item.endMs <= boundaryEndMs
     }
 
     fun updateRuntimeConditions(
@@ -274,6 +924,8 @@ class SentinelWorkforceCoordinator {
                 "${leadChapter.title} (+${group.size - 1})"
             }
             val existing = chapterRecords[leadChapter.id]
+            val withinBoundary = !boundaryAnchored || windowStart < boundaryEndMs
+            val clippedEnd = if (boundaryAnchored) minOf(windowEnd, boundaryEndMs) else windowEnd
             if (existing == null) {
                 val record = ChapterPatrolRecord(
                     chapterId = leadChapter.id,
@@ -281,19 +933,47 @@ class SentinelWorkforceCoordinator {
                     boundaryMs = leadChapter.startMs,
                     windowStartMs = windowStart,
                     windowEndMs = windowEnd,
+                    status = if (withinBoundary) {
+                        ChapterInspectionStatus.INSPECTION_QUEUED
+                    } else {
+                        ChapterInspectionStatus.NOT_INSPECTED
+                    },
+                    summary = if (withinBoundary) {
+                        "Queued for chapter transition check"
+                    } else {
+                        "Deferred until within 3-minute boundary"
+                    },
+                )
+                chapterRecords[leadChapter.id] = record
+                if (withinBoundary && clippedEnd > windowStart) {
+                    enqueueLocked(
+                        SentinelWorkItem(
+                            id = "patrol_${leadChapter.id}",
+                            tier = SentinelPriorityTier.PREVENTIVE_MAINTENANCE,
+                            kind = SentinelTaskKind.CHAPTER_BOUNDARY_PATROL,
+                            startMs = windowStart,
+                            endMs = clippedEnd,
+                            chapterId = leadChapter.id,
+                            chapterTitle = combinedTitle,
+                            schedulingGeneration = schedulingGeneration,
+                        )
+                    )
+                }
+            } else if (existing.status == ChapterInspectionStatus.NOT_INSPECTED && withinBoundary && clippedEnd > windowStart) {
+                chapterRecords[leadChapter.id] = existing.copy(
                     status = ChapterInspectionStatus.INSPECTION_QUEUED,
                     summary = "Queued for chapter transition check",
                 )
-                chapterRecords[leadChapter.id] = record
                 enqueueLocked(
                     SentinelWorkItem(
                         id = "patrol_${leadChapter.id}",
                         tier = SentinelPriorityTier.PREVENTIVE_MAINTENANCE,
                         kind = SentinelTaskKind.CHAPTER_BOUNDARY_PATROL,
                         startMs = windowStart,
-                        endMs = windowEnd,
+                        endMs = clippedEnd,
                         chapterId = leadChapter.id,
                         chapterTitle = combinedTitle,
+                        schedulingGeneration = schedulingGeneration,
                     )
                 )
             }
@@ -354,9 +1034,21 @@ class SentinelWorkforceCoordinator {
             }
         }
 
-        val minHorizon = (playheadMs + 2_000L).coerceAtLeast(0L)
-        val maxHorizon = (playheadMs + lookaheadMaxMs).coerceAtMost(durationMs)
-        val preferredMin = playheadMs + lookaheadMinMs
+        val effectiveAnchor = if (boundaryAnchored) acknowledgedViewerPosMs else playheadMs.coerceAtLeast(0L)
+        val hardBoundaryEnd = if (boundaryAnchored) {
+            boundaryEndMs
+        } else {
+            minOf(durationMs, effectiveAnchor + policy.horizonMs)
+        }
+        val lookaheadOrigin = if (isViewerPaused) {
+            effectiveAnchor
+        } else {
+            maxOf(effectiveAnchor, playheadMs.coerceAtLeast(0L))
+        }
+        val minHorizon = (lookaheadOrigin + 2_000L).coerceAtLeast(0L)
+        val maxHorizon = minOf(lookaheadOrigin + lookaheadMaxMs, hardBoundaryEnd, durationMs)
+        val preferredMin = lookaheadOrigin + lookaheadMinMs
+        if (maxHorizon <= minHorizon) return@synchronized emptyList()
 
         val newlyQueued = mutableListOf<SentinelWorkItem>()
         val candidates = mergedSeams
@@ -368,19 +1060,23 @@ class SentinelWorkforceCoordinator {
         for ((seamMs, chapter) in candidates) {
             val seamKey = changeoverSeamKey(seamMs)
             if (seamKey in preListenedSeamKeys) continue
-            val winStart = (seamMs - CHANGEOVER_PRE_MS).coerceAtLeast(0L)
-            val winEnd = (seamMs + CHANGEOVER_POST_MS).coerceAtMost(durationMs)
-            if (winEnd - winStart < 4_000L) continue
+            val rawWinStart = (seamMs - CHANGEOVER_PRE_MS).coerceAtLeast(0L)
+            val rawWinEnd = (seamMs + CHANGEOVER_POST_MS).coerceAtMost(durationMs)
+            // Enforce rolling boundary INCLUDING second-rounding margin so changeover pre-listen NEVER crosses boundaryEndMs
+            val roundedCapMs = (hardBoundaryEnd / 1_000L) * 1_000L
+            val winEnd = minOf(rawWinEnd, roundedCapMs)
+            if (winEnd - rawWinStart < 4_000L) continue
 
             val item = SentinelWorkItem(
                 id = seamKey,
                 tier = SentinelPriorityTier.PREVENTIVE_MAINTENANCE,
                 kind = SentinelTaskKind.CHANGEOVER_PRELISTEN,
-                startMs = winStart,
+                startMs = rawWinStart,
                 endMs = winEnd,
                 chapterId = chapter?.id,
                 chapterTitle = chapter?.title ?: "Transition ${seamMs / 1000L}s",
                 createdAtEpochMs = nowEpochMs + (seamMs / 1000L),
+                schedulingGeneration = schedulingGeneration,
             )
             if (enqueueLocked(item)) {
                 newlyQueued.add(item)
@@ -413,17 +1109,25 @@ class SentinelWorkforceCoordinator {
         workerId: String = WORKER_2_ID,
         nowEpochMs: Long = System.currentTimeMillis(),
     ): Pair<SentinelWorkItem, IntervalReservation>? = synchronized(lock) {
+        if (isScrubberPreviewActive || quotaMode == QuotaSaverMode.ZERO_CLOUD) return@synchronized null
         val activeCount = workers.values.count { it.isActive }
         val isWorkerAlreadyActive = workers[workerId]?.isActive == true
         if (!isWorkerAlreadyActive && activeCount >= maxAllowedWorkersLocked()) {
             return@synchronized null
         }
         if (isPatrolSuspendedLocked()) return@synchronized null
+        // Priority order rule: required Scout 2 review always runs before preventive changeover pre-listen!
+        if (queue.any { it.kind == SentinelTaskKind.SCOUT2_REQUIRED_REVIEW }) return@synchronized null
 
         val iterator = queue.iterator()
         while (iterator.hasNext()) {
             val item = iterator.next()
             if (item.kind != SentinelTaskKind.CHANGEOVER_PRELISTEN) continue
+            if (item.schedulingGeneration > 0L && item.schedulingGeneration < schedulingGeneration) {
+                iterator.remove()
+                continue
+            }
+            if (!isWithinActiveBoundaryLocked(item)) continue
             val reservation = tryReserveInterval(workerId, item.startMs, item.endMs, item.tier, nowEpochMs)
                 ?: continue
             iterator.remove()
@@ -678,10 +1382,24 @@ class SentinelWorkforceCoordinator {
             return@synchronized null
         }
 
+        if (isScrubberPreviewActive) return@synchronized null
         val suspendPatrol = isPatrolSuspendedLocked()
         val iterator = queue.iterator()
         while (iterator.hasNext()) {
             val item = iterator.next()
+            if (item.schedulingGeneration > 0L && item.schedulingGeneration < schedulingGeneration) {
+                iterator.remove()
+                continue
+            }
+            if (!isWithinActiveBoundaryLocked(item)) {
+                continue
+            }
+            if (item.kind == SentinelTaskKind.PLAYBACK_LOOKAHEAD &&
+                pendingReviewDraftCount >= policy.maxPendingReviewDrafts
+            ) {
+                // Backpressure: pause new Scout 1 preparation while Scout 2 review queue is full
+                continue
+            }
             if (suspendPatrol &&
                 item.kind != SentinelTaskKind.SCOUT2_REQUIRED_REVIEW &&
                 item.tier.rank >= SentinelPriorityTier.PREVENTIVE_MAINTENANCE.rank
@@ -885,6 +1603,7 @@ class SentinelWorkforceCoordinator {
             totalCompletedRepairs = totalCompletedRepairs,
             totalLocalCleanChapterChecks = totalLocalCleanChapterChecks,
             totalCloudEscalatedChapterChecks = totalCloudEscalatedChapterChecks,
+            schedulerState = buildSchedulerSnapshotLocked(),
         )
     }
 

@@ -423,6 +423,18 @@ data class BalloonStyleSettings(
 )
 
 @JsonClass(generateAdapter = true)
+data class PersistedSchedulingState(
+    val acknowledgedViewerPosMs: Long = 0L,
+    val horizonMs: Long = 180_000L,
+    val schedulingGeneration: Long = 0L,
+    val isViewerPaused: Boolean = false,
+    val lastIdleAnchorMs: Long = -1L,
+    val lastIdleBoundaryEndMs: Long = -1L,
+    val schedulerOutcome: String = "ACTIVE",
+    val savedAtEpochMs: Long = 0L,
+)
+
+@JsonClass(generateAdapter = true)
 data class DialogueLensProject(
     val id: String,
     val title: String,
@@ -451,6 +463,7 @@ data class DialogueLensProject(
     val lastPlaybackPositionMs: Long = 0L,
     val lastWatchedAtEpochMs: Long = 0L,
     val coveragePercent: Int = 0,
+    val schedulingState: PersistedSchedulingState? = null,
 )
 
 /**
