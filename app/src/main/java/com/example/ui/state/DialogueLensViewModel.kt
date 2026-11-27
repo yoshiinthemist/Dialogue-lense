@@ -101,7 +101,10 @@ import com.example.domain.pipeline.DraftInterval
 import com.example.domain.pipeline.IntervalReviewOutcome
 import com.example.domain.pipeline.ReleasedPlaybackSnapshot
 import com.example.domain.pipeline.ReleasedTimelineStore
+import com.example.domain.pipeline.Scout1CueTimestamp
+import com.example.domain.pipeline.Scout1TimestampReport
 import com.example.domain.pipeline.Scout2IndependentReviewer
+import com.example.domain.pipeline.ScoutClockProvenance
 import com.example.domain.pipeline.YouTubeCapabilityReport
 import com.example.domain.playback.PlaybackReadinessController
 import com.example.domain.playback.PlaybackReadinessSnapshot
@@ -741,6 +744,38 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
      * via the same [BalloonLayoutEngine] -> ReleasedTimelineStore atomically publishes the reviewed
      * interval (or rejects stale session/seek/config/revision writes).
      */
+    private fun buildScout1TimestampReport(
+        windowStartMs: Long,
+        windowEndMs: Long,
+        events: List<DialogueEvent>,
+        rawCuesByEventId: Map<String, AiTranscribedCue> = emptyMap(),
+        explicitProvenance: ScoutClockProvenance? = null,
+    ): Scout1TimestampReport {
+        val provenance = explicitProvenance ?: when {
+            rawCuesByEventId.isEmpty() -> ScoutClockProvenance.WINDOW_FALLBACK
+            rawCuesByEventId.values.any { it.appliedClockOffsetMs > 0L } -> ScoutClockProvenance.OFFSET_SHIFTED_RELATIVE
+            else -> ScoutClockProvenance.ABSOLUTE_VIDEO_SEC
+        }
+        val entries = events.map { evt ->
+            val raw = rawCuesByEventId[evt.id]
+            Scout1CueTimestamp(
+                eventId = evt.id,
+                stableCueKey = evt.canonicalIdentityKey,
+                reportedStartMs = evt.startTimeMs,
+                reportedEndMs = evt.endTimeMs,
+                rawStartSec = raw?.rawStartSec,
+                rawEndSec = raw?.rawEndSec,
+                appliedClockOffsetMs = raw?.appliedClockOffsetMs ?: 0L,
+            )
+        }
+        return Scout1TimestampReport(
+            windowStartMs = windowStartMs,
+            windowEndMs = windowEndMs,
+            clockProvenance = provenance,
+            cueTimestamps = entries,
+        )
+    }
+
     internal fun stageAndReviewIntervalThroughReleaseGate(
         project: DialogueLensProject,
         intervalId: String,
@@ -755,6 +790,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         hasIndependentAudioOrFrameEvidence: Boolean = false,
         elapsedProcessingMs: Long = 0L,
         expectedConfigFingerprint: String? = null,
+        timestampReport: Scout1TimestampReport? = null,
     ): Pair<IntervalReviewOutcome?, ReleasedPlaybackSnapshot> {
         if (elapsedProcessingMs > 0L) {
             readinessController.recordProcessingLatencyMs(elapsedProcessingMs)
@@ -764,6 +800,11 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         val nowMs = System.currentTimeMillis()
         val draftRev = nextDraftRevision.incrementAndGet()
         val refTrack = releaseStore.currentReferenceTrack()
+        val resolvedReport = timestampReport ?: buildScout1TimestampReport(
+            windowStartMs = startMs,
+            windowEndMs = endMs,
+            events = events,
+        )
         val draft = DraftInterval(
             intervalId = intervalId,
             mediaId = project.id,
@@ -784,10 +825,15 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             hasUnavailableEvidence = hasUnavailableEvidence,
             hasIndependentAudioOrFrameEvidence = hasIndependentAudioOrFrameEvidence,
             createdAtEpochMs = nowMs,
+            timestampReport = resolvedReport,
         )
         if (!releaseStore.stageDraft(draft)) {
             return null to releaseStore.snapshot()
         }
+        val reportSummaryLabel = "Scout 1 report: ${resolvedReport.cueTimestamps.size} cues · " +
+            "${SubtitleParser.formatCompactTime(startMs)}–${SubtitleParser.formatCompactTime(endMs)} · " +
+            resolvedReport.clockProvenance.name
+        sentinelCoordinator.recordScout1TimestampReportSummary(reportSummaryLabel)
         sentinelCoordinator.updatePendingReviewCount(releaseStore.pendingDraftCount())
 
         // Dependent Stage Scheduler: Scout 2 review runs at CRITICAL priority and is NEVER suspended by low lead
@@ -824,7 +870,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 )
             }
             val deferredSnap = releaseStore.snapshot()
-            _uiState.update { it.copy(releaseSnapshot = deferredSnap) }
+            _uiState.update {
+                it.copy(
+                    releaseSnapshot = deferredSnap,
+                    sentinelSnapshot = sentinelCoordinator.inspectorSnapshot(),
+                )
+            }
             wakeScheduler("review_claim_deferred")
             return null to deferredSnap
         }
@@ -862,7 +913,16 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             outcome = outcome,
             nowEpochMs = System.currentTimeMillis(),
         )
+        if (releasedSnap != null) {
+            sentinelCoordinator.recordScoutTimestampAudit(
+                reportSummary = outcome.scout1ReportSummary.ifBlank { reportSummaryLabel },
+                verifiedCount = outcome.timestampVerifiedCount,
+                adjustedCount = outcome.timestampAdjustedCount,
+                adjustments = outcome.timestampAdjustments,
+            )
+        }
         sentinelCoordinator.updatePendingReviewCount(releaseStore.pendingDraftCount())
+        _uiState.update { it.copy(sentinelSnapshot = sentinelCoordinator.inspectorSnapshot()) }
         return if (releasedSnap != null) outcome to releasedSnap else null to releaseStore.snapshot()
     }
 
@@ -1530,6 +1590,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     if (outcome != null && isRequestContextCurrent(ctx)) {
                         val snap = releaseStore.commitReviewedRelease(draft, outcome, System.currentTimeMillis())
                         if (snap != null) {
+                            sentinelCoordinator.recordScoutTimestampAudit(
+                                reportSummary = outcome.scout1ReportSummary,
+                                verifiedCount = outcome.timestampVerifiedCount,
+                                adjustedCount = outcome.timestampAdjustedCount,
+                                adjustments = outcome.timestampAdjustments,
+                            )
                             drainedAny = true
                             val liveProj = _uiState.value.project
                             val canPublish = !LookaheadWindowPlanner.hasLoadedSubtitlesLocked(
@@ -1951,8 +2017,10 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                             if (reconciledCues.isNotEmpty()) {
                                 val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
                                 val hintMap = mutableMapOf<String, AiTranslatedLine>()
+                                val rawCuesByEventId = mutableMapOf<String, AiTranscribedCue>()
                                 val incomingEvents = reconciledCues.map { cue ->
                                     val eventId = SubtitleParser.newEventId()
+                                    rawCuesByEventId[eventId] = cue
                                     val isOffOrNonSpoken = cue.dialogueType != DialogueType.SPOKEN
                                     val spatialAnchor = if (!isOffOrNonSpoken && cue.anchorX != null && cue.anchorY != null) {
                                         NormalizedPoint(cue.anchorX, cue.anchorY)
@@ -2054,6 +2122,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                         }
                                     }
                                     val seamEvents = finalEvents.filter { it.startTimeMs in seamStartMs until seamEndMs }
+                                    val seamTimestampReport = buildScout1TimestampReport(
+                                        windowStartMs = seamStartMs,
+                                        windowEndMs = seamEndMs,
+                                        events = seamEvents,
+                                        rawCuesByEventId = rawCuesByEventId,
+                                    )
                                     val (reviewOutcome, releaseSnap) = stageAndReviewIntervalThroughReleaseGate(
                                         project = workingProj.copy(speakers = attributedSpeakers, dialogueEvents = finalEvents),
                                         intervalId = "seam_${seamStartMs}_${seamEndMs}",
@@ -2066,6 +2140,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                         hasIndependentAudioOrFrameEvidence = false,
                                         elapsedProcessingMs = (System.currentTimeMillis() - seamExecStartMs).coerceAtLeast(1L),
                                         expectedConfigFingerprint = requestCtx.configFingerprint,
+                                        timestampReport = seamTimestampReport,
                                     )
                                     if (reviewOutcome != null) {
                                         val mergedReviewed = mergeReleasedIntervalPreservingLocks(
@@ -4096,9 +4171,46 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
         if (cues.isEmpty()) return
 
-        val rawEvents = cues.map { c ->
+        var workingAudioProj = latestProj
+        val (reconciledCues, reconciledUpdates, _) = reconcileWindowOutcomeSpeakersAndCues(
+            existingSpeakers = workingAudioProj.speakers,
+            cues = cues,
+            speakerUpdates = detailed.speakerUpdates,
+        )
+        if (reconciledUpdates.isNotEmpty()) {
+            val (castMerged, updatedMem) = mergeCastSlotAssignments(
+                project = workingAudioProj,
+                assignments = reconciledUpdates,
+                rememberedColors = _uiState.value.characterColorMemory,
+                reconcileColors = attributionEngine::reconcileCharacterColors,
+                discoveryTimestampMs = clippedStartMs,
+            )
+            if (updatedMem != _uiState.value.characterColorMemory) {
+                persistCharacterColorMemory(updatedMem)
+            }
+            workingAudioProj = castMerged
+        }
+
+        val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
+        val hintMap = mutableMapOf<String, AiTranslatedLine>()
+        val rawCuesByEventId = mutableMapOf<String, AiTranscribedCue>()
+        val rawEvents = reconciledCues.map { c ->
+            val id = SubtitleParser.newEventId()
+            rawCuesByEventId[id] = c
+            val slotUpper = c.suggestedSpeakerSlot.trim().uppercase()
+            hintMap[id] = AiTranslatedLine(
+                id = id,
+                naturalTranslation = c.naturalTranslation,
+                literalTranslation = c.literalTranslation,
+                romanization = c.romanization,
+                dialogueTypeHint = c.dialogueType,
+                speakerTurnHint = "UNCERTAIN",
+                suggestedSpeakerSlot = slotUpper.ifBlank { "UNCERTAIN" },
+                contextReason = c.contextReason,
+                culturalNote = c.culturalNote,
+            )
             DialogueEvent(
-                id = SubtitleParser.newEventId(),
+                id = id,
                 startTimeMs = c.startMs,
                 endTimeMs = c.endMs,
                 sourceText = c.sourceText,
@@ -4106,7 +4218,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 literalText = c.literalTranslation,
                 romanization = c.romanization,
                 speakerId = null,
-                speakerConfidence = 0.56f,
+                speakerConfidence = if (slotUpper in validSlots) 0.82f else 0.56f,
                 faceTrackId = null,
                 faceConfidence = 0f,
                 shotId = "shot_1",
@@ -4118,25 +4230,34 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
         }
         val paced = SubtitleParser.applyReadingPacingGuardrails(rawEvents)
         val mergeReport = LookaheadWindowPlanner.mergeWindowDialogueEventsWithReport(
-            existing = latestProj.dialogueEvents.filterNot { it.sourceText.startsWith("Web Cinema ready") },
+            existing = workingAudioProj.dialogueEvents.filterNot { it.sourceText.startsWith("Web Cinema ready") },
             incoming = paced,
             windowStartMs = clippedStartMs,
             windowEndMs = clippedEndMs + 1_000L,
         )
         coverageLedger.recordDuplicateDecisions(mergeReport.decisions)
+        cachedAiTurnHints.putAll(hintMap)
         val (updatedSpeakers, attributed) = attributionEngine.assignSpeakers(
             events = mergeReport.events,
-            shots = latestProj.shots,
-            faceTracks = latestProj.faceTracks,
-            existingSpeakers = latestProj.speakers,
+            shots = workingAudioProj.shots,
+            faceTracks = workingAudioProj.faceTracks,
+            existingSpeakers = workingAudioProj.speakers,
+            turnHints = cachedAiTurnHints,
             rememberedCharacterColors = _uiState.value.characterColorMemory,
-            slotToSpeakerId = buildSlotToSpeakerIdMap(latestProj.speakers),
+            slotToSpeakerId = buildSlotToSpeakerIdMap(workingAudioProj.speakers),
         )
         if (!isRequestContextCurrent(item.requestCtx)) return
 
         val windowSlice = attributed.filter { it.startTimeMs in clippedStartMs until clippedEndMs }
+        val audioTimestampReport = buildScout1TimestampReport(
+            windowStartMs = clippedStartMs,
+            windowEndMs = clippedEndMs,
+            events = windowSlice,
+            rawCuesByEventId = rawCuesByEventId,
+            explicitProvenance = ScoutClockProvenance.CHUNK_RELATIVE_OFFSET,
+        )
         val (reviewOutcome, releaseSnap) = stageAndReviewIntervalThroughReleaseGate(
-            project = latestProj.copy(speakers = updatedSpeakers, dialogueEvents = attributed),
+            project = workingAudioProj.copy(speakers = updatedSpeakers, dialogueEvents = attributed),
             intervalId = "web_${clippedStartMs}_${clippedEndMs}",
             startMs = clippedStartMs,
             endMs = clippedEndMs,
@@ -4148,6 +4269,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
             hasIndependentAudioOrFrameEvidence = true,
             elapsedProcessingMs = elapsedMs,
             expectedConfigFingerprint = item.requestCtx.configFingerprint,
+            timestampReport = audioTimestampReport,
         )
         if (reviewOutcome == null) {
             _uiState.update { it.copy(releaseSnapshot = releaseSnap) }
@@ -8216,6 +8338,9 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                 var windowCoverageStatus: CoverageStatus = CoverageStatus.PENDING
                 var windowFailureReason = ""
                 var incrementRetryFlag = false
+                var mediaSpeakerUpdates: List<AiCastSlotAssignment> = emptyList()
+                val rawMediaCuesByEventId = mutableMapOf<String, AiTranscribedCue>()
+                var mediaClockProvenance: ScoutClockProvenance = ScoutClockProvenance.WINDOW_FALLBACK
 
                 val updatedEventsInWindow: List<DialogueEvent> = if (
                     allowCloudScout && (!hasPreloadedSubtitles || existingInWindow.isEmpty()) && wavChunk != null
@@ -8341,14 +8466,22 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                 incrementRetryFlag = true
                             }
                         }
-                        val aiCues = detailed.cues
-                        if (aiCues.isNotEmpty()) {
+                        val (reconciledMediaCues, reconciledMediaUpdates, _) = reconcileWindowOutcomeSpeakersAndCues(
+                            existingSpeakers = latestAfterDecode.speakers,
+                            cues = detailed.cues,
+                            speakerUpdates = detailed.speakerUpdates,
+                        )
+                        mediaSpeakerUpdates = reconciledMediaUpdates
+                        mediaClockProvenance = ScoutClockProvenance.CHUNK_RELATIVE_OFFSET
+                        if (reconciledMediaCues.isNotEmpty()) {
                             SubtitleParser.applyReadingPacingGuardrails(
-                                aiCues.map { c ->
+                                reconciledMediaCues.map { c ->
                                     val id = SubtitleParser.newEventId()
+                                    rawMediaCuesByEventId[id] = c
                                     val mid = (c.startMs + c.endMs) / 2L
                                     val sId = mergedShots.firstOrNull { mid in it.startMs..it.endMs }?.id
                                         ?: mergedShots.firstOrNull()?.id ?: "shot_1"
+                                    val slotUpper = c.suggestedSpeakerSlot.trim().uppercase()
                                     hintMap[id] = AiTranslatedLine(
                                         id = id,
                                         naturalTranslation = c.naturalTranslation,
@@ -8356,7 +8489,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                         romanization = c.romanization,
                                         dialogueTypeHint = c.dialogueType,
                                         speakerTurnHint = "UNCERTAIN",
-                                        suggestedSpeakerSlot = c.suggestedSpeakerSlot,
+                                        suggestedSpeakerSlot = slotUpper.ifBlank { "UNCERTAIN" },
                                         contextReason = c.contextReason,
                                         culturalNote = c.culturalNote,
                                     )
@@ -8369,7 +8502,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                         literalText = c.literalTranslation,
                                         romanization = c.romanization,
                                         speakerId = null,
-                                        speakerConfidence = 0.56f,
+                                        speakerConfidence = if (slotUpper in setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")) 0.80f else 0.56f,
                                         faceTrackId = null,
                                         faceConfidence = 0f,
                                         shotId = sId,
@@ -8505,21 +8638,37 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     break
                 }
 
+                var workingBeforeCommit = latestBeforeCommit
+                if (mediaSpeakerUpdates.isNotEmpty()) {
+                    val (castMerged, updatedMem) = mergeCastSlotAssignments(
+                        project = workingBeforeCommit,
+                        assignments = mediaSpeakerUpdates,
+                        rememberedColors = _uiState.value.characterColorMemory,
+                        reconcileColors = attributionEngine::reconcileCharacterColors,
+                        discoveryTimestampMs = nextWin.startMs,
+                    )
+                    if (updatedMem != _uiState.value.characterColorMemory) {
+                        persistCharacterColorMemory(updatedMem)
+                    }
+                    workingBeforeCommit = castMerged
+                }
+
                 val mergeReport = LookaheadWindowPlanner.mergeWindowDialogueEventsWithReport(
-                    existing = latestBeforeCommit.dialogueEvents.filterNot { it.sourceText.startsWith("Web Cinema ready") },
+                    existing = workingBeforeCommit.dialogueEvents.filterNot { it.sourceText.startsWith("Web Cinema ready") },
                     incoming = updatedEventsInWindow,
                     windowStartMs = nextWin.startMs,
                     windowEndMs = nextWin.endMs,
                 )
 
+                cachedAiTurnHints.putAll(hintMap)
                 val (updatedSpeakers, attributed) = attributionEngine.assignSpeakers(
                     events = mergeReport.events,
                     shots = mergedShots,
                     faceTracks = mergedFaces,
-                    existingSpeakers = latestBeforeCommit.speakers,
-                    turnHints = hintMap,
+                    existingSpeakers = workingBeforeCommit.speakers,
+                    turnHints = cachedAiTurnHints,
                     rememberedCharacterColors = _uiState.value.characterColorMemory,
-                    slotToSpeakerId = buildSlotToSpeakerIdMap(latestBeforeCommit.speakers),
+                    slotToSpeakerId = buildSlotToSpeakerIdMap(workingBeforeCommit.speakers),
                 )
 
                 var finalEvents = attributed
@@ -8530,8 +8679,15 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         windowCoverageStatus == CoverageStatus.PARTIAL_RECOVERY)
                 ) {
                     val windowSlice = attributed.filter { it.startTimeMs in nextWin.startMs until nextWin.endMs }
+                    val mediaTimestampReport = buildScout1TimestampReport(
+                        windowStartMs = nextWin.startMs,
+                        windowEndMs = nextWin.endMs,
+                        events = windowSlice,
+                        rawCuesByEventId = rawMediaCuesByEventId,
+                        explicitProvenance = mediaClockProvenance,
+                    )
                     val (reviewed, releaseSnap) = stageAndReviewIntervalThroughReleaseGate(
-                        project = latestBeforeCommit.copy(speakers = updatedSpeakers, dialogueEvents = attributed),
+                        project = workingBeforeCommit.copy(speakers = updatedSpeakers, dialogueEvents = attributed),
                         intervalId = "media_${nextWin.startMs}_${nextWin.endMs}",
                         startMs = nextWin.startMs,
                         endMs = nextWin.endMs,
@@ -8542,6 +8698,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         isConfirmedSilence = windowCoverageStatus == CoverageStatus.VERIFIED_SILENCE && windowSlice.isEmpty(),
                         hasIndependentAudioOrFrameEvidence = true,
                         expectedConfigFingerprint = winRequestCtx.configFingerprint,
+                        timestampReport = mediaTimestampReport,
                     )
                     if (reviewed == null) {
                         val keptStatus = if (releaseStore.hasPendingDraftsInWindow(nextWin.startMs, nextWin.endMs)) {
@@ -9367,10 +9524,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                     if (reconciledCues.isNotEmpty()) {
                         val windowEvents = mutableListOf<DialogueEvent>()
                         val hintMap = mutableMapOf<String, AiTranslatedLine>()
+                        val rawCuesByEventId = mutableMapOf<String, AiTranscribedCue>()
                         val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
 
                         reconciledCues.forEach { cue ->
                             val eventId = SubtitleParser.newEventId()
+                            rawCuesByEventId[eventId] = cue
                             val isNonSpeaker = cue.dialogueType == DialogueType.SOUND_DESCRIPTION ||
                                 cue.dialogueType == DialogueType.NARRATION
                             val isOffScreenOrVoiceOver = cue.dialogueType != DialogueType.SPOKEN
@@ -9497,6 +9656,12 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
 
                         // Pass Scout 1 window through Scout 2 Independent Review & Atomic Release Gate
                         val windowSliceEvents = attributedAll.filter { it.startTimeMs in wStartMs until wEndMs }
+                        val ytTimestampReport = buildScout1TimestampReport(
+                            windowStartMs = wStartMs,
+                            windowEndMs = wEndMs,
+                            events = windowSliceEvents,
+                            rawCuesByEventId = rawCuesByEventId,
+                        )
                         val (reviewed, releaseSnap) = stageAndReviewIntervalThroughReleaseGate(
                             project = workingProj.copy(speakers = enrichedSpeakers, dialogueEvents = attributedAll),
                             intervalId = "win_${wStartMs}_${wEndMs}",
@@ -9511,6 +9676,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                             hasIndependentAudioOrFrameEvidence = false,
                             elapsedProcessingMs = elapsedProcessingMs,
                             expectedConfigFingerprint = requestCtx?.configFingerprint,
+                            timestampReport = ytTimestampReport,
                         )
                         if (reviewed == null) {
                             _uiState.update { it.copy(releaseSnapshot = releaseSnap) }
@@ -11671,9 +11837,43 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                             detailed.outcome == TranscriptionOutcome.PARTIAL_SUCCESS
                         )
                     if (isUsableOutcome && detailed != null) {
-                        val candidateEvents = detailed.cues.map { cue ->
+                        var workingHealProj = currentProj
+                        val (reconciledHealCues, reconciledHealUpdates, _) = reconcileWindowOutcomeSpeakersAndCues(
+                            existingSpeakers = workingHealProj.speakers,
+                            cues = detailed.cues,
+                            speakerUpdates = detailed.speakerUpdates,
+                        )
+                        if (reconciledHealUpdates.isNotEmpty()) {
+                            val (castMerged, updatedMem) = mergeCastSlotAssignments(
+                                project = workingHealProj,
+                                assignments = reconciledHealUpdates,
+                                rememberedColors = _uiState.value.characterColorMemory,
+                                reconcileColors = attributionEngine::reconcileCharacterColors,
+                                discoveryTimestampMs = beacon.windowStartMs,
+                            )
+                            if (updatedMem != _uiState.value.characterColorMemory) {
+                                persistCharacterColorMemory(updatedMem)
+                            }
+                            workingHealProj = castMerged
+                        }
+                        val validSlots = setOf("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
+                        val healHints = mutableMapOf<String, AiTranslatedLine>()
+                        val candidateEvents = reconciledHealCues.map { cue ->
+                            val evtId = SubtitleParser.newEventId()
+                            val slotUpper = cue.suggestedSpeakerSlot.trim().uppercase()
+                            healHints[evtId] = AiTranslatedLine(
+                                id = evtId,
+                                naturalTranslation = cue.naturalTranslation,
+                                literalTranslation = cue.literalTranslation,
+                                romanization = cue.romanization,
+                                dialogueTypeHint = cue.dialogueType,
+                                speakerTurnHint = "UNCERTAIN",
+                                suggestedSpeakerSlot = slotUpper.ifBlank { "UNCERTAIN" },
+                                contextReason = cue.contextReason,
+                                culturalNote = cue.culturalNote,
+                            )
                             DialogueEvent(
-                                id = SubtitleParser.newEventId(),
+                                id = evtId,
                                 startTimeMs = cue.startMs,
                                 endTimeMs = cue.endMs,
                                 sourceText = cue.sourceText,
@@ -11681,30 +11881,33 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                                 literalText = cue.literalTranslation,
                                 romanization = cue.romanization,
                                 speakerId = null,
-                                speakerConfidence = 0.55f,
+                                speakerConfidence = if (slotUpper in validSlots) 0.80f else 0.55f,
                                 faceTrackId = null,
                                 faceConfidence = 0f,
-                                shotId = currentProj.shots.firstOrNull { cue.startMs in it.startMs..it.endMs }?.id ?: "shot_1",
+                                shotId = workingHealProj.shots.firstOrNull { cue.startMs in it.startMs..it.endMs }?.id ?: "shot_1",
                                 dialogueType = cue.dialogueType,
                                 placementMode = if (cue.dialogueType == DialogueType.SPOKEN) {
                                     PlacementMode.NEUTRAL_FALLBACK
                                 } else {
                                     PlacementMode.EDGE_DOCKED
                                 },
+                                contextCueReason = cue.contextReason,
                                 culturalNote = cue.culturalNote,
                             )
                         }
+                        cachedAiTurnHints.putAll(healHints)
                         val (reSpeakers, attributedCandidates) = if (candidateEvents.isNotEmpty()) {
                             attributionEngine.assignSpeakers(
                                 events = candidateEvents,
-                                shots = currentProj.shots,
-                                faceTracks = currentProj.faceTracks,
-                                existingSpeakers = currentProj.speakers,
+                                shots = workingHealProj.shots,
+                                faceTracks = workingHealProj.faceTracks,
+                                existingSpeakers = workingHealProj.speakers,
+                                turnHints = cachedAiTurnHints,
                                 rememberedCharacterColors = _uiState.value.characterColorMemory,
-                                slotToSpeakerId = buildSlotToSpeakerIdMap(currentProj.speakers),
+                                slotToSpeakerId = buildSlotToSpeakerIdMap(workingHealProj.speakers),
                             )
                         } else {
-                            currentProj.speakers to emptyList()
+                            workingHealProj.speakers to emptyList()
                         }
                         if (!isRequestContextCurrent(repairCtx)) {
                             updateProject(HealBeaconEngine.markBeaconSuperseded(currentProj, beaconId, reason = "Superseded before publication"))
@@ -11712,7 +11915,7 @@ class DialogueLensViewModel(application: Application) : AndroidViewModel(applica
                         }
                         val silenceConfirmed = detailed.outcome == TranscriptionOutcome.VERIFIED_SILENCE
                         val repairOutcome = HealBeaconEngine.applyValidatedLocalizedRepair(
-                            project = currentProj.copy(speakers = reSpeakers),
+                            project = workingHealProj.copy(speakers = reSpeakers),
                             beaconId = beaconId,
                             candidateEvents = attributedCandidates,
                             silenceExplicitlyConfirmed = silenceConfirmed,
@@ -11953,7 +12156,8 @@ internal fun reconcileWindowOutcomeSpeakersAndCues(
     fun isGenericSpeakerName(raw: String): Boolean {
         val t = raw.trim().lowercase()
         return t.isBlank() ||
-            t.matches(Regex("^(speaker|host|guest|panelist|narrator|person)\\s*[a-z0-9]*$"))
+            t.matches(Regex("^(speaker|host|guest|panelist|narrator|person)(\\s+([a-z]|[0-9]+))?$")) ||
+            t.matches(Regex("^(unknown(\\s+speaker)?|unidentified)$"))
     }
 
     fun namesMatch(incomingRaw: String, existing: Speaker): Boolean {
@@ -12010,19 +12214,26 @@ internal fun reconcileWindowOutcomeSpeakersAndCues(
         }
     }
 
-    // Pass 2: Place remaining new/unnamed assignments, relocating away from occupied non-matching slots
+    // Pass 2: Place remaining new/unnamed assignments, keeping upgradable contextual/inferred slots
+    // eligible for in-place upgrade while relocating away from locked or firmly established different speakers.
     for (assignment in pendingAssignments) {
         val localSlot = assignment.slot.trim().uppercase()
         if (localSlot in slotRemap) continue
 
         val existingAtLocal = existingBySlot[localSlot]
+        val localIsUpgradableContextual = existingAtLocal != null &&
+            !existingAtLocal.isLocked &&
+            !existingAtLocal.isUserNamed &&
+            (existingAtLocal.isRolePlaceholder || existingAtLocal.revealProvenance == "SCOUT_INFERRED")
+        val localHasConflictingVisualVoice = existingAtLocal != null &&
+            existingAtLocal.visualVoiceNotes.isNotBlank() &&
+            assignment.visualVoiceNotes.isNotBlank() &&
+            !existingAtLocal.visualVoiceNotes.equals(assignment.visualVoiceNotes.trim(), ignoreCase = true)
         val localHasDifferentDistinctSpeaker = existingAtLocal != null && (
             existingAtLocal.isLocked ||
-                existingAtLocal.isConfirmedCharacter ||
-                existingAtLocal.hasDistinctCharacterName ||
-                (existingAtLocal.visualVoiceNotes.isNotBlank() &&
-                    assignment.visualVoiceNotes.isNotBlank() &&
-                    !existingAtLocal.visualVoiceNotes.equals(assignment.visualVoiceNotes.trim(), ignoreCase = true))
+                existingAtLocal.isUserNamed ||
+                (!localIsUpgradableContextual && (existingAtLocal.isConfirmedCharacter || existingAtLocal.hasDistinctCharacterName)) ||
+                localHasConflictingVisualVoice
             )
 
         val targetSlot = if (localSlot !in claimedTargetSlots && !localHasDifferentDistinctSpeaker) {
@@ -12108,14 +12319,17 @@ internal fun mergeCastSlotAssignments(
             val spaceIdx = slice.lastIndexOf(' ')
             if (spaceIdx >= 8) slice.substring(0, spaceIdx).trimEnd(',', '-', ':', '/') else slice.trim()
         }
+        val isGenericLabel = cleanedNewName.isBlank() ||
+            cleanedNewName.equals("UNCERTAIN", ignoreCase = true) ||
+            cleanedNewName.equals("Unknown", ignoreCase = true) ||
+            cleanedNewName.equals("Unknown Speaker", ignoreCase = true) ||
+            cleanedNewName.equals("Unidentified", ignoreCase = true) ||
+            cleanedNewName.matches(Regex("^Speaker\\s+[A-Z0-9]+$", RegexOption.IGNORE_CASE))
         val mergedNotes = buildString {
             val incomingNotes = assignment.visualVoiceNotes.trim()
             if (incomingNotes.isNotBlank()) {
                 append(incomingNotes)
-            } else if (!assignment.isVisuallyConfirmed &&
-                cleanedNewName.isNotBlank() &&
-                !cleanedNewName.matches(Regex("^Speaker\\s+[A-Z0-9]+$", RegexOption.IGNORE_CASE))
-            ) {
+            } else if (!assignment.isVisuallyConfirmed && !isGenericLabel) {
                 append(cleanedNewName)
             } else if (existing.visualVoiceNotes.isNotBlank()) {
                 append(existing.visualVoiceNotes)
@@ -12124,9 +12338,8 @@ internal fun mergeCastSlotAssignments(
         val mergedReason = assignment.rationale.trim().ifBlank { existing.discoveryReason }
         val mergedFirstSeen = existing.firstAppearedMs ?: discoveryTimestampMs
 
-        if (!assignment.isVisuallyConfirmed) {
-            // Strict visual confirmation gate: keep unconfirmed speakers dotted gray (no premature name)
-            // while storing rich visual/voice clues so later Scout windows can recognize and confirm them!
+        if (isGenericLabel) {
+            // Blank or generic slot names stay unknown (dotted gray) while preserving voice/visual clues
             if (!existing.isConfirmedCharacter) {
                 workingSpeakers[slotIdx] = existing.copy(
                     isIdentityConfirmed = false,
@@ -12148,13 +12361,23 @@ internal fun mergeCastSlotAssignments(
             return@forEach
         }
 
-        if (cleanedNewName.isBlank()) return@forEach
+        val existingIsInferredOnly = existing.revealProvenance == "SCOUT_INFERRED" || existing.isRolePlaceholder
+        val shouldApplyName = !existing.isUserNamed && (
+            !existing.isConfirmedCharacter ||
+                !existing.hasDistinctCharacterName ||
+                (existing.isRolePlaceholder && !assignment.isRolePlaceholder) ||
+                (existingIsInferredOnly && assignment.isVisuallyConfirmed)
+            )
+        val nextProvenance = when {
+            existing.isUserNamed -> "USER_RENAME"
+            assignment.isVisuallyConfirmed -> "SCOUT_DISCOVERY"
+            else -> "SCOUT_INFERRED"
+        }
 
-        val shouldApplyName = !existing.isConfirmedCharacter ||
-            !existing.hasDistinctCharacterName ||
-            (existing.isRolePlaceholder && !assignment.isRolePlaceholder)
-
-        if (shouldApplyName && (!existing.displayName.equals(cleanedNewName, ignoreCase = true) || !existing.isIdentityConfirmed)) {
+        if (shouldApplyName && (!existing.displayName.equals(cleanedNewName, ignoreCase = true) ||
+                !existing.isIdentityConfirmed ||
+                (existing.revealProvenance != nextProvenance && assignment.isVisuallyConfirmed))
+        ) {
             val priorHistory = if (existing.hasDistinctCharacterName &&
                 existing.displayName.isNotBlank() &&
                 !existing.displayName.equals(cleanedNewName, ignoreCase = true)
@@ -12168,9 +12391,10 @@ internal fun mergeCastSlotAssignments(
                 isRolePlaceholder = assignment.isRolePlaceholder,
                 isIdentityConfirmed = true,
                 firstAppearedMs = mergedFirstSeen,
-                nameRevealedAtMs = existing.nameRevealedAtMs ?: discoveryTimestampMs,
+                // Preserve existing nameRevealedAtMs (null by default) so immediate Scout labels show across all cues
+                nameRevealedAtMs = existing.nameRevealedAtMs,
                 isUserNamed = existing.isUserNamed,
-                revealProvenance = if (existing.isUserNamed) "USER_RENAME" else "SCOUT_DISCOVERY",
+                revealProvenance = nextProvenance,
                 visualVoiceNotes = mergedNotes.ifBlank { existing.visualVoiceNotes },
                 previousNames = priorHistory,
                 discoveryReason = mergedReason,

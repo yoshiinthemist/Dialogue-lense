@@ -10,6 +10,7 @@ import com.example.domain.layout.BalloonLayoutEngine
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -1725,7 +1726,7 @@ class DialogueLensEngineTest {
     }
 
     @Test
-    fun unconfirmedScoutSpeakerStaysDottedGrayThenRetroactivelyUpdatesAllVideoCuesOnConfirmation() {
+    fun unconfirmedScoutSpeakerAppliesContextualNameImmediatelyThenUpgradesInPlaceOnVisualConfirmation() {
         val attribution = SpeakerAttributionEngine()
         val layoutEngine = BalloonLayoutEngine()
         val baseProject = DemoScenarioFactory.createDemoProject().copy(
@@ -1740,7 +1741,7 @@ class DialogueLensEngineTest {
                     sourceText = "Let's look at the latest numbers.",
                     translatedText = "Let's look at the latest numbers.",
                     speakerId = "spk_b",
-                    speakerConfidence = 0.48f,
+                    speakerConfidence = 0.78f,
                     faceTrackId = null,
                     faceConfidence = 0.72f,
                     shotId = "shot_1",
@@ -1755,7 +1756,7 @@ class DialogueLensEngineTest {
                     sourceText = "That's the exact trend we saw last week.",
                     translatedText = "That's the exact trend we saw last week.",
                     speakerId = "spk_b",
-                    speakerConfidence = 0.75f,
+                    speakerConfidence = 0.78f,
                     faceTrackId = null,
                     faceConfidence = 0.80f,
                     shotId = "shot_1",
@@ -1763,11 +1764,25 @@ class DialogueLensEngineTest {
                     placementMode = PlacementMode.AUTO,
                     anchorPosition = com.example.data.model.NormalizedPoint(0.74f, 0.32f),
                 ),
+                com.example.data.model.DialogueEvent(
+                    id = "cue_3",
+                    startTimeMs = 20_000L,
+                    endTimeMs = 22_000L,
+                    sourceText = "And someone offstage muttered.",
+                    translatedText = "And someone offstage muttered.",
+                    speakerId = "spk_c",
+                    speakerConfidence = 0.42f,
+                    faceTrackId = null,
+                    faceConfidence = 0f,
+                    shotId = "shot_1",
+                    dialogueType = DialogueType.SPOKEN,
+                    placementMode = PlacementMode.NEUTRAL_FALLBACK,
+                ),
             ),
         )
 
-        // Step 1: Unconfirmed Scout observation — must stay dotted gray and NOT consume Primary color 0
-        val (unconfirmedProject, memoryAfterStep1) = com.example.ui.state.mergeCastSlotAssignments(
+        // Step 1: Inferred/contextual label ("Panelist") on B applies immediately while generic label on C stays dotted gray
+        val (inferredProject, memoryAfterStep1) = com.example.ui.state.mergeCastSlotAssignments(
             project = baseProject,
             assignments = listOf(
                 com.example.data.ai.AiCastSlotAssignment(
@@ -1778,31 +1793,45 @@ class DialogueLensEngineTest {
                     visualVoiceNotes = "Brown blazer, right panel desk",
                     isVisuallyConfirmed = false,
                 ),
+                com.example.data.ai.AiCastSlotAssignment(
+                    slot = "C",
+                    displayName = "Speaker C",
+                    rationale = "Generic voice label",
+                    isRolePlaceholder = true,
+                    visualVoiceNotes = "Offstage baritone",
+                    isVisuallyConfirmed = false,
+                ),
             ),
             rememberedColors = emptyMap(),
             reconcileColors = { spks, evts, mem -> attribution.reconcileCharacterColors(spks, evts, mem) },
-            discoveryTimestampMs = 1_000L,
+            discoveryTimestampMs = 15_000L,
         )
 
-        val spkBUnconfirmed = unconfirmedProject.speakers.first { it.id == "spk_b" }
-        assertFalse("Unconfirmed Scout speaker must remain unconfirmed", spkBUnconfirmed.isConfirmedCharacter)
-        assertTrue(
-            "Unconfirmed Scout speaker cues must render dotted gray",
-            com.example.data.model.isBubbleSpeakerUnknown(unconfirmedProject.dialogueEvents.first(), spkBUnconfirmed),
+        val spkBInferred = inferredProject.speakers.first { it.id == "spk_b" }
+        assertTrue("Contextual/inferred Scout speaker must be named immediately", spkBInferred.isConfirmedCharacter)
+        assertEquals("Panelist", spkBInferred.visibleDisplayNameAt(1_000L))
+        assertEquals("SCOUT_INFERRED", spkBInferred.revealProvenance)
+        assertNull("nameRevealedAtMs stays null so early cues display inferred name immediately", spkBInferred.nameRevealedAtMs)
+        assertFalse(
+            "Inferred named speaker cues must NOT render dotted gray",
+            com.example.data.model.isBubbleSpeakerUnknown(inferredProject.dialogueEvents.first(), spkBInferred),
         )
-        assertFalse("Unconfirmed speaker must NOT claim a remembered Primary color", spkBUnconfirmed.colorRemembered)
         assertTrue(
-            "Visual/voice notes must be preserved privately while unconfirmed",
-            spkBUnconfirmed.visualVoiceNotes.contains("Brown blazer"),
+            "Visual/voice notes must be preserved",
+            spkBInferred.visualVoiceNotes.contains("Brown blazer"),
         )
-        val unconfirmedBalloons = layoutEngine.computeLayout(unconfirmedProject, 2_000L)
-        assertEquals(1, unconfirmedBalloons.size)
-        assertTrue("Placed balloon stays dotted gray before visual confirmation", unconfirmedBalloons.first().isUnknownSpeaker)
+        val spkCGeneric = inferredProject.speakers.first { it.id == "spk_c" }
+        assertFalse("Generic Speaker C label must remain unconfirmed dotted gray", spkCGeneric.isConfirmedCharacter)
+        assertTrue(
+            "Generic Speaker C cue stays dotted gray",
+            com.example.data.model.isBubbleSpeakerUnknown(inferredProject.dialogueEvents.last(), spkCGeneric),
+        )
 
-        // Step 2: Later window visually confirms the speaker via lower-third chyron -> retroactive update!
-        val (confirmedProject, memoryAfterStep2) = com.example.ui.state.mergeCastSlotAssignments(
-            project = unconfirmedProject,
-            assignments = listOf(
+        // Step 2: Later window visually confirms Michael Ian Black -> reconciles in-place onto spk_b and upgrades!
+        val (reconciledCues, reconciledUpdates, remap) = com.example.ui.state.reconcileWindowOutcomeSpeakersAndCues(
+            existingSpeakers = inferredProject.speakers,
+            cues = emptyList(),
+            speakerUpdates = listOf(
                 com.example.data.ai.AiCastSlotAssignment(
                     slot = "B",
                     displayName = "Michael Ian Black",
@@ -1812,17 +1841,25 @@ class DialogueLensEngineTest {
                     isVisuallyConfirmed = true,
                 ),
             ),
+        )
+        assertTrue(reconciledCues.isEmpty())
+        assertEquals("B", remap["B"])
+
+        val (confirmedProject, memoryAfterStep2) = com.example.ui.state.mergeCastSlotAssignments(
+            project = inferredProject,
+            assignments = reconciledUpdates,
             rememberedColors = memoryAfterStep1,
             reconcileColors = { spks, evts, mem -> attribution.reconcileCharacterColors(spks, evts, mem) },
-            discoveryTimestampMs = 15_000L,
+            discoveryTimestampMs = 45_000L,
         )
 
         val spkBConfirmed = confirmedProject.speakers.first { it.id == "spk_b" }
-        assertTrue("Speaker must become confirmed once visually verified", spkBConfirmed.isConfirmedCharacter)
-        assertEquals("Michael Ian Black", spkBConfirmed.displayName)
-        assertEquals("First confirmed character claims Primary color 0", 0, spkBConfirmed.accentIndex)
+        assertTrue("Speaker must remain confirmed after visual verification", spkBConfirmed.isConfirmedCharacter)
+        assertFalse("Role placeholder flag must clear upon real name confirmation", spkBConfirmed.isRolePlaceholder)
+        assertEquals("Michael Ian Black", spkBConfirmed.visibleDisplayNameAt(1_000L))
+        assertEquals("SCOUT_DISCOVERY", spkBConfirmed.revealProvenance)
         assertTrue("Confirmed speaker reserves remembered color", spkBConfirmed.colorRemembered)
-        assertEquals(0, memoryAfterStep2["michael ian black"])
+        assertNotNull(memoryAfterStep2["michael ian black"])
 
         // Verify ALL earlier cues were retroactively upgraded across the user's video data
         val cue1After = confirmedProject.dialogueEvents.first { it.id == "cue_1" }

@@ -1,5 +1,5 @@
 37946655d9fdb3f09a36437d77840af0a336adb4c75da7726e273d6a88cd2c10  .env.example
-ac3ff008bcf271f901138684bd99e52cf29d1a6f1ed34a10e93cad019e6ef9db  app/build.gradle.kts
+4752a2bbda7b556fbcce817d6a70ec8ac7dde4a5a190dd398084c334939c8cce  app/build.gradle.kts
 1cf8c57e8f79c250b0af9c1a5a4edad71a5c348a79ab70243b6bae086c150ad2  app/proguard-rules.pro
 c6ef958cafb00dbec798a71f5be604e9cf56189676312bea40f63dd07ca0d674  app/src/androidTest/java/com/example/ExampleInstrumentedTest.kt
 5a3ceafabfc9e8c07112522ff2b105dde4f79d19b99acf7c7298885039b89a29  app/src/main/AndroidManifest.xml
@@ -7,7 +7,7 @@ c6ef958cafb00dbec798a71f5be604e9cf56189676312bea40f63dd07ca0d674  app/src/androi
 d4baef7ee8e5d8d2eea83f5e3a642d2e36dc0f1eed2c31279c069a7d61667ca6  app/src/main/java/com/example/data/ai/AppCheckHelper.kt
 e9a9a36c17d6ec56a363b309ab40d23889aef2762a8411ea4c7850c0927f9c2a  app/src/main/java/com/example/data/ai/OnDeviceTranslatorService.kt
 b3fb3d1e79f3e4755e782ba9be15cefdb9e9dfc1bcf724a8bd53c0ed5cc5092d  app/src/main/java/com/example/data/ai/ScoutHeartbeatService.kt
-9aecd892e775851e33cc5cdcfaa684db537f4d9c1b9d5fde810442ccd5b0e87c  app/src/main/java/com/example/data/ai/TranslationAiService.kt
+e10dd333e592df392132c386043304eb2f679db0d7311ae1bc421762a2099514  app/src/main/java/com/example/data/ai/TranslationAiService.kt
 aabf286628a5a9a97d5f1413c768504f6277903e36c536f9bd8775435c2b14f9  app/src/main/java/com/example/data/model/ProjectModels.kt
 5ae226044a9d44850f884ea4da644cfefd95dc34cabdaac709b51b6f7e683f72  app/src/main/java/com/example/data/project/DemoScenarioFactory.kt
 bf368e43d602d24d74894fa60fc6155589338a695e3830b81a7a24342ae50bd0  app/src/main/java/com/example/data/project/ProjectStore.kt
@@ -31,11 +31,11 @@ e40eb4e57cab0eabd2ab4cfd38e22c59e1eff332de33ffaf70b9ad4e17434c25  app/src/main/j
 64f8861b97769e4ce88fda5e17af6f10e02439fdbc12f770d94c7eeeb5ff9e94  app/src/main/java/com/example/domain/layout/TailGeometry.kt
 99ad007956f90e81f3becd1d0d66c4002f2d5d313868f04c8c269c4d241301f7  app/src/main/java/com/example/domain/layout/VisualStabilityDiagnostics.kt
 9e21aec8aac30cd469d2a296d43b88c6dd91bbabd0b9e4e751c183ea09c1eff6  app/src/main/java/com/example/domain/media/MediaSourceAdapter.kt
-04eb27c04604ed67a872bcfdaf179307348520768e456cc90e82564916ccf5f5  app/src/main/java/com/example/domain/pipeline/ScoutReleasePipeline.kt
+f0d93b0dbb209d6c0d25d5cffb312cb9a27ca5b2d230e9c86fc76dc010404b9c  app/src/main/java/com/example/domain/pipeline/ScoutReleasePipeline.kt
 2210672c6bb139c6f30b79beb616dd982559a65ec997920f27a86080798270e7  app/src/main/java/com/example/domain/playback/PlaybackReadinessController.kt
-048fc8b042baace1a1267924b7fbf8ef9c624665bc8f9169a699958fc116ad5f  app/src/main/java/com/example/domain/sentinel/SentinelWorkforceCoordinator.kt
+94969ad5f1929f9e6752ae3351d1cca140d719313d40666ebd8188b2bce5e1d2  app/src/main/java/com/example/domain/sentinel/SentinelWorkforceCoordinator.kt
 90b06f2f685733be2189049aab7104665d01e3af74f1a19ac1b985403c438b65  app/src/main/java/com/example/ui/DialogueLensScreen.kt
-6bafba57664d2a33ea3b2f3ae848580002812cb5b9a4f413fd35a34365eaccaf  app/src/main/java/com/example/ui/editor/TimelineSubtitleEditor.kt
+fb65db116151674ecfb2b5bb40f73318328258aa13233ab8de554e39e07058ca  app/src/main/java/com/example/ui/editor/TimelineSubtitleEditor.kt
 db954bc2cd2b51ab3e90caeb6680b400b5c32c3a281da57a40631aeedfaa3ffe  app/src/main/java/com/example/ui/player/CinemaIntroOverlay.kt
 9722adf1dcaafd8dc7e127a5c495e6e22770f5215ac6204bf8bfa1e3ab35565f  app/src/main/java/com/example/ui/player/HealBeaconUi.kt
 dbcd3ce9f97e2f4babd167165a597770930e97125020651cb86753f2eaa1fa12  app/src/main/java/com/example/ui/player/PlayerControlsBar.kt
@@ -49,7 +49,7 @@ a1f235b401b129c07f4e89e8012f5031af131510fc975afe271c61799333fc2f  app/src/main/j
 ae3c80dbe6b807c9403f29716d557029cb9ecfaa4009cb86b67b8ba45f2bcc75  app/src/main/java/com/example/ui/setup/OnboardingOverlay.kt
 02f8e99ffcc6e8b16b8e375d4996e1670562700835d26e5361e4139f0c313a5a  app/src/main/java/com/example/ui/setup/StartLauncherScreen.kt
 4f1b42f6978c918f0830816cef82344763646d120f795d5788d276313853f3b3  app/src/main/java/com/example/ui/setup/SubtitleExportSheet.kt
-4d80dc9cd797d71daf92252ec1fef08595aa9d28ecbf1ac556a08119f941be37  app/src/main/java/com/example/ui/state/DialogueLensViewModel.kt
+d7605e7e22e68d6ebe1d7c1ff9acd09aedbbd1fec143c33bfacbba7d30a7d8d8  app/src/main/java/com/example/ui/state/DialogueLensViewModel.kt
 dfebbdcda377906671020d768c220a3c0a9e406f897270c1cca4b4c0e902a666  app/src/main/java/com/example/ui/state/HumanReadableStatus.kt
 74e219608e4f32450e98a23b23e4c6fb4398ad58de9e98942c32c3f629d10287  app/src/main/java/com/example/ui/state/SubtitlePreGenerator.kt
 464a8289c44d578625c7decbb26aca3f778d65cf943d1a2e22f6ce6b2ac59350  app/src/main/java/com/example/ui/theme/Color.kt
@@ -87,10 +87,11 @@ e8288b65767f4f28854d168c7b19c308579d3703bdf3fc26c2b266e19148f465  app/src/main/r
 76b84d21b69e55322d57dcff4f408e0e0be91652bc652d9080b8e6f0adb14ea2  app/src/test/java/com/example/ContractR09R14R15RegressionTest.kt
 0759c3d9318f7a6d8a1857dbebc92152999829559257ef70f512ebf640c816bd  app/src/test/java/com/example/ContractR09R14R15RobolectricTest.kt
 04f7ecd172f112ecf0fc66d01397d58d1ea11a7b99d7deb5d90dfb56b5ed4d15  app/src/test/java/com/example/DialogueLensAuditRepairsTest.kt
-5b96af8ddbceba339281650803167b2ddb28719587a6736921be700551952a4f  app/src/test/java/com/example/DialogueLensEngineTest.kt
+1b6f58bb2bb0f2f273790c109a050b9f26b3a1988ef084b9a4896dacca30ccc9  app/src/test/java/com/example/DialogueLensEngineTest.kt
 a94b18ad46725aea507036e19e0b3893bc74f0277bc110dcdd1d008b90bd00dd  app/src/test/java/com/example/DialogueLensStabilizationTest.kt
 9d3c12aea379425989747e394dc42fe904eb1d45ecb50d9d20d6cefffae66fcf  app/src/test/java/com/example/DialogueLensV1OverhaulTest.kt
 8fba3672e7588550c0bec452dbf5cf5afa79d0cca96bdc4b9b3ab79b6ba41e0f  app/src/test/java/com/example/DialogueLensV2OverhaulTest.kt
+ebfd4e6ff216e3d57714e3cb8a4bd94fd7a88c91bf34ae7e59cc67adf524fe28  app/src/test/java/com/example/DialogueLensV36RegressionTest.kt
 ff201b353e64688dd14f4dfec2307b4e03d525cf756963d0168632fefe20d8a8  app/src/test/java/com/example/DialogueLensV6RegressionTest.kt
 0cab88a8a011bb26de80aac326042b194eacb8a8e609d311a0f241c9543ee285  app/src/test/java/com/example/DialogueLensViewModelAndRendererIntegrationRobolectricTest.kt
 caf20edd8d3b71da0f9e5cd7f760833a4e7b001e24a84421ffb6a1412457dda3  app/src/test/java/com/example/ExampleRobolectricTest.kt

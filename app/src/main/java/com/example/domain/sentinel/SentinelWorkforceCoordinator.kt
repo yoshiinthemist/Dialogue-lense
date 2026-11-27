@@ -9,6 +9,7 @@ import com.example.data.model.QuotaSaverMode
 import com.example.data.model.VideoChapter
 import com.example.domain.analysis.LookaheadWindowPlanner
 import com.example.domain.analysis.TranscriptCoverageLedger
+import com.example.domain.pipeline.TimestampAdjustmentRecord
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -194,6 +195,10 @@ data class SentinelInspectorSnapshot(
     val totalLocalCleanChapterChecks: Int = 0,
     val totalCloudEscalatedChapterChecks: Int = 0,
     val schedulerState: SchedulerStateSnapshot = SchedulerStateSnapshot(),
+    val latestScout1ReportSummary: String = "",
+    val totalTimestampsVerified: Int = 0,
+    val totalTimestampsAdjusted: Int = 0,
+    val recentTimestampAdjustments: List<TimestampAdjustmentRecord> = emptyList(),
 )
 
 /**
@@ -230,6 +235,10 @@ class SentinelWorkforceCoordinator {
     private var totalCompletedRepairs: Int = 0
     private var totalLocalCleanChapterChecks: Int = 0
     private var totalCloudEscalatedChapterChecks: Int = 0
+    private var latestScout1ReportSummary: String = ""
+    private var totalTimestampsVerified: Int = 0
+    private var totalTimestampsAdjusted: Int = 0
+    private val recentTimestampAdjustments = mutableListOf<TimestampAdjustmentRecord>()
 
     // Single authoritative rolling 3-minute boundary & idle/wake state
     private var policy: RollingBoundaryPolicy = RollingBoundaryPolicy()
@@ -308,6 +317,10 @@ class SentinelWorkforceCoordinator {
             totalCompletedRepairs = 0
             totalLocalCleanChapterChecks = 0
             totalCloudEscalatedChapterChecks = 0
+            latestScout1ReportSummary = ""
+            totalTimestampsVerified = 0
+            totalTimestampsAdjusted = 0
+            recentTimestampAdjustments.clear()
 
             val projDur = maxOf(
                 project.videoSource.durationMs,
@@ -1730,6 +1743,34 @@ class SentinelWorkforceCoordinator {
         }
     }
 
+    fun recordScout1TimestampReportSummary(summary: String) {
+        if (summary.isBlank()) return
+        synchronized(lock) {
+            latestScout1ReportSummary = summary
+        }
+    }
+
+    fun recordScoutTimestampAudit(
+        reportSummary: String,
+        verifiedCount: Int,
+        adjustedCount: Int,
+        adjustments: List<TimestampAdjustmentRecord>,
+    ) {
+        synchronized(lock) {
+            if (reportSummary.isNotBlank()) {
+                latestScout1ReportSummary = reportSummary
+            }
+            totalTimestampsVerified += verifiedCount.coerceAtLeast(0)
+            totalTimestampsAdjusted += adjustedCount.coerceAtLeast(0)
+            if (adjustments.isNotEmpty()) {
+                recentTimestampAdjustments.addAll(adjustments)
+                while (recentTimestampAdjustments.size > 12) {
+                    recentTimestampAdjustments.removeAt(0)
+                }
+            }
+        }
+    }
+
     fun inspectorSnapshot(): SentinelInspectorSnapshot = synchronized(lock) {
         val suspended = isPatrolSuspendedLocked()
         val suspensionReason = when {
@@ -1752,6 +1793,10 @@ class SentinelWorkforceCoordinator {
             totalLocalCleanChapterChecks = totalLocalCleanChapterChecks,
             totalCloudEscalatedChapterChecks = totalCloudEscalatedChapterChecks,
             schedulerState = buildSchedulerSnapshotLocked(),
+            latestScout1ReportSummary = latestScout1ReportSummary,
+            totalTimestampsVerified = totalTimestampsVerified,
+            totalTimestampsAdjusted = totalTimestampsAdjusted,
+            recentTimestampAdjustments = recentTimestampAdjustments.takeLast(6),
         )
     }
 
