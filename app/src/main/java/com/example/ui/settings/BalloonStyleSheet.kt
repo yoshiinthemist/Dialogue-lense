@@ -1,12 +1,18 @@
 package com.example.ui.settings
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -14,18 +20,40 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.data.model.BalloonStyleSettings
 import com.example.data.model.BubbleVisualStyle
+import com.example.data.model.CaptionAccessibilityContrast
+import com.example.data.model.CaptionFontFamily
 import com.example.data.model.SpeakerLabelMode
+import java.util.Locale
 import kotlin.math.roundToInt
+
+private data class CaptionColorThemeOption(
+    val id: String,
+    val label: String,
+    val fgHex: Long?,
+    val bgHex: Long?,
+)
+
+private val CaptionColorThemePresets = listOf(
+    CaptionColorThemeOption("auto", "Style Default", null, null),
+    CaptionColorThemeOption("midnight_white", "Midnight + White", 0xFFF8FAFC, 0xFF0B1120),
+    CaptionColorThemeOption("obsidian_amber", "Obsidian + Amber", 0xFFFDE047, 0xFF0A0A0C),
+    CaptionColorThemeOption("cream_ink", "Warm Cream + Ink", 0xFF111827, 0xFFFAF5EA),
+    CaptionColorThemeOption("slate_mint", "Slate + Mint", 0xFFA7F3D0, 0xFF0F172A),
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,6 +96,104 @@ fun BalloonStyleSheet(
                         modifier = Modifier.testTag("preset_${preset.name.lowercase()}"),
                     )
                 }
+            }
+
+            Text("Caption Font Family", style = MaterialTheme.typography.labelMedium)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                CaptionFontFamily.entries.forEach { font ->
+                    FilterChip(
+                        selected = settings.fontFamily == font,
+                        onClick = { onUpdate(settings.copy(fontFamily = font)) },
+                        label = { Text(font.label) },
+                        modifier = Modifier.testTag("font_family_${font.name.lowercase()}"),
+                    )
+                }
+            }
+
+            val previewBg = if (settings.highContrastMode) 0xFF050507 else (settings.customBackgroundColorHex ?: 0xFF0F172A)
+            val previewFg = if (settings.highContrastMode) 0xFFFFFFFF else (settings.customForegroundColorHex ?: 0xFFF8FAFC)
+            val previewAlpha = if (settings.highContrastMode) 0.98f else settings.balloonOpacity.coerceIn(0.68f, 0.98f)
+            val compositedBg = CaptionAccessibilityContrast.compositeOverBackdrop(previewBg, previewAlpha, 0xFF808080L)
+            val contrastRatio = CaptionAccessibilityContrast.contrastRatio(previewFg, compositedBg)
+            val passesContrast = contrastRatio >= CaptionAccessibilityContrast.MIN_TEXT_CONTRAST_RATIO
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Caption Colors & Contrast", style = MaterialTheme.typography.labelMedium)
+                Text(
+                    text = String.format(
+                        Locale.US,
+                        "%.1f:1 %s",
+                        contrastRatio,
+                        if (passesContrast) "AA+" else "Auto-Protected",
+                    ),
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                    color = if (passesContrast) Color(0xFF34D399) else Color(0xFFFBBF24),
+                    modifier = Modifier.testTag("caption_contrast_ratio_label"),
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                CaptionColorThemePresets.forEach { option ->
+                    val selected = settings.customForegroundColorHex == option.fgHex &&
+                        settings.customBackgroundColorHex == option.bgHex
+                    FilterChip(
+                        selected = selected,
+                        onClick = {
+                            onUpdate(
+                                settings.copy(
+                                    customForegroundColorHex = option.fgHex,
+                                    customBackgroundColorHex = option.bgHex,
+                                )
+                            )
+                        },
+                        leadingIcon = if (option.bgHex != null && option.fgHex != null) {
+                            {
+                                Box(
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .clip(CircleShape)
+                                        .background(Color((option.bgHex and 0x00FFFFFFL) or (0xFFL shl 24))),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .clip(CircleShape)
+                                            .background(Color((option.fgHex and 0x00FFFFFFL) or (0xFFL shl 24))),
+                                    )
+                                }
+                            }
+                        } else null,
+                        label = { Text(option.label) },
+                        modifier = Modifier.testTag("color_preset_${option.id}"),
+                    )
+                }
+            }
+            Surface(
+                color = Color((previewBg and 0x00FFFFFFL) or (0xFFL shl 24)).copy(alpha = previewAlpha),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.5.dp, if (settings.highContrastMode) Color(0xFFFACC15) else Color(0xFF38BDF8)),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = "Live caption readability check · Aa Bb Cc 123",
+                    color = Color((previewFg and 0x00FFFFFFL) or (0xFFL shl 24)),
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                )
             }
 
             Text(
@@ -147,8 +273,8 @@ fun BalloonStyleSheet(
             )
 
             StyleSwitchRow(
-                title = "Minimal Tail Pointer",
-                subtitle = "Point subtle tail toward speaker only when position is verified",
+                title = "Default Tail Preference",
+                subtitle = "Used when choosing Bubble captions vs Bubbles with tails in the player bar",
                 checked = settings.showTail,
                 onCheckedChange = { onUpdate(settings.copy(showTail = it)) },
                 tag = "switch_tail",

@@ -837,9 +837,12 @@ class DialogueLensEngineTest {
         )
         val b1 = engine.computeLayout(ytProject, 1500L).first()
         val b2 = engine.computeLayout(ytProject, 4000L).first()
-        assertFalse(b1.isAmbiguousFallback)
-        assertFalse(b2.isAmbiguousFallback)
-        assertTrue(kotlin.math.abs(b1.rect.centerX - b2.rect.centerX) > 0.20f)
+        assertEquals(PlacementMode.NEUTRAL_FALLBACK, b1.placementMode)
+        assertEquals(PlacementMode.NEUTRAL_FALLBACK, b2.placementMode)
+        assertTrue(
+            "Color/accent parity alone must not yank sequential neutral fallback bubbles across screen",
+            kotlin.math.abs(b1.rect.centerX - b2.rect.centerX) < 0.05f,
+        )
     }
 
     @Test
@@ -1518,23 +1521,31 @@ class DialogueLensEngineTest {
     }
 
     @Test
-    fun captionDisplayModePrimaryPickerStreamlinesToThreeAndMigratesBoth() {
+    fun captionDisplayModePrimaryPickerHasFourExclusiveModesAndMigratesLegacySettings() {
         assertEquals(
             listOf(
-                com.example.data.model.CaptionDisplayMode.BALLOONS,
-                com.example.data.model.CaptionDisplayMode.FIXED_ZONES,
-                com.example.data.model.CaptionDisplayMode.CLASSIC,
                 com.example.data.model.CaptionDisplayMode.OFF,
+                com.example.data.model.CaptionDisplayMode.CLASSIC,
+                com.example.data.model.CaptionDisplayMode.BALLOONS,
+                com.example.data.model.CaptionDisplayMode.BUBBLES_WITH_TAILS,
             ),
             com.example.data.model.CaptionDisplayMode.primaryModes,
         )
         assertEquals(
             com.example.data.model.CaptionDisplayMode.BALLOONS,
-            com.example.data.model.CaptionDisplayMode.BOTH.normalizedPrimaryMode(),
+            com.example.data.model.CaptionDisplayMode.BOTH.normalizedPrimaryMode(previousShowTail = false),
         )
         assertEquals(
-            com.example.data.model.CaptionDisplayMode.FIXED_ZONES,
+            com.example.data.model.CaptionDisplayMode.BUBBLES_WITH_TAILS,
+            com.example.data.model.CaptionDisplayMode.BOTH.normalizedPrimaryMode(previousShowTail = true),
+        )
+        assertEquals(
+            com.example.data.model.CaptionDisplayMode.BALLOONS,
             com.example.data.model.CaptionDisplayMode.FIXED_ZONES.normalizedPrimaryMode(),
+        )
+        assertEquals(
+            com.example.data.model.CaptionDisplayMode.BUBBLES_WITH_TAILS,
+            com.example.data.model.CaptionDisplayMode.BUBBLES_WITH_TAILS.normalizedPrimaryMode(),
         )
         assertEquals(
             com.example.data.model.CaptionDisplayMode.CLASSIC,
@@ -2007,7 +2018,7 @@ class DialogueLensEngineTest {
 
     @Test
     fun tailLineOfSightCheckRejectsBubblePocketsWhoseTailCrossesBystanderFace() {
-        val centerBystander = com.example.data.model.NormalizedRect(0.36f, 0.12f, 0.60f, 0.72f)
+        val centerBystander = com.example.data.model.NormalizedRect(0.44f, 0.12f, 0.60f, 0.72f)
         // Direct segment test: slicing straight across the bystander vs staying cleanly to the right
         assertTrue(
             "Segment slicing across bystander face must be detected",
@@ -2058,13 +2069,23 @@ class DialogueLensEngineTest {
             dialogueEvents = listOf(event),
         )
 
-        val placed = BalloonLayoutEngine().computeLayout(project, 3_000L)
-        assertEquals(1, placed.size)
-        val balloon = placed.first()
+        val placedWithPref = BalloonLayoutEngine().computeLayout(project, 3_000L)
+        assertEquals(1, placedWithPref.size)
+        val balloonPref = placedWithPref.first()
+        assertNotNull(
+            "Distant on-screen speaker mouth remains a valid aim target when drawn short pointer is unobstructed",
+            balloonPref.tailTarget,
+        )
+
+        // When no conflicting TOP_LEFT zone forces placement across the bystander, bubble stays near speaker on the right
+        val autoEvent = event.copy(preferredDeadSpaceZone = com.example.data.model.DeadSpaceZone.AUTO)
+        val placedAuto = BalloonLayoutEngine().computeLayout(project.copy(dialogueEvents = listOf(autoEvent)), 3_000L)
+        assertEquals(1, placedAuto.size)
+        val balloon = placedAuto.first()
         val tail = balloon.tailTarget
         assertNotNull("Confirmed panelist bubble must have a tailTarget", tail)
         assertFalse(
-            "Tail ray from bubble center to speaker mouth must NOT slice across bystander face (rect=${balloon.rect})",
+            "Short pointer from right-side bubble to right-side mouth must NOT slice across bystander face (rect=${balloon.rect})",
             com.example.domain.layout.segmentIntersectsRect(
                 p1 = com.example.data.model.NormalizedPoint(balloon.rect.centerX, balloon.rect.centerY),
                 p2 = tail!!,
@@ -2072,7 +2093,7 @@ class DialogueLensEngineTest {
             ),
         )
         assertTrue(
-            "Bubble must choose right-side clear pocket instead of TOP_LEFT across bystander (centerX=${balloon.rect.centerX})",
+            "Bubble must choose right-side clear pocket near speaker (centerX=${balloon.rect.centerX})",
             balloon.rect.centerX > 0.56f,
         )
     }

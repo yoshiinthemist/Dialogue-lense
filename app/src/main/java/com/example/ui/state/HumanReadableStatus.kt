@@ -90,7 +90,7 @@ object HumanReadableStatus {
             }
         }
 
-        // 2. Active user-visible Heal Beacons
+        // 2. Active user-visible Heal Beacons (ignore QUEUED/MARKED, SUPERSEDED, CANCELLED)
         val activeHealingCount = project.healBeacons.count { it.status == HealBeaconStatus.HEALING }
         if (activeHealingCount > 0) {
             return HumanReadableReadiness(
@@ -105,7 +105,9 @@ object HumanReadableStatus {
             )
         }
 
-        val attentionCount = project.healBeacons.count { !it.autoTriggered && it.status == HealBeaconStatus.NEEDS_ATTENTION }
+        val attentionCount = project.healBeacons.count {
+            !it.autoTriggered && it.status == HealBeaconStatus.NEEDS_ATTENTION
+        }
         if (attentionCount > 0) {
             return HumanReadableReadiness(
                 label = "Needs attention",

@@ -418,16 +418,29 @@ class Scout2IndependentReviewer {
                 draft.evidenceProvenance == SubtitleSourceKind.AI_DRAFT.name
             )
 
+        val reviewedCueIds = mutableSetOf<String>()
+        val eventRefsMap = linkedMapOf<String, MutableList<ReferenceCaptionCue>>()
+        for (ref in alignedRefs) {
+            val bestMatch = deduplicated
+                .mapNotNull { evt ->
+                    val overlapMs = (minOf(ref.endMs, evt.endTimeMs) - maxOf(ref.startMs, evt.startTimeMs))
+                    val startGapMs = abs(ref.startMs - evt.startTimeMs)
+                    if (overlapMs > 0L || startGapMs <= 800L) {
+                        Triple(evt, overlapMs.coerceAtLeast(0L), startGapMs)
+                    } else {
+                        null
+                    }
+                }
+                .maxWithOrNull(compareBy<Triple<DialogueEvent, Long, Long>> { it.second }.thenByDescending { -it.third })
+            if (bestMatch != null) {
+                eventRefsMap.getOrPut(bestMatch.first.id) { mutableListOf() }.add(ref)
+                coveredRefIds.add(ref.cueId)
+            }
+        }
+
         val reviewedExisting = deduplicated.map { evt ->
             val stableKey = evt.stableCueKey.ifBlank { evt.id }
-            val overlappingRefs = alignedRefs.filter { ref ->
-                val overlapStart = maxOf(ref.startMs, evt.startTimeMs)
-                val overlapEnd = minOf(ref.endMs, evt.endTimeMs)
-                val directOverlap = overlapEnd > overlapStart
-                val closeProximity = abs(ref.startMs - evt.startTimeMs) <= 800L
-                directOverlap || closeProximity
-            }
-            overlappingRefs.forEach { coveredRefIds.add(it.cueId) }
+            val overlappingRefs = eventRefsMap[evt.id].orEmpty()
 
             val cueRequiresTransByText = isTranslationRequested ||
                 (hasConcreteTarget && detectDominantScriptLanguage(evt.sourceText).let { s ->
@@ -439,7 +452,7 @@ class Scout2IndependentReviewer {
                 sourceLangNorm = sourceLangNorm,
                 targetLangNorm = targetLangNorm,
                 requiresTranslation = cueRequiresTransByText,
-            )
+            ) && (evt.translationSourceRevision == 0 || evt.translationSourceRevision >= evt.sourceTextRevision)
             val sanitizedTranslated = if (!hasValidTranslation && cueRequiresTransByText) {
                 ""
             } else {
@@ -531,7 +544,11 @@ class Scout2IndependentReviewer {
                     when {
                         semantic.isEquivalent -> {
                             val translationChecked = canCompareAgainstTranslated && !cueNeedsTranslation
-                            val sourceVerified = refOriginIsHighTrust || draftEvidenceIsAudio
+                            val sourceVerified = if (cueRequiresTranslation && cueRefMatchesTarget) {
+                                draftEvidenceIsAudio
+                            } else {
+                                refOriginIsHighTrust || draftEvidenceIsAudio
+                            }
                             val cueVerified = sourceVerified && (!cueRequiresTranslation || translationChecked)
                             if (refOriginIsHighTrust) usedCaptionAlignment = true
                             if (draftEvidenceIsAudio) usedIndependentAudio = true
@@ -558,6 +575,8 @@ class Scout2IndependentReviewer {
                                     },
                                     note = if (cueRequiresTranslation && !translationChecked) {
                                         "Source matched reference; translation unverified"
+                                    } else if (!sourceVerified) {
+                                        "Target translation matched reference; source audio unverified"
                                     } else {
                                         "Matched reference (${(semantic.score * 100).toInt()}%)"
                                     },
@@ -567,7 +586,9 @@ class Scout2IndependentReviewer {
                         }
                         refOriginIsHighTrust && (semantic.hasCriticalDivergence || semantic.score < EQUIVALENT_TEXT_THRESHOLD) -> {
                             usedCaptionAlignment = true
-                            if (canCompareAgainstTranslated) {
+                            if (canCompareAgainstTranslated && !cueRequiresTranslation) {
+                                val srcChanged = normalizeTextForCompare(combinedRefText) != normalizeTextForCompare(evt.sourceText)
+                                val nextRev = if (srcChanged) evt.sourceTextRevision + 1 else evt.sourceTextRevision
                                 repairedDialogueCount++
                                 verifiedCueCount++
                                 notes.add("Repaired cue ${evt.id} using ${referenceTrack?.originKind?.label} reference (${semantic.reason})")
@@ -588,13 +609,48 @@ class Scout2IndependentReviewer {
                                     translatedText = combinedRefText,
                                     stableCueKey = stableKey,
                                     needsTranslation = false,
+                                    sourceTextRevision = nextRev,
+                                    translationSourceRevision = nextRev,
+                                )
+                            } else if (canCompareAgainstTranslated && cueRequiresTranslation) {
+                                // Target-language reference repairs ONLY translatedText; NEVER overwrite foreign sourceText!
+                                repairedDialogueCount++
+                                val srcBacked = draftEvidenceIsAudio
+                                if (srcBacked) verifiedCueCount++ else unverifiedCueCount++
+                                notes.add("Repaired target translation for ${evt.id} from ${referenceTrack?.originKind?.label} reference without overwriting sourceText")
+                                cueReviews.add(
+                                    CueReviewRecord(
+                                        eventId = evt.id,
+                                        stableCueKey = stableKey,
+                                        status = DialogueReviewStatus.REPAIRED_FROM_REFERENCE,
+                                        isSourceVerified = srcBacked,
+                                        isTranslationVerified = true,
+                                        needsTranslation = false,
+                                        wordingMethod = WordingVerificationMethod.CAPTION_ALIGNMENT,
+                                        note = "Target translation repaired; original sourceText preserved",
+                                    )
+                                )
+                                evt.copy(
+                                    translatedText = combinedRefText,
+                                    stableCueKey = stableKey,
+                                    needsTranslation = false,
+                                    translationSourceRevision = evt.sourceTextRevision,
                                 )
                             } else {
+                                // Source-language reference repair: substantive source changes MUST invalidate
+                                // derived target/literal/romanization outputs and queue targeted re-translation.
+                                val srcMateriallyChanged = normalizeTextForCompare(combinedRefText) != normalizeTextForCompare(evt.sourceText)
+                                val nextSrcRev = if (srcMateriallyChanged) evt.sourceTextRevision + 1 else evt.sourceTextRevision
+                                val nextTranslated = if (srcMateriallyChanged) "" else sanitizedTranslated
+                                val nextLiteral = if (srcMateriallyChanged) "" else evt.literalText
+                                val nextRoman = if (srcMateriallyChanged) "" else evt.romanization
+                                val nextTransRev = if (srcMateriallyChanged) 0 else evt.translationSourceRevision
+                                val stillMissingTrans = cueRequiresTranslation && (srcMateriallyChanged || nextTranslated.isBlank())
                                 repairedDialogueCount++
                                 unverifiedCueCount++
                                 allTranslationsVerified = false
-                                val stillMissingTrans = sanitizedTranslated.isBlank()
-                                notes.add("Repaired sourceText for ${evt.id} (${semantic.reason}); ${draft.targetLanguage} translation remains unverified")
+                                if (stillMissingTrans) escalatedForAmbiguity = true
+                                notes.add("Repaired sourceText for ${evt.id} (${semantic.reason}); ${draft.targetLanguage} translation invalidated pending repair")
                                 cueReviews.add(
                                     CueReviewRecord(
                                         eventId = evt.id,
@@ -604,14 +660,18 @@ class Scout2IndependentReviewer {
                                         isTranslationVerified = false,
                                         needsTranslation = stillMissingTrans,
                                         wordingMethod = WordingVerificationMethod.CAPTION_ALIGNMENT,
-                                        note = "Source repaired; translation unverified",
+                                        note = "Source repaired; dependent translation invalidated",
                                     )
                                 )
                                 evt.copy(
                                     sourceText = combinedRefText,
-                                    translatedText = sanitizedTranslated,
+                                    translatedText = nextTranslated,
+                                    literalText = nextLiteral,
+                                    romanization = nextRoman,
                                     stableCueKey = stableKey,
                                     needsTranslation = stillMissingTrans,
+                                    sourceTextRevision = nextSrcRev,
+                                    translationSourceRevision = nextTransRev,
                                 )
                             }
                         }
@@ -717,7 +777,7 @@ class Scout2IndependentReviewer {
         if (recoveredOmitted.isNotEmpty()) {
             notes.add("Recovered ${recoveredOmitted.size} omitted cue(s) inside draft from reference captions")
         }
-        val textReviewed = (reviewedExisting + recoveredOmitted).sortedBy { it.startTimeMs }
+        val textReviewed = canonicalizeReviewedEvents(reviewedExisting + recoveredOmitted, notes)
 
         val totalCues = textReviewed.size
         val allCuesIndependentlyVerified = totalCues > 0 &&
@@ -919,6 +979,69 @@ class Scout2IndependentReviewer {
         return out
     }
 
+    private fun canonicalizeReviewedEvents(
+        events: List<DialogueEvent>,
+        notes: MutableList<String>,
+    ): List<DialogueEvent> {
+        if (events.size <= 1) {
+            return events.map { it.copy(stableCueKey = it.canonicalIdentityKey) }
+        }
+        val sorted = events.sortedWith(compareBy<DialogueEvent> { it.startTimeMs }.thenByDescending { it.sourceTextRevision }.thenBy { it.id })
+        val out = mutableListOf<DialogueEvent>()
+        for (incoming in sorted) {
+            val incomingKey = incoming.canonicalIdentityKey
+            val existingByKeyIdx = out.indexOfFirst { it.canonicalIdentityKey == incomingKey }
+            if (existingByKeyIdx >= 0) {
+                val prev = out[existingByKeyIdx]
+                if (!prev.lockedByUser && (incoming.sourceTextRevision >= prev.sourceTextRevision)) {
+                    out[existingByKeyIdx] = incoming.copy(stableCueKey = incomingKey)
+                }
+                notes.add("Canonicalized duplicate key $incomingKey")
+                continue
+            }
+            val duplicateIdx = out.indexOfFirst { prev ->
+                val sameOrCompatibleSpeaker = prev.speakerId == null ||
+                    incoming.speakerId == null ||
+                    prev.speakerId.equals(incoming.speakerId, ignoreCase = true)
+                if (!sameOrCompatibleSpeaker || prev.dialogueType != incoming.dialogueType) {
+                    false
+                } else {
+                    val overlapMs = minOf(prev.endTimeMs, incoming.endTimeMs) - maxOf(prev.startTimeMs, incoming.startTimeMs)
+                    val nearStart = abs(prev.startTimeMs - incoming.startTimeMs) <= 500L
+                    if (overlapMs <= 0L && !nearStart) {
+                        false
+                    } else {
+                        val sem = evaluateSemanticEquivalence(
+                            prev.sourceText.ifBlank { prev.translatedText },
+                            incoming.sourceText.ifBlank { incoming.translatedText },
+                        )
+                        sem.isEquivalent || sem.score >= 0.78f
+                    }
+                }
+            }
+            if (duplicateIdx >= 0) {
+                val prev = out[duplicateIdx]
+                val preferIncoming = !prev.lockedByUser && (
+                    incoming.sourceTextRevision > prev.sourceTextRevision ||
+                        (incoming.translatedText.isNotBlank() && prev.translatedText.isBlank()) ||
+                        (incoming.sourceText.length > prev.sourceText.length + 4 && !prev.id.startsWith("sc2_"))
+                    )
+                if (preferIncoming) {
+                    out[duplicateIdx] = incoming.copy(
+                        id = prev.id,
+                        stableCueKey = prev.canonicalIdentityKey,
+                        startTimeMs = minOf(prev.startTimeMs, incoming.startTimeMs),
+                        endTimeMs = maxOf(prev.endTimeMs, incoming.endTimeMs),
+                    )
+                }
+                notes.add("Collapsed post-repair overlapping duplicate for ${prev.canonicalIdentityKey}")
+            } else {
+                out.add(incoming.copy(stableCueKey = incomingKey))
+            }
+        }
+        return out
+    }
+
     private fun validatePresentation(
         events: List<DialogueEvent>,
         layoutEngine: BalloonLayoutEngine,
@@ -940,7 +1063,7 @@ class Scout2IndependentReviewer {
                 event = evt,
                 styleSettings = styleSettings,
                 liveFaces = liveFaces,
-                fixedZoneTaillessMode = displayMode == CaptionDisplayMode.FIXED_ZONES,
+                displayMode = displayMode,
                 measuredNormalizedSizes = measuredNormalizedSizes,
             )
             if (!stability.isWithinBounds || stability.hasSevereFaceCollision || stability.maxDriftNorm > MAX_ALLOWED_PREVIEW_DRIFT) {
@@ -961,7 +1084,7 @@ class Scout2IndependentReviewer {
                     event = fallbackEvt,
                     styleSettings = styleSettings,
                     liveFaces = liveFaces,
-                    fixedZoneTaillessMode = displayMode == CaptionDisplayMode.FIXED_ZONES,
+                    displayMode = displayMode,
                     measuredNormalizedSizes = measuredNormalizedSizes,
                 )
                 if (!recheck.isWithinBounds || recheck.hasSevereFaceCollision || recheck.maxDriftNorm > MAX_ALLOWED_PREVIEW_DRIFT) {
@@ -1601,6 +1724,8 @@ class ReleasedTimelineStore {
         neutralizeAttribution: Boolean = false,
         removeHallucinatedCue: Boolean = false,
         nowEpochMs: Long = System.currentTimeMillis(),
+        correctedTargetText: String? = null,
+        sourceMatchesTargetLanguage: Boolean = true,
     ): ReleasedPlaybackSnapshot? = synchronized(lock) {
         if (mediaId != activeMediaId || sessionToken != activeSessionToken) {
             staleCallbacksRejected++
@@ -1622,9 +1747,35 @@ class ReleasedTimelineStore {
             releasedEventsById.remove(targetEventId)
             lastReleaseSummary = "Removed materially wrong cue $targetEventId (rev #$releaseRevision)"
         } else {
+            val sourceChanged = correctedText != null && correctedText.trim() != existing.sourceText.trim()
+            val nextSourceRev = if (sourceChanged) existing.sourceTextRevision + 1 else existing.sourceTextRevision
+            val nextSourceText = correctedText ?: existing.sourceText
+            val nextTranslatedText = when {
+                correctedTargetText != null -> correctedTargetText
+                correctedText != null && sourceMatchesTargetLanguage -> correctedText
+                sourceChanged -> ""
+                else -> existing.translatedText
+            }
+            val nextNeedsTranslation = when {
+                correctedTargetText != null -> correctedTargetText.isBlank() && !sourceMatchesTargetLanguage
+                correctedText != null && sourceMatchesTargetLanguage -> false
+                sourceChanged -> true
+                else -> existing.needsTranslation
+            }
+            val nextTranslationRev = when {
+                correctedTargetText != null -> nextSourceRev
+                correctedText != null && sourceMatchesTargetLanguage -> nextSourceRev
+                sourceChanged -> 0
+                else -> existing.translationSourceRevision
+            }
             val updated = existing.copy(
-                sourceText = correctedText ?: existing.sourceText,
-                translatedText = correctedText ?: existing.translatedText,
+                sourceText = nextSourceText,
+                translatedText = nextTranslatedText,
+                literalText = if (sourceChanged && !sourceMatchesTargetLanguage && correctedTargetText == null) "" else existing.literalText,
+                romanization = if (sourceChanged && !sourceMatchesTargetLanguage && correctedTargetText == null) "" else existing.romanization,
+                needsTranslation = nextNeedsTranslation,
+                sourceTextRevision = nextSourceRev,
+                translationSourceRevision = nextTranslationRev,
                 speakerId = if (neutralizeAttribution) null else existing.speakerId,
                 speakerConfidence = if (neutralizeAttribution) 0.35f else existing.speakerConfidence,
                 faceTrackId = if (neutralizeAttribution) null else existing.faceTrackId,
@@ -1632,7 +1783,7 @@ class ReleasedTimelineStore {
                 anchorPosition = if (neutralizeAttribution) null else existing.anchorPosition,
                 placementMode = if (neutralizeAttribution) PlacementMode.NEUTRAL_FALLBACK else existing.placementMode,
                 attributionSummary = if (neutralizeAttribution) "Unidentified speaker" else existing.attributionSummary,
-                stableCueKey = existing.stableCueKey.ifBlank { existing.id },
+                stableCueKey = existing.canonicalIdentityKey,
             )
             releasedEventsById[targetEventId] = updated
             lastReleaseSummary = "Controlled visible correction on $targetEventId (rev #$releaseRevision)"
@@ -1651,21 +1802,43 @@ class ReleasedTimelineStore {
         speakers: List<Speaker>,
     ) {
         speakers.forEach { releasedSpeakersById[it.id] = it }
-        // Remove previous non-user-locked events strictly inside [startMs, endMs) unless preserved by id/stableCueKey
         val incomingIds = incoming.map { it.id }.toSet()
-        val staleInWindow = releasedEventsById.values
+        val incomingKeys = incoming.map { it.canonicalIdentityKey }.toSet()
+        // Remove previous non-user-locked events inside [startMs, endMs), sharing canonical keys,
+        // or spanning across the repair boundary when reconciled against incoming revisions.
+        val staleIds = releasedEventsById.values
             .filter { evt ->
-                !evt.lockedByUser &&
-                    evt.startTimeMs in startMs until endMs &&
-                    evt.id !in incomingIds
+                if (evt.lockedByUser) return@filter false
+                if (evt.id in incomingIds || evt.canonicalIdentityKey in incomingKeys) return@filter true
+                if (evt.startTimeMs in startMs until endMs) return@filter true
+                val spansWindowBoundary = evt.startTimeMs < endMs && evt.endTimeMs > startMs
+                if (!spansWindowBoundary) return@filter false
+                incoming.any { inc ->
+                    val sameParent = evt.parentUtteranceKey.isNotBlank() &&
+                        (evt.parentUtteranceKey == inc.parentUtteranceKey || evt.parentUtteranceKey == inc.canonicalIdentityKey)
+                    val sameSpeakerOrUnknown = evt.speakerId == null ||
+                        inc.speakerId == null ||
+                        evt.speakerId.equals(inc.speakerId, ignoreCase = true)
+                    val overlap = (minOf(evt.endTimeMs, inc.endTimeMs) - maxOf(evt.startTimeMs, inc.startTimeMs)).coerceAtLeast(0L)
+                    val sem = if (overlap > 0L && sameSpeakerOrUnknown) {
+                        Scout2IndependentReviewer.evaluateSemanticEquivalence(evt.sourceText, inc.sourceText)
+                    } else {
+                        null
+                    }
+                    sameParent || (sem != null && (sem.isEquivalent || sem.score >= 0.72f))
+                }
             }
             .map { it.id }
-        staleInWindow.forEach { releasedEventsById.remove(it) }
+        staleIds.forEach { releasedEventsById.remove(it) }
 
         for (evt in incoming) {
+            val stableKey = evt.canonicalIdentityKey
             val existingById = releasedEventsById[evt.id]
             if (existingById?.lockedByUser == true) continue
-            val stableKey = evt.stableCueKey.ifBlank { existingById?.stableCueKey?.ifBlank { evt.id } ?: evt.id }
+            val existingLockedByKey = releasedEventsById.values.firstOrNull {
+                it.lockedByUser && it.canonicalIdentityKey == stableKey
+            }
+            if (existingLockedByKey != null) continue
             releasedEventsById[evt.id] = evt.copy(stableCueKey = stableKey)
         }
     }

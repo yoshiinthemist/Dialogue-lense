@@ -1,5 +1,6 @@
 package com.example.domain.playback
 
+import com.example.data.model.CaptionDisplayMode
 import com.example.data.model.CoverageStatus
 import com.example.domain.analysis.TranscriptCoverageLedger
 import kotlin.math.abs
@@ -87,6 +88,9 @@ data class PlaybackTimingDiagnostics(
     val contiguousReleasedLeadMs: Long = contiguousVerifiedLeadMs,
     val measuredProcessingLatencyMs: Long = 0L,
     val isUsingUnverifiedFallback: Boolean = false,
+    val requestedSeekSeq: Long = 0L,
+    val dispatchedSeekSeq: Long = 0L,
+    val seekDispatchedAtEpochMs: Long = 0L,
 )
 
 data class PlaybackReadinessSnapshot(
@@ -151,7 +155,12 @@ class PlaybackReadinessController(
     private var lastContiguousLeadMs: Long = 0L
     private var lastVerifiedLeadMs: Long = 0L
     private var measuredLatencyEmaMs: Long = 0L
+    private var mediaUsesCoverageGate: Boolean = true
     private var requiresCoverageGate: Boolean = true
+    private var requestedSeekSeq: Long = 0L
+    private var dispatchedSeekSeq: Long = 0L
+    private var seekDispatchedAtEpochMs: Long = 0L
+    private var isMediaHardwareError: Boolean = false
 
     fun resetForMedia(
         initialPositionMs: Long,
@@ -161,6 +170,7 @@ class PlaybackReadinessController(
         playbackSpeed: Float = 1.0f,
         initialSeekGeneration: Long = 0L,
     ): PlaybackReadinessSnapshot {
+        this.mediaUsesCoverageGate = requiresCoverageGate
         this.requiresCoverageGate = requiresCoverageGate
         this.userIntent = initialIntent
         this.playbackSpeed = playbackSpeed.coerceIn(0.25f, 3.0f)
@@ -170,6 +180,10 @@ class PlaybackReadinessController(
         val safeGen = initialSeekGeneration.coerceAtLeast(0L)
         this.seekGeneration = safeGen
         this.acknowledgedSeekGeneration = safeGen
+        this.requestedSeekSeq = safeGen
+        this.dispatchedSeekSeq = safeGen
+        this.seekDispatchedAtEpochMs = 0L
+        this.isMediaHardwareError = false
         this.bufferingEpisodeId = 0L
         this.bufferingStartedAtEpochMs = 0L
         this.lastBufferingDurationMs = 0L
@@ -285,12 +299,15 @@ class PlaybackReadinessController(
             requestedTargetMs.coerceAtLeast(0L)
         }
         seekGeneration++
+        requestedSeekSeq = seekGeneration
+        seekDispatchedAtEpochMs = nowEpochMs
         currentPositionMs = clamped
         targetPositionMs = clamped
         pendingAutoResume = null
         activeWatchNowBypass = null
         waitTimedOut = false
         failureReason = ""
+        isMediaHardwareError = false
 
         if (!requiresCoverageGate) {
             state = PlaybackReadinessState.SEEKING
@@ -328,9 +345,14 @@ class PlaybackReadinessController(
         if (isSeekPendingAck) {
             if (abs(safePos - targetPositionMs) <= SEEK_ACK_TOLERANCE_MS) {
                 acknowledgedSeekGeneration = seekGeneration
+                dispatchedSeekSeq = maxOf(dispatchedSeekSeq, seekGeneration)
+                seekDispatchedAtEpochMs = 0L
                 currentPositionMs = safePos
             } else {
                 // Ignore stale pre-seek position sample while player is still moving to targetPositionMs
+                if (seekDispatchedAtEpochMs > 0L && nowEpochMs - seekDispatchedAtEpochMs >= SEEK_ACK_TIMEOUT_MS) {
+                    return onSeekAckTimedOut(ledger, nowEpochMs)
+                }
                 return evaluateCoverage(ledger, nowEpochMs)
             }
         } else {
@@ -518,9 +540,76 @@ class PlaybackReadinessController(
     /**
      * Explicit user retry after a bounded buffering timeout or failure.
      */
+    fun onSeekDispatched(
+        dispatchedGeneration: Long = seekGeneration,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): PlaybackReadinessSnapshot {
+        dispatchedSeekSeq = maxOf(dispatchedSeekSeq, dispatchedGeneration)
+        if (seekDispatchedAtEpochMs <= 0L) {
+            seekDispatchedAtEpochMs = nowEpochMs
+        }
+        return snapshot()
+    }
+
+    fun onSeekAckTimedOut(
+        ledger: TranscriptCoverageLedger,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): PlaybackReadinessSnapshot {
+        if (seekGeneration <= acknowledgedSeekGeneration) return evaluateCoverage(ledger, nowEpochMs)
+        waitTimedOut = true
+        isMediaHardwareError = true
+        pendingAutoResume = null
+        failureReason = "Seek did not reach target position in time. Retry or scrub again."
+        state = PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR
+        return snapshot()
+    }
+
+    /**
+     * Switches between captioned modes and OFF cleanly:
+     * - Switching to OFF releases caption buffering holds (without overriding intentional user PAUSE
+     *   or hiding genuine media hardware errors).
+     * - Switching back to a captioned mode restores the media coverage gate and evaluates lead.
+     */
+    fun onDisplayModeChanged(
+        displayMode: CaptionDisplayMode,
+        ledger: TranscriptCoverageLedger,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): PlaybackReadinessSnapshot {
+        val primary = displayMode.normalizedPrimaryMode()
+        if (primary == CaptionDisplayMode.OFF) {
+            requiresCoverageGate = false
+            pendingAutoResume = null
+            waitTimedOut = false
+            if (!isMediaHardwareError) {
+                if (isBufferingState(state) ||
+                    state == PlaybackReadinessState.WATCHING_WITHOUT_FULL_COVERAGE ||
+                    state == PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR ||
+                    state == PlaybackReadinessState.READY_TO_AUTO_RESUME
+                ) {
+                    failureReason = ""
+                    state = if (userIntent == UserPlaybackIntent.PLAY) {
+                        PlaybackReadinessState.PLAYING
+                    } else {
+                        PlaybackReadinessState.PAUSED_BY_USER
+                    }
+                }
+            }
+            return snapshot()
+        }
+
+        requiresCoverageGate = mediaUsesCoverageGate
+        if (!requiresCoverageGate) return snapshot()
+        return if (userIntent == UserPlaybackIntent.PLAY) {
+            onUserPlayRequested(currentPositionMs, ledger, nowEpochMs)
+        } else {
+            evaluateCoverage(ledger, nowEpochMs)
+        }
+    }
+
     fun onUserRetryBuffering(nowEpochMs: Long = System.currentTimeMillis()): PlaybackReadinessSnapshot {
         waitTimedOut = false
         failureReason = ""
+        isMediaHardwareError = false
         activeWatchNowBypass = null
         startBufferingEpisode(
             newState = if (targetPositionMs <= 1_000L) {
@@ -534,7 +623,8 @@ class PlaybackReadinessController(
         return snapshot()
     }
 
-    fun onMediaOrAnalysisError(reason: String): PlaybackReadinessSnapshot {
+    fun onMediaOrAnalysisError(reason: String, isMediaHardwareError: Boolean = false): PlaybackReadinessSnapshot {
+        this.isMediaHardwareError = isMediaHardwareError
         failureReason = reason.ifBlank { "Unable to prepare dialogue for this section." }
         pendingAutoResume = null
         state = PlaybackReadinessState.PLAYBACK_OR_ANALYSIS_ERROR
@@ -663,6 +753,9 @@ class PlaybackReadinessController(
             contiguousReleasedLeadMs = lastContiguousLeadMs,
             measuredProcessingLatencyMs = measuredLatencyEmaMs,
             isUsingUnverifiedFallback = usingFallback,
+            requestedSeekSeq = requestedSeekSeq,
+            dispatchedSeekSeq = dispatchedSeekSeq,
+            seekDispatchedAtEpochMs = seekDispatchedAtEpochMs,
         )
         return PlaybackReadinessSnapshot(
             state = state,
@@ -691,6 +784,7 @@ class PlaybackReadinessController(
         const val MIN_SHORT_VIDEO_LEAD_MS = 1_500L
         const val END_OF_MEDIA_TOLERANCE_MS = 1_200L
         const val SEEK_ACK_TOLERANCE_MS = 1_800L
+        const val SEEK_ACK_TIMEOUT_MS = 12_000L
         const val DEFAULT_WAIT_TIMEOUT_MS = 24_000L
         const val LATENCY_BASELINE_MS = 3_500L
         const val MAX_TRACKED_LATENCY_MS = 18_000L

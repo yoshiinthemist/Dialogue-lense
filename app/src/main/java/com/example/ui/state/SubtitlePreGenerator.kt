@@ -1318,57 +1318,90 @@ class SubtitlePreGenerator(
         onQuotaTripped: () -> Unit = {},
         onStatus: (String) -> Unit,
     ): DialogueLensProject {
-        val src = project.sourceLanguage
+        val rawSrc = project.sourceLanguage
         val tgt = project.targetLanguage
-        if (src.equals(tgt, ignoreCase = true) || src.equals("Auto-Detect", ignoreCase = true)) {
+        val srcNorm = com.example.domain.pipeline.Scout2IndependentReviewer.normalizeLanguageTag(rawSrc)
+        val tgtNorm = com.example.domain.pipeline.Scout2IndependentReviewer.normalizeLanguageTag(tgt)
+        if (tgtNorm == "auto" || tgtNorm.isBlank()) {
             return project
         }
-        val translatable = project.dialogueEvents.filter { it.sourceText.isNotBlank() }
+        val isAutoSource = srcNorm == "auto" || srcNorm.isBlank()
+        if (!isAutoSource && srcNorm == tgtNorm) {
+            return project
+        }
+
+        val translatable = project.dialogueEvents.filter { evt ->
+            if (evt.sourceText.isBlank()) return@filter false
+            if (evt.needsTranslation) return@filter true
+            if (!isAutoSource) return@filter evt.translatedText.isBlank() ||
+                evt.translatedText.trim().equals(evt.sourceText.trim(), ignoreCase = true)
+            val detected = com.example.domain.pipeline.Scout2IndependentReviewer.detectDominantScriptLanguage(evt.sourceText)
+            (detected.isNotBlank() && detected != tgtNorm) || evt.translatedText.isBlank()
+        }
         if (translatable.isEmpty()) return project
 
         val cacheMap = projectStore.loadTranslationCache().toMutableMap()
-        val cachedUpdates = mutableMapOf<String, String>()
+        val cachedUpdates = mutableMapOf<String, Pair<String, Int>>()
         val uncached = mutableListOf<DialogueEvent>()
         translatable.forEach { evt ->
-            val key = ProjectStore.buildLineTranslationCacheKey(evt.sourceText, src, tgt)
+            val effectiveSrc = if (!isAutoSource) {
+                rawSrc
+            } else {
+                com.example.domain.pipeline.Scout2IndependentReviewer.detectDominantScriptLanguage(evt.sourceText)
+                    .ifBlank { "Auto-Detect" }
+            }
+            val key = ProjectStore.buildLineTranslationCacheKey(evt.sourceText, effectiveSrc, tgt)
             val hit = cacheMap[key]
             if (!hit.isNullOrBlank()) {
-                cachedUpdates[evt.id] = hit
+                cachedUpdates[evt.id] = hit to evt.sourceTextRevision
             } else {
                 uncached.add(evt)
             }
         }
 
-        val preferCloudBestModel = quotaSaverMode == QuotaSaverMode.PRO_ACCURACY && !quotaCircuitBreakerTripped && canContinueCloud()
+        val batchSize = 45
+        var circuitTripped = quotaCircuitBreakerTripped
+        val preferCloudBestModel = quotaSaverMode == QuotaSaverMode.PRO_ACCURACY && !circuitTripped && canContinueCloud()
         if (uncached.isNotEmpty() && preferCloudBestModel) {
-            onStatus("Translating ${uncached.size} lines into $tgt with Gemini 3.8 Flash...")
-            var batchRes = translationAiService.translateBatch(
-                events = uncached.take(45),
-                sourceLanguage = src,
-                targetLanguage = tgt,
-                speakers = project.speakers,
-                glossary = project.glossary,
-                preferLiteModel = false,
-            )
-            if (batchRes.isFailure && TranslationAiService.isQuotaOrCreditExhaustedError(batchRes.exceptionOrNull()) && canContinueCloud()) {
-                onStatus("Gemini 3.8 Flash credits depleted — switching to Flash-Lite...")
-                batchRes = translationAiService.translateBatch(
-                    events = uncached.take(45),
-                    sourceLanguage = src,
+            val batches = uncached.chunked(batchSize)
+            for ((batchIdx, batch) in batches.withIndex()) {
+                if (circuitTripped || !canContinueCloud()) break
+                onStatus("Translating lines ${batchIdx * batchSize + 1}–${batchIdx * batchSize + batch.size} of ${uncached.size} into $tgt...")
+                var batchRes = translationAiService.translateBatch(
+                    events = batch,
+                    sourceLanguage = rawSrc,
                     targetLanguage = tgt,
                     speakers = project.speakers,
                     glossary = project.glossary,
-                    preferLiteModel = true,
+                    preferLiteModel = false,
                 )
-            }
-            if (batchRes.isFailure && TranslationAiService.isQuotaOrCreditExhaustedError(batchRes.exceptionOrNull())) {
-                onQuotaTripped()
-            }
-            batchRes.getOrNull().orEmpty().forEach { line ->
-                val srcText = uncached.firstOrNull { it.id == line.id }?.sourceText.orEmpty()
-                if (srcText.isNotBlank() && line.naturalTranslation.isNotBlank()) {
-                    cacheMap[ProjectStore.buildLineTranslationCacheKey(srcText, src, tgt)] = line.naturalTranslation
-                    cachedUpdates[line.id] = line.naturalTranslation
+                if (batchRes.isFailure && TranslationAiService.isQuotaOrCreditExhaustedError(batchRes.exceptionOrNull()) && canContinueCloud()) {
+                    onStatus("Gemini 3.8 Flash credits depleted — switching to Flash-Lite...")
+                    batchRes = translationAiService.translateBatch(
+                        events = batch,
+                        sourceLanguage = rawSrc,
+                        targetLanguage = tgt,
+                        speakers = project.speakers,
+                        glossary = project.glossary,
+                        preferLiteModel = true,
+                    )
+                }
+                if (batchRes.isFailure && TranslationAiService.isQuotaOrCreditExhaustedError(batchRes.exceptionOrNull())) {
+                    circuitTripped = true
+                    onQuotaTripped()
+                    break
+                }
+                batchRes.getOrNull().orEmpty().forEach { line ->
+                    val matchedEvt = batch.firstOrNull { it.id == line.id }
+                    val srcText = matchedEvt?.sourceText.orEmpty()
+                    if (matchedEvt != null && srcText.isNotBlank() && line.naturalTranslation.isNotBlank()) {
+                        val effectiveSrc = if (!isAutoSource) rawSrc else {
+                            com.example.domain.pipeline.Scout2IndependentReviewer.detectDominantScriptLanguage(srcText)
+                                .ifBlank { "Auto-Detect" }
+                        }
+                        cacheMap[ProjectStore.buildLineTranslationCacheKey(srcText, effectiveSrc, tgt)] = line.naturalTranslation
+                        cachedUpdates[line.id] = line.naturalTranslation to matchedEvt.sourceTextRevision
+                    }
                 }
             }
             if (cachedUpdates.isNotEmpty()) {
@@ -1377,40 +1410,52 @@ class SubtitlePreGenerator(
         }
 
         val stillUncached = uncached.filter { it.id !in cachedUpdates }
-        if (stillUncached.isNotEmpty() && onDeviceTranslator.canTranslateOffline(src, tgt)) {
+        if (stillUncached.isNotEmpty() && !isAutoSource && onDeviceTranslator.canTranslateOffline(rawSrc, tgt)) {
             onStatus("Translating ${stillUncached.size} lines offline into $tgt via ML Kit ($0)...")
-            val offlineMap = onDeviceTranslator.translateEventsOffline(stillUncached, src, tgt).getOrNull().orEmpty()
+            val offlineMap = onDeviceTranslator.translateEventsOffline(stillUncached, rawSrc, tgt).getOrNull().orEmpty()
             offlineMap.forEach { (id, tr) ->
-                val srcText = stillUncached.firstOrNull { it.id == id }?.sourceText.orEmpty()
-                if (srcText.isNotBlank() && tr.isNotBlank()) {
-                    cacheMap[ProjectStore.buildLineTranslationCacheKey(srcText, src, tgt)] = tr
-                    cachedUpdates[id] = tr
+                val matchedEvt = stillUncached.firstOrNull { it.id == id }
+                val srcText = matchedEvt?.sourceText.orEmpty()
+                if (matchedEvt != null && srcText.isNotBlank() && tr.isNotBlank()) {
+                    cacheMap[ProjectStore.buildLineTranslationCacheKey(srcText, rawSrc, tgt)] = tr
+                    cachedUpdates[id] = tr to matchedEvt.sourceTextRevision
                 }
             }
             projectStore.saveTranslationCache(cacheMap)
         } else if (stillUncached.isNotEmpty() &&
             quotaSaverMode != QuotaSaverMode.ZERO_CLOUD &&
-            !quotaCircuitBreakerTripped &&
+            !circuitTripped &&
             !preferCloudBestModel &&
             canContinueCloud()
         ) {
-            onStatus("Translating ${stillUncached.size} lines into $tgt...")
-            val batchRes = translationAiService.translateBatch(
-                events = stillUncached.take(45),
-                sourceLanguage = src,
-                targetLanguage = tgt,
-                speakers = project.speakers,
-                glossary = project.glossary,
-                preferLiteModel = true,
-            )
-            if (batchRes.isFailure && TranslationAiService.isQuotaOrCreditExhaustedError(batchRes.exceptionOrNull())) {
-                onQuotaTripped()
-            }
-            batchRes.getOrNull().orEmpty().forEach { line ->
-                val srcText = stillUncached.firstOrNull { it.id == line.id }?.sourceText.orEmpty()
-                if (srcText.isNotBlank() && line.naturalTranslation.isNotBlank()) {
-                    cacheMap[ProjectStore.buildLineTranslationCacheKey(srcText, src, tgt)] = line.naturalTranslation
-                    cachedUpdates[line.id] = line.naturalTranslation
+            val batches = stillUncached.chunked(batchSize)
+            for ((batchIdx, batch) in batches.withIndex()) {
+                if (circuitTripped || !canContinueCloud()) break
+                onStatus("Translating lines ${batchIdx * batchSize + 1}–${batchIdx * batchSize + batch.size} of ${stillUncached.size} into $tgt...")
+                val batchRes = translationAiService.translateBatch(
+                    events = batch,
+                    sourceLanguage = rawSrc,
+                    targetLanguage = tgt,
+                    speakers = project.speakers,
+                    glossary = project.glossary,
+                    preferLiteModel = true,
+                )
+                if (batchRes.isFailure && TranslationAiService.isQuotaOrCreditExhaustedError(batchRes.exceptionOrNull())) {
+                    circuitTripped = true
+                    onQuotaTripped()
+                    break
+                }
+                batchRes.getOrNull().orEmpty().forEach { line ->
+                    val matchedEvt = batch.firstOrNull { it.id == line.id }
+                    val srcText = matchedEvt?.sourceText.orEmpty()
+                    if (matchedEvt != null && srcText.isNotBlank() && line.naturalTranslation.isNotBlank()) {
+                        val effectiveSrc = if (!isAutoSource) rawSrc else {
+                            com.example.domain.pipeline.Scout2IndependentReviewer.detectDominantScriptLanguage(srcText)
+                                .ifBlank { "Auto-Detect" }
+                        }
+                        cacheMap[ProjectStore.buildLineTranslationCacheKey(srcText, effectiveSrc, tgt)] = line.naturalTranslation
+                        cachedUpdates[line.id] = line.naturalTranslation to matchedEvt.sourceTextRevision
+                    }
                 }
             }
             if (cachedUpdates.isNotEmpty()) {
@@ -1421,8 +1466,12 @@ class SubtitlePreGenerator(
         if (cachedUpdates.isEmpty()) return project
         val patched = SubtitleParser.applyReadingPacingGuardrails(
             project.dialogueEvents.map { evt ->
-                val tr = cachedUpdates[evt.id] ?: return@map evt
-                evt.copy(translatedText = tr)
+                val (tr, rev) = cachedUpdates[evt.id] ?: return@map evt
+                evt.copy(
+                    translatedText = tr,
+                    needsTranslation = false,
+                    translationSourceRevision = rev,
+                )
             }
         )
         return project.copy(dialogueEvents = patched)
@@ -1496,14 +1545,23 @@ class SubtitlePreGenerator(
             else -> "CUT"
         }
         val shots = listOf(Shot("shot_1", 0L, durationMs, cutType = cutType))
+        val srcLangNorm = com.example.domain.pipeline.Scout2IndependentReviewer.normalizeLanguageTag(sourceLanguage)
+        val tgtLangNorm = com.example.domain.pipeline.Scout2IndependentReviewer.normalizeLanguageTag(targetLanguage)
+        val hasConcreteTarget = tgtLangNorm.isNotBlank() && tgtLangNorm != "auto"
         val rawEvents = SubtitleParser.applyReadingPacingGuardrails(
-            cues.map { cue ->
+            cues.mapIndexed { idx, cue ->
+                val detectedScript = com.example.domain.pipeline.Scout2IndependentReviewer.detectDominantScriptLanguage(cue.text)
+                val needsTrans = hasConcreteTarget && (
+                    (srcLangNorm.isNotBlank() && srcLangNorm != "auto" && srcLangNorm != tgtLangNorm) ||
+                        (detectedScript.isNotBlank() && detectedScript != tgtLangNorm)
+                    )
+                val stableKey = "${youtubeVideoId ?: id}_cue_${idx}_${cue.startTimeMs}"
                 DialogueEvent(
                     id = SubtitleParser.newEventId(),
                     startTimeMs = cue.startTimeMs,
                     endTimeMs = cue.endTimeMs,
                     sourceText = cue.text,
-                    translatedText = cue.text,
+                    translatedText = if (needsTrans) "" else cue.text,
                     speakerId = null,
                     speakerConfidence = 0.48f,
                     faceTrackId = null,
@@ -1515,6 +1573,10 @@ class SubtitlePreGenerator(
                     } else {
                         PlacementMode.EDGE_DOCKED
                     },
+                    stableCueKey = stableKey,
+                    needsTranslation = needsTrans,
+                    sourceSpanStartMs = cue.startTimeMs,
+                    sourceSpanEndMs = cue.endTimeMs,
                 )
             }
         )

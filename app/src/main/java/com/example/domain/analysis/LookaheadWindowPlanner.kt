@@ -469,14 +469,12 @@ object LookaheadWindowPlanner {
         windowEndMs: Long,
     ): WindowMergeReport {
         val incomingIds = incoming.map { it.id }.toSet()
-        // Additive & idempotent merge: NEVER blindly wipe existing unlocked cues inside [windowStartMs, windowEndMs),
-        // because overlapping windows, bisected partial recoveries, or simultaneous speakers may contribute cues
-        // across passes. Only replace an existing unlocked event when an incoming event updates that exact ID.
+        val incomingKeys = incoming.map { it.canonicalIdentityKey }.toSet()
         val keptExisting = existing.filter { evt ->
-            evt.lockedByUser || evt.id !in incomingIds
+            evt.lockedByUser || (evt.id !in incomingIds && evt.canonicalIdentityKey !in incomingKeys)
         }
         val lockedInWindow = keptExisting.filter { evt ->
-            evt.lockedByUser && evt.startTimeMs in windowStartMs until windowEndMs
+            evt.lockedByUser && evt.endTimeMs > windowStartMs && evt.startTimeMs < windowEndMs
         }
 
         val merged = keptExisting.toMutableList()
@@ -535,21 +533,46 @@ object LookaheadWindowPlanner {
                 continue
             }
 
-            val duplicateMatch = merged.firstOrNull { prev ->
-                areDuplicateUtterances(prev, candidate)
+            val duplicateMatchIdx = merged.indexOfFirst { prev ->
+                prev.canonicalIdentityKey == candidate.canonicalIdentityKey ||
+                    areDuplicateUtterances(prev, candidate)
             }
-            if (duplicateMatch != null) {
-                rejectedCount++
-                decisions.add(
-                    DuplicateDecisionRecord(
-                        accepted = false,
-                        reason = "TEMPORAL_OVERLAP_SAME_UTTERANCE",
-                        incomingTextPreview = candidate.sourceText.take(48),
-                        incomingStartMs = candidate.startTimeMs,
-                        matchedStartMs = duplicateMatch.startTimeMs,
-                        speakerId = candidate.speakerId,
+            if (duplicateMatchIdx >= 0) {
+                val duplicateMatch = merged[duplicateMatchIdx]
+                val canReplaceWithImprovement = !duplicateMatch.lockedByUser && (
+                    candidate.sourceTextRevision > duplicateMatch.sourceTextRevision ||
+                        (candidate.translatedText.isNotBlank() && duplicateMatch.translatedText.isBlank()) ||
+                        (candidate.speakerId != null && duplicateMatch.speakerId == null &&
+                            candidate.speakerConfidence > duplicateMatch.speakerConfidence + 0.1f)
                     )
-                )
+                if (canReplaceWithImprovement) {
+                    merged[duplicateMatchIdx] = candidate.copy(
+                        stableCueKey = duplicateMatch.canonicalIdentityKey,
+                    )
+                    acceptedCount++
+                    decisions.add(
+                        DuplicateDecisionRecord(
+                            accepted = true,
+                            reason = "REPLACED_WITH_IMPROVED_REVISION",
+                            incomingTextPreview = candidate.sourceText.take(48),
+                            incomingStartMs = candidate.startTimeMs,
+                            matchedStartMs = duplicateMatch.startTimeMs,
+                            speakerId = candidate.speakerId,
+                        )
+                    )
+                } else {
+                    rejectedCount++
+                    decisions.add(
+                        DuplicateDecisionRecord(
+                            accepted = false,
+                            reason = "TEMPORAL_OVERLAP_SAME_UTTERANCE",
+                            incomingTextPreview = candidate.sourceText.take(48),
+                            incomingStartMs = candidate.startTimeMs,
+                            matchedStartMs = duplicateMatch.startTimeMs,
+                            speakerId = candidate.speakerId,
+                        )
+                    )
+                }
                 continue
             }
 

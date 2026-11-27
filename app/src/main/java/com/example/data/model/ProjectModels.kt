@@ -58,17 +58,48 @@ enum class TranslationMode(val label: String) {
 }
 
 enum class CaptionDisplayMode(val label: String) {
-    BALLOONS("Balloons"),
-    FIXED_ZONES("Fixed Zones"),
-    CLASSIC("Classic"),
-    BOTH("Both"),
-    OFF("Off");
+    OFF("No captions"),
+    CLASSIC("Classic captions"),
+    BALLOONS("Bubble captions"),
+    BUBBLES_WITH_TAILS("Bubbles with tails"),
+    @Deprecated("Legacy mode migrated to BALLOONS")
+    FIXED_ZONES("Bubble captions"),
+    @Deprecated("Legacy mode migrated to BUBBLES_WITH_TAILS or BALLOONS")
+    BOTH("Bubbles with tails");
 
-    fun normalizedPrimaryMode(): CaptionDisplayMode =
-        if (this == BOTH) BALLOONS else this
+    val shouldShowBubbles: Boolean
+        get() = when (normalizedPrimaryMode()) {
+            BALLOONS, BUBBLES_WITH_TAILS -> true
+            OFF, CLASSIC -> false
+            else -> false
+        }
+
+    val shouldShowClassic: Boolean
+        get() = normalizedPrimaryMode() == CLASSIC
+
+    val shouldShowTails: Boolean
+        get() = normalizedPrimaryMode() == BUBBLES_WITH_TAILS
+
+    fun normalizedPrimaryMode(previousShowTail: Boolean = false): CaptionDisplayMode = when (this) {
+        OFF -> OFF
+        CLASSIC -> CLASSIC
+        BALLOONS -> BALLOONS
+        BUBBLES_WITH_TAILS -> BUBBLES_WITH_TAILS
+        FIXED_ZONES -> BALLOONS
+        BOTH -> if (previousShowTail) BUBBLES_WITH_TAILS else BALLOONS
+    }
 
     companion object {
-        val primaryModes: List<CaptionDisplayMode> = listOf(BALLOONS, FIXED_ZONES, CLASSIC, OFF)
+        val primaryModes: List<CaptionDisplayMode> = listOf(OFF, CLASSIC, BALLOONS, BUBBLES_WITH_TAILS)
+
+        fun migrateLegacy(rawMode: CaptionDisplayMode, previousShowTail: Boolean): CaptionDisplayMode =
+            when (rawMode) {
+                OFF -> OFF
+                CLASSIC -> CLASSIC
+                FIXED_ZONES -> BALLOONS
+                BOTH, BALLOONS -> if (previousShowTail) BUBBLES_WITH_TAILS else BALLOONS
+                BUBBLES_WITH_TAILS -> BUBBLES_WITH_TAILS
+            }
     }
 }
 
@@ -125,6 +156,13 @@ enum class BubbleVisualStyle(val label: String) {
     MANGA_INK("Manga"),
     STREAMING_CLEAN("Minimal"),
     READING_COMFORT("Reading Comfort"),
+}
+
+enum class CaptionFontFamily(val label: String) {
+    DEFAULT_SANS("System Sans"),
+    SERIF("Classic Serif"),
+    MONOSPACE("Monospace"),
+    READABLE_ROUNDED("Readable Rounded"),
 }
 
 enum class SpeakerLabelMode(val label: String) {
@@ -261,9 +299,27 @@ data class Speaker(
     val previousNames: List<String> = emptyList(),
     val discoveryReason: String = "",
     val isIdentityConfirmed: Boolean = true,
+    val nameRevealedAtMs: Long? = null,
+    val isUserNamed: Boolean = false,
+    val revealProvenance: String = "",
 ) {
     val displayName: String
         get() = customName.ifBlank { defaultLabel }
+
+    fun visibleDisplayNameAt(atTimeMs: Long): String {
+        if (customName.isBlank()) return defaultLabel
+        if (isLocked || isUserNamed) return customName
+        val revealAt = nameRevealedAtMs ?: return customName
+        return if (atTimeMs >= revealAt) customName else defaultLabel
+    }
+
+    fun hasVisibleCharacterNameAt(atTimeMs: Long): Boolean {
+        val resolved = visibleDisplayNameAt(atTimeMs).trim()
+        if (resolved.length < 2) return false
+        if (resolved.matches(Regex("^Speaker\\s+[A-Z0-9]+$", RegexOption.IGNORE_CASE))) return false
+        if (resolved.matches(Regex("^(Unknown(\\s+Speaker)?|Unidentified)$", RegexOption.IGNORE_CASE))) return false
+        return true
+    }
 
     val hasDistinctCharacterName: Boolean
         get() {
@@ -304,7 +360,15 @@ data class DialogueEvent(
     val avoidBoxes: List<NormalizedRect> = emptyList(),
     val stableCueKey: String = "",
     val needsTranslation: Boolean = false,
+    val parentUtteranceKey: String = "",
+    val sourceSpanStartMs: Long? = null,
+    val sourceSpanEndMs: Long? = null,
+    val sourceTextRevision: Int = 1,
+    val translationSourceRevision: Int = 0,
 ) {
+    val canonicalIdentityKey: String
+        get() = stableCueKey.ifBlank { id }
+
     val confidenceTier: ConfidenceTier
         get() = confidenceTierFor(speakerConfidence)
 
@@ -358,6 +422,8 @@ enum class HealBeaconStatus {
     HEALING,
     HEALED,
     NEEDS_ATTENTION,
+    SUPERSEDED,
+    CANCELLED,
     UNDONE,
 }
 
@@ -399,6 +465,8 @@ data class HealBeacon(
     val patrolChapterId: String? = null,
     val beforeSampleText: String = "",
     val afterSampleText: String = "",
+    val generationToken: Long = 0L,
+    val coordinatorJobId: String = "",
 )
 
 @JsonClass(generateAdapter = true)
@@ -420,7 +488,61 @@ data class BalloonStyleSettings(
     val lipReadingSafeZone: Boolean = true,
     val offScreenEdgeGlow: Boolean = true,
     val ambientMoodBorder: Boolean = true,
+    val fontFamily: CaptionFontFamily = CaptionFontFamily.DEFAULT_SANS,
+    val customForegroundColorHex: Long? = null,
+    val customBackgroundColorHex: Long? = null,
 )
+
+object CaptionAccessibilityContrast {
+    const val MIN_TEXT_CONTRAST_RATIO: Float = 4.5f
+
+    fun compositeOverBackdrop(
+        surfaceArgb: Long,
+        surfaceAlpha: Float,
+        backdropArgb: Long = 0xFF101828L,
+    ): Long {
+        val a = surfaceAlpha.coerceIn(0f, 1f)
+        val sr = ((surfaceArgb shr 16) and 0xFF).toFloat()
+        val sg = ((surfaceArgb shr 8) and 0xFF).toFloat()
+        val sb = (surfaceArgb and 0xFF).toFloat()
+        val br = ((backdropArgb shr 16) and 0xFF).toFloat()
+        val bg = ((backdropArgb shr 8) and 0xFF).toFloat()
+        val bb = (backdropArgb and 0xFF).toFloat()
+        val r = (sr * a + br * (1f - a)).toInt().coerceIn(0, 255)
+        val g = (sg * a + bg * (1f - a)).toInt().coerceIn(0, 255)
+        val b = (sb * a + bb * (1f - a)).toInt().coerceIn(0, 255)
+        return (0xFFL shl 24) or (r.toLong() shl 16) or (g.toLong() shl 8) or b.toLong()
+    }
+
+    fun relativeLuminance(argb: Long): Float {
+        fun linearize(channel: Long): Double {
+            val srgb = channel.toDouble() / 255.0
+            return if (srgb <= 0.04045) srgb / 12.92 else Math.pow((srgb + 0.055) / 1.055, 2.4)
+        }
+        val r = linearize((argb shr 16) and 0xFF)
+        val g = linearize((argb shr 8) and 0xFF)
+        val b = linearize(argb and 0xFF)
+        return (0.2126 * r + 0.7152 * g + 0.0722 * b).toFloat()
+    }
+
+    fun contrastRatio(fgArgb: Long, bgArgb: Long): Float {
+        val l1 = relativeLuminance(fgArgb)
+        val l2 = relativeLuminance(bgArgb)
+        val lighter = maxOf(l1, l2)
+        val darker = minOf(l1, l2)
+        return ((lighter + 0.05f) / (darker + 0.05f))
+    }
+
+    fun meetsMinimumTextContrast(
+        fgArgb: Long,
+        bgContainerArgb: Long,
+        bgAlpha: Float,
+        backdropArgb: Long = 0xFF808080L,
+    ): Boolean {
+        val composited = compositeOverBackdrop(bgContainerArgb, bgAlpha, backdropArgb)
+        return contrastRatio(fgArgb, composited) >= MIN_TEXT_CONTRAST_RATIO
+    }
+}
 
 @JsonClass(generateAdapter = true)
 data class PersistedSchedulingState(
@@ -614,6 +736,55 @@ data class CachedVideoTranscript(
         const val CURRENT_CACHE_VERSION = 2
     }
 }
+enum class ScoutCaptureHealthState(val label: String) {
+    WAITING_FOR_MEDIA("Waiting for media"),
+    UNSUPPORTED_CAPTURE("Capture unsupported"),
+    RECORDER_STARTED("Recorder active"),
+    USABLE_DECODED_INPUT("Decoded speech input usable"),
+    SOURCE_INACCESSIBLE("Source protected or inaccessible"),
+    CONFIRMED_SILENCE("Confirmed silence"),
+    DECODE_FAILED("Audio decode failed"),
+    FAILED_EXHAUSTED("Capture recovery exhausted"),
+}
 
+@JsonClass(generateAdapter = true)
+data class ScoutCaptureDiagnostics(
+    val healthState: ScoutCaptureHealthState = ScoutCaptureHealthState.WAITING_FOR_MEDIA,
+    val selectedElementId: String = "",
+    val documentGeneration: Long = 0L,
+    val recorderId: String = "",
+    val outputMuted: Boolean = true,
+    val outputVolumeZero: Boolean = true,
+    val trackReadyState: String = "",
+    val trackMuted: Boolean = false,
+    val trackEnabled: Boolean = false,
+    val lastMimeType: String = "",
+    val lastSliceStartMs: Long = -1L,
+    val lastSliceEndMs: Long = -1L,
+    val sampleRateHz: Int = 0,
+    val decodedSampleCount: Int = 0,
+    val rmsEnergy: Float = 0f,
+    val peakAmplitude: Float = 0f,
+    val discontinuityCount: Int = 0,
+    val droppedGapCount: Int = 0,
+    val diagnosticDetail: String = "",
+)
 
+enum class YouTubePlayerErrorKind(val label: String) {
+    CLIENT_IDENTITY_153("Client identity rejected (153)"),
+    EMBEDDING_DENIED_101_150("Embedding disallowed (101/150)"),
+    INVALID_PARAM_2("Invalid request (2)"),
+    HTML5_ERROR_5("HTML5 playback error (5)"),
+    VIDEO_NOT_FOUND_100("Video unavailable (100)"),
+    UNKNOWN("Player error"),
+}
+
+fun classifyYouTubeErrorCode(errorCode: Int): YouTubePlayerErrorKind = when (errorCode) {
+    153 -> YouTubePlayerErrorKind.CLIENT_IDENTITY_153
+    101, 150 -> YouTubePlayerErrorKind.EMBEDDING_DENIED_101_150
+    2 -> YouTubePlayerErrorKind.INVALID_PARAM_2
+    5 -> YouTubePlayerErrorKind.HTML5_ERROR_5
+    100 -> YouTubePlayerErrorKind.VIDEO_NOT_FOUND_100
+    else -> YouTubePlayerErrorKind.UNKNOWN
+}
 

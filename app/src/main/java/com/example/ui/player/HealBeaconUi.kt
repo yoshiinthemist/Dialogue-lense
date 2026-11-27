@@ -205,6 +205,8 @@ fun healBeaconColor(status: HealBeaconStatus): Color = when (status) {
     HealBeaconStatus.HEALED -> SoftJade
     HealBeaconStatus.NEEDS_ATTENTION -> WarmAmber
     HealBeaconStatus.UNDONE -> InkSecondary
+    HealBeaconStatus.SUPERSEDED -> InkSecondary
+    HealBeaconStatus.CANCELLED -> InkSecondary
 }
 
 fun healBeaconStatusLabel(status: HealBeaconStatus): String = when (status) {
@@ -213,6 +215,8 @@ fun healBeaconStatusLabel(status: HealBeaconStatus): String = when (status) {
     HealBeaconStatus.HEALED -> "Healed"
     HealBeaconStatus.NEEDS_ATTENTION -> "Needs attention"
     HealBeaconStatus.UNDONE -> "Undone"
+    HealBeaconStatus.SUPERSEDED -> "Superseded"
+    HealBeaconStatus.CANCELLED -> "Cancelled"
 }
 
 fun healScopeLabel(scope: HealScope): String = when (scope) {
@@ -310,6 +314,18 @@ fun HealBeaconDetailSheet(
                                 )
                                 HealBeaconStatus.UNDONE -> Icon(
                                     Icons.AutoMirrored.Rounded.Undo,
+                                    contentDescription = null,
+                                    tint = statusColor,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                                HealBeaconStatus.SUPERSEDED -> Icon(
+                                    Icons.Rounded.Refresh,
+                                    contentDescription = null,
+                                    tint = statusColor,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                                HealBeaconStatus.CANCELLED -> Icon(
+                                    Icons.Rounded.DeleteOutline,
                                     contentDescription = null,
                                     tint = statusColor,
                                     modifier = Modifier.size(20.dp),

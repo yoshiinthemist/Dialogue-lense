@@ -370,27 +370,32 @@ class SubtitleTimelineMatcher(
 
         if (cursorIdx >= sortedEvents.size) return emptyList()
 
-        // First check exact strict range [startTimeMs .. endTimeMs]
+        // First check exact strict start-inclusive, end-exclusive range [startTimeMs .. endTimeMs)
         val exact = mutableListOf<DialogueEvent>()
         var idx = (cursorIdx - 2).coerceAtLeast(0)
         while (idx < sortedEvents.size) {
             val evt = sortedEvents[idx]
             if (evt.startTimeMs > currentMs + frameToleranceMs) break
-            if (currentMs in evt.startTimeMs..evt.endTimeMs) {
+            val inHalfOpen = if (evt.endTimeMs > evt.startTimeMs) {
+                currentMs in evt.startTimeMs until evt.endTimeMs
+            } else {
+                currentMs == evt.startTimeMs
+            }
+            if (inHalfOpen) {
                 exact.add(evt)
             }
             idx++
         }
         if (exact.isNotEmpty()) return exact
 
-        // If no cue matched strictly (e.g., 16ms frame landed just within 18ms of cue edge),
-        // snap to the closest cue boundary within frameToleranceMs without overlapping neighbors.
+        // If no cue matched strictly (e.g., 16ms frame landed just within 18ms of an isolated cue edge),
+        // snap to the closest isolated boundary within frameToleranceMs without overlapping adjacent cues.
         var nearIdx = (cursorIdx - 2).coerceAtLeast(0)
         while (nearIdx < sortedEvents.size) {
             val evt = sortedEvents[nearIdx]
             if (evt.startTimeMs > currentMs + frameToleranceMs) break
-            val withinStartEdge = currentMs in (evt.startTimeMs - frameToleranceMs)..evt.startTimeMs
-            val withinEndEdge = currentMs in evt.endTimeMs..(evt.endTimeMs + frameToleranceMs)
+            val withinStartEdge = currentMs in (evt.startTimeMs - frameToleranceMs) until evt.startTimeMs
+            val withinEndEdge = currentMs > evt.endTimeMs && currentMs <= (evt.endTimeMs + frameToleranceMs)
             if (withinStartEdge || withinEndEdge) {
                 return listOf(evt)
             }

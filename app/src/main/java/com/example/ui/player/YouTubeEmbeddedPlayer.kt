@@ -49,12 +49,14 @@ fun YouTubeEmbeddedPlayer(
     preferredCaptionLang: String = "en",
     onCaptionTrackStatus: (trackCount: Int, activeLang: String, trackEnabled: Boolean, activeCuePresent: Boolean, probeBlocked: Boolean) -> Unit = { _, _, _, _, _ -> },
     onEmbedFallback: (errorCode: Int) -> Unit = {},
+    onPlayerError: (errorCode: Int) -> Unit = {},
     onCapturedTimedTextBody: (url: String, body: String, cookies: String?, userAgent: String?) -> Unit = { _, _, _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     val latestCallback by rememberUpdatedState(onPlaybackState)
     val latestTrackStatusCallback by rememberUpdatedState(onCaptionTrackStatus)
     val latestEmbedFallbackCallback by rememberUpdatedState(onEmbedFallback)
+    val latestPlayerErrorCallback by rememberUpdatedState(onPlayerError)
     val latestPreferredLang by rememberUpdatedState(preferredCaptionLang)
     val latestCapturedTimedTextCallback by rememberUpdatedState(onCapturedTimedTextBody)
     val seenTimedTextUrls = remember(videoId) { mutableSetOf<String>() }
@@ -86,9 +88,16 @@ fun YouTubeEmbeddedPlayer(
     LaunchedEffect(playRequest, playerReady, usingMobileWatchFallback) {
         val req = playRequest ?: return@LaunchedEffect
         if (!playerReady || req.first == lastHandledPlaySeq) return@LaunchedEffect
-        lastHandledPlaySeq = req.first
-        val js = if (req.second) "window.dlPlay && window.dlPlay();" else "window.dlPause && window.dlPause();"
-        webViewRef?.evaluateJavascript(js, null)
+        val js = if (req.second) {
+            "(window.dlPlay ? window.dlPlay() : 'pending')"
+        } else {
+            "(window.dlPause ? window.dlPause() : 'pending')"
+        }
+        webViewRef?.evaluateJavascript(js) { res ->
+            if (res == "\"ok\"") {
+                lastHandledPlaySeq = req.first
+            }
+        }
     }
 
     LaunchedEffect(effectiveMuted, playerReady, usingMobileWatchFallback) {
@@ -105,9 +114,12 @@ fun YouTubeEmbeddedPlayer(
     LaunchedEffect(seekRequest, playerReady, usingMobileWatchFallback) {
         val req = seekRequest ?: return@LaunchedEffect
         if (!playerReady || req.first == lastHandledSeekSeq) return@LaunchedEffect
-        lastHandledSeekSeq = req.first
         val seconds = (req.second / 1000.0)
-        webViewRef?.evaluateJavascript("window.dlSeek && window.dlSeek($seconds);", null)
+        webViewRef?.evaluateJavascript("(window.dlSeek ? window.dlSeek($seconds) : 'pending')") { res ->
+            if (res == "\"ok\"") {
+                lastHandledSeekSeq = req.first
+            }
+        }
     }
 
     LaunchedEffect(effectiveSuppressCc, playerReady, usingMobileWatchFallback) {
@@ -305,8 +317,16 @@ fun YouTubeEmbeddedPlayer(
                     }
 
                     @JavascriptInterface
+                    fun onPlayerError(errorCode: Int) {
+                        mainHandler.post {
+                            latestPlayerErrorCallback(errorCode)
+                        }
+                    }
+
+                    @JavascriptInterface
                     fun onEmbedBlocked(errorCode: Int) {
                         mainHandler.post {
+                            latestPlayerErrorCallback(errorCode)
                             val activeId = loadedVideoId?.replace(Regex("[^0-9A-Za-z_-]"), "").orEmpty()
                             if (!fallbackAttempted && activeId.isNotEmpty()) {
                                 fallbackAttempted = true
@@ -444,14 +464,14 @@ private fun buildYouTubeIframeHtml(
             var ytReady = false;
             var pollTimer = null;
             var pendingDesiredPlay = null;
-            var playGraceUntilMs = 0;
+            var pendingSeekSec = null;
             var forceScoutMute = $forceMuteFlag;
             var suppressCc = $initialSuppressFlag;
             var hasAppliedSoftMute = false;
             var switchedToWatchFallback = false;
 
             var lastReportedTrackSig = '';
-            var hasEnsuredCaptionModule = false;
+            var hasAppliedCaptionTrack = false;
             var pollTick = 0;
 
             function reportNativeCaptionTracks(isBlocked) {
@@ -476,32 +496,38 @@ private fun buildYouTubeIframeHtml(
               } catch (e) {}
             }
 
-            function ensurePreferredCaptionTrackOnce() {
-              if (hasEnsuredCaptionModule || !ytPlayer) return;
-              hasEnsuredCaptionModule = true;
+            function ensurePreferredCaptionTrack() {
+              if (hasAppliedCaptionTrack || !ytPlayer) return;
               try {
                 if (typeof ytPlayer.loadModule === 'function') ytPlayer.loadModule('captions');
                 var list = (typeof ytPlayer.getOption === 'function') ? ytPlayer.getOption('captions', 'tracklist') : null;
                 var active = (typeof ytPlayer.getOption === 'function') ? ytPlayer.getOption('captions', 'track') : null;
-                if ((!active || !active.languageCode) && typeof ytPlayer.setOption === 'function') {
-                  var pick = '$safeLang';
-                  if (Array.isArray(list) && list.length > 0) {
-                    var exact = list.find(function(t) { return t && t.languageCode && String(t.languageCode).toLowerCase().indexOf('$safeLang') === 0; });
-                    pick = (exact && exact.languageCode) ? String(exact.languageCode) : (list[0].languageCode ? String(list[0].languageCode) : pick);
-                  }
+                if (active && active.languageCode) {
+                  hasAppliedCaptionTrack = true;
+                  return;
+                }
+                if (Array.isArray(list) && list.length > 0 && typeof ytPlayer.setOption === 'function') {
+                  var exact = list.find(function(t) { return t && t.languageCode && String(t.languageCode).toLowerCase().indexOf('$safeLang') === 0; });
+                  var pick = (exact && exact.languageCode) ? String(exact.languageCode) : (list[0].languageCode ? String(list[0].languageCode) : '$safeLang');
                   if (!suppressCc || forceScoutMute) {
                     ytPlayer.setOption('captions', 'track', { languageCode: pick });
+                    hasAppliedCaptionTrack = true;
                   }
                 }
               } catch (e) {}
+            }
+
+            function restorePreferredCaptionTrack() {
+              if (!ytPlayer || suppressCc && !forceScoutMute) return;
+              hasAppliedCaptionTrack = false;
+              ensurePreferredCaptionTrack();
+              reportNativeCaptionTracks(false);
             }
 
             function applySoftCaptionMuteOnce() {
               if (!suppressCc || forceScoutMute || !ytPlayer || hasAppliedSoftMute) return;
               hasAppliedSoftMute = true;
               try {
-                // Report available tracks BEFORE softly clearing viewer double-caption display,
-                // so Scout telemetry never sees an artificially empty CC state.
                 reportNativeCaptionTracks(false);
                 if (typeof ytPlayer.setOption === 'function') {
                   ytPlayer.setOption('captions', 'track', {});
@@ -519,29 +545,34 @@ private fun buildYouTubeIframeHtml(
                     if (forceScoutMute && ytPlayer.getCurrentTime && ytPlayer.getCurrentTime() > 4 && ytPlayer.seekTo) {
                       ytPlayer.seekTo(0, true);
                     }
-                    ensurePreferredCaptionTrackOnce();
+                    ensurePreferredCaptionTrack();
                     if (suppressCc && !forceScoutMute) {
                       setTimeout(applySoftCaptionMuteOnce, 450);
                     }
                     if (window.DialogueLensYt) window.DialogueLensYt.onReady();
                     setTimeout(function() { reportNativeCaptionTracks(false); }, 650);
+                    if (pendingSeekSec !== null && ytPlayer.seekTo) {
+                      ytPlayer.seekTo(pendingSeekSec, true);
+                      pendingSeekSec = null;
+                    }
                     if (pendingDesiredPlay === true && ytPlayer.playVideo) {
-                      playGraceUntilMs = Date.now() + 2500;
                       ytPlayer.playVideo();
                       pendingDesiredPlay = null;
                     } else if (pendingDesiredPlay === false && ytPlayer.pauseVideo) {
-                      playGraceUntilMs = 0;
                       ytPlayer.pauseVideo();
                       pendingDesiredPlay = null;
                     }
                     startPolling();
                   },
                   onApiChange: function() {
-                    ensurePreferredCaptionTrackOnce();
+                    ensurePreferredCaptionTrack();
                     reportNativeCaptionTracks(false);
                   },
                   onStateChange: function(ev) {
                     if (forceScoutMute && ytPlayer && ytPlayer.mute) ytPlayer.mute();
+                    if (!hasAppliedCaptionTrack) {
+                      ensurePreferredCaptionTrack();
+                    }
                     if (suppressCc && !forceScoutMute && !hasAppliedSoftMute) {
                       applySoftCaptionMuteOnce();
                     }
@@ -559,6 +590,9 @@ private fun buildYouTubeIframeHtml(
                       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
                       window.DialogueLensYt.onEmbedBlocked(code);
                       return;
+                    }
+                    if (window.DialogueLensYt && typeof window.DialogueLensYt.onPlayerError === 'function') {
+                      window.DialogueLensYt.onPlayerError(code);
                     }
                     var el = document.getElementById('errBanner');
                     var txt = document.getElementById('errText');
@@ -579,14 +613,13 @@ private fun buildYouTubeIframeHtml(
               attachYtPlayer();
             }
 
-            // Guard in case iframe_api loaded synchronously or before callback fired
+            // Bounded attach retries when iframe_api is already cached; NEVER fake onReady()
             setTimeout(function() {
               if (!ytReady && !switchedToWatchFallback) attachYtPlayer();
-              if (!ytReady && !switchedToWatchFallback && window.DialogueLensYt) {
-                window.DialogueLensYt.onReady();
-                startPolling();
-              }
             }, 1200);
+            setTimeout(function() {
+              if (!ytReady && !switchedToWatchFallback) attachYtPlayer();
+            }, 3500);
 
             function startPolling() {
               if (pollTimer) clearInterval(pollTimer);
@@ -594,71 +627,58 @@ private fun buildYouTubeIframeHtml(
             }
 
             function pushState() {
-              if (switchedToWatchFallback || !ytPlayer || !ytPlayer.getCurrentTime || !window.DialogueLensYt) return;
+              if (switchedToWatchFallback || !ytReady || !ytPlayer || !ytPlayer.getCurrentTime || !window.DialogueLensYt) return;
               pollTick++;
               if (pollTick % 20 === 0) {
+                if (!hasAppliedCaptionTrack) ensurePreferredCaptionTrack();
                 reportNativeCaptionTracks(false);
               }
               var curMs = Math.round((ytPlayer.getCurrentTime() || 0) * 1000);
               var durMs = Math.round((ytPlayer.getDuration ? (ytPlayer.getDuration() || 0) : 0) * 1000);
               var st = ytPlayer.getPlayerState ? ytPlayer.getPlayerState() : -1;
-              if (st === 1 || st === 2 || st === 0) {
-                playGraceUntilMs = 0;
-              }
-              var playing = (st === 1) || (st === 3) || (Date.now() < playGraceUntilMs && st !== 2 && st !== 0);
+              var playing = (st === 1);
               window.DialogueLensYt.onProgress(curMs, durMs, playing);
             }
 
-            function postYtCommand(func, args) {
-              try {
-                var fr = document.getElementById('player');
-                if (fr && fr.contentWindow) {
-                  fr.contentWindow.postMessage(
-                    JSON.stringify({ event: 'command', func: func, args: args || [] }),
-                    '*'
-                  );
-                }
-              } catch (err) {}
-            }
-
             window.dlPlay = function() {
-              playGraceUntilMs = Date.now() + 2500;
-              if (forceScoutMute) {
-                if (ytPlayer && typeof ytPlayer.mute === 'function') ytPlayer.mute();
-                else postYtCommand('mute');
+              if (forceScoutMute && ytPlayer && typeof ytPlayer.mute === 'function') {
+                ytPlayer.mute();
               }
-              if (ytPlayer && typeof ytPlayer.playVideo === 'function') {
+              if (ytReady && ytPlayer && typeof ytPlayer.playVideo === 'function') {
+                pendingDesiredPlay = null;
                 ytPlayer.playVideo();
-              } else {
-                pendingDesiredPlay = true;
-                postYtCommand('playVideo');
+                return 'ok';
               }
+              pendingDesiredPlay = true;
+              return 'pending';
             };
             window.dlPause = function() {
-              playGraceUntilMs = 0;
-              if (ytPlayer && typeof ytPlayer.pauseVideo === 'function') {
+              if (ytReady && ytPlayer && typeof ytPlayer.pauseVideo === 'function') {
+                pendingDesiredPlay = null;
                 ytPlayer.pauseVideo();
-              } else {
-                pendingDesiredPlay = false;
-                postYtCommand('pauseVideo');
+                return 'ok';
               }
+              pendingDesiredPlay = false;
+              return 'pending';
             };
             window.dlMute = function() {
               if (ytPlayer && typeof ytPlayer.mute === 'function') ytPlayer.mute();
-              else postYtCommand('mute');
             };
             window.dlUnmute = function() {
               if (forceScoutMute) return;
               if (ytPlayer && typeof ytPlayer.unMute === 'function') ytPlayer.unMute();
-              else postYtCommand('unMute');
             };
             window.dlRate = function(rate) {
               if (ytPlayer && typeof ytPlayer.setPlaybackRate === 'function') ytPlayer.setPlaybackRate(rate);
-              else postYtCommand('setPlaybackRate', [rate]);
             };
             window.dlSeek = function(sec) {
-              if (ytPlayer && typeof ytPlayer.seekTo === 'function') ytPlayer.seekTo(sec, true);
-              else postYtCommand('seekTo', [sec, true]);
+              if (ytReady && ytPlayer && typeof ytPlayer.seekTo === 'function') {
+                pendingSeekSec = null;
+                ytPlayer.seekTo(sec, true);
+                return 'ok';
+              }
+              pendingSeekSec = sec;
+              return 'pending';
             };
             window.dlSetSuppressCc = function(flag) {
               var nextSuppress = !!flag;
@@ -669,6 +689,7 @@ private fun buildYouTubeIframeHtml(
               } else if (!nextSuppress && suppressCc) {
                 suppressCc = false;
                 hasAppliedSoftMute = false;
+                restorePreferredCaptionTrack();
               }
             };
           </script>
@@ -699,7 +720,6 @@ private fun buildYouTubeMobileWatchHookScript(
   }
   window.__dlYtmHookInstalled = true;
   var notifiedReady = false;
-  var playGraceUntilMs = 0;
   var pendingPlay = false;
   var pendingSeekSec = null;
   var lastReportedTrackSig = '';
@@ -880,19 +900,23 @@ private fun buildYouTubeMobileWatchHookScript(
   }
 
   window.dlPlay = function() {
-    playGraceUntilMs = Date.now() + 2500;
-    pendingPlay = true;
     var v = findVideo();
     if (v) {
       pendingPlay = false;
       kickVideoPlay(v);
+      return 'ok';
     }
+    pendingPlay = true;
+    return 'pending';
   };
   window.dlPause = function() {
-    playGraceUntilMs = 0;
     pendingPlay = false;
     var v = findVideo();
-    if (v && typeof v.pause === 'function') v.pause();
+    if (v && typeof v.pause === 'function') {
+      v.pause();
+      return 'ok';
+    }
+    return 'pending';
   };
   window.dlMute = function() {
     desiredMuted = true;
@@ -918,11 +942,12 @@ private fun buildYouTubeMobileWatchHookScript(
   window.dlSeek = function(sec) {
     var v = findVideo();
     if (v && isFinite(sec)) {
-      v.currentTime = sec;
       pendingSeekSec = null;
-    } else {
-      pendingSeekSec = sec;
+      v.currentTime = sec;
+      return 'ok';
     }
+    pendingSeekSec = sec;
+    return 'pending';
   };
   window.dlSetSuppressCc = function(flag) {
     suppressCc = !!flag;
@@ -938,7 +963,7 @@ private fun buildYouTubeMobileWatchHookScript(
     var v = findVideo();
     if (!v || !window.DialogueLensYt) return;
 
-    if (!notifiedReady) {
+    if (!notifiedReady && v.readyState >= 1) {
       notifiedReady = true;
       window.DialogueLensYt.onReady();
     }
@@ -960,7 +985,7 @@ private fun buildYouTubeMobileWatchHookScript(
 
     var curMs = Math.round((v.currentTime || 0) * 1000);
     var durMs = (isFinite(v.duration) && v.duration > 0) ? Math.round(v.duration * 1000) : 0;
-    var playing = (!v.paused && !v.ended) || (Date.now() < playGraceUntilMs && !v.ended);
+    var playing = (!v.paused && !v.ended && v.readyState >= 3);
     window.DialogueLensYt.onProgress(curMs, durMs, playing);
   }, 50);
 })();

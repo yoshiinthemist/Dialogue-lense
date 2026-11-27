@@ -8,6 +8,7 @@ import android.net.Uri
 import android.util.Log
 import com.example.data.model.AudioVoiceFeatures
 import com.example.data.model.DialogueEvent
+import com.example.data.model.ScoutCaptureHealthState
 import com.example.data.subtitle.RawSubtitleCue
 import com.example.data.subtitle.SubtitleParser
 import kotlinx.coroutines.Dispatchers
@@ -31,6 +32,15 @@ data class AudioWavChunk(
     val startMs: Long,
     val endMs: Long,
     val wavBytes: ByteArray,
+)
+
+data class CapturedAudioInspection(
+    val healthState: ScoutCaptureHealthState,
+    val decodedSamplesCount: Int,
+    val rmsEnergy: Float,
+    val peakAmplitude: Float,
+    val sampleRateHz: Int,
+    val diagnosticNote: String = "",
 )
 
 /**
@@ -1064,6 +1074,141 @@ class AudioAnalyzer(private val context: Context) {
                 URI(baseUrl).resolve(trimmed).toString()
             }.getOrDefault(trimmed)
         }
+
+        fun inspectPcmWavBytes(bytes: ByteArray): CapturedAudioInspection {
+            if (bytes.size < 44) {
+                return CapturedAudioInspection(
+                    healthState = ScoutCaptureHealthState.DECODE_FAILED,
+                    decodedSamplesCount = 0,
+                    rmsEnergy = 0f,
+                    peakAmplitude = 0f,
+                    sampleRateHz = 0,
+                    diagnosticNote = "Truncated WAV container",
+                )
+            }
+            val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            val riff = ByteArray(4).also { buf.get(it) }
+            buf.getInt() // riff chunk size
+            val wave = ByteArray(4).also { buf.get(it) }
+            if (String(riff, Charsets.US_ASCII) != "RIFF" || String(wave, Charsets.US_ASCII) != "WAVE") {
+                return CapturedAudioInspection(
+                    healthState = ScoutCaptureHealthState.DECODE_FAILED,
+                    decodedSamplesCount = 0,
+                    rmsEnergy = 0f,
+                    peakAmplitude = 0f,
+                    sampleRateHz = 0,
+                    diagnosticNote = "Invalid RIFF/WAVE header",
+                )
+            }
+
+            var audioFormat = -1
+            var channels = 1
+            var sampleRate = 0
+            var bitsPerSample = 0
+            var dataOffset = -1
+            var dataSize = 0
+
+            while (buf.remaining() >= 8) {
+                val idBytes = ByteArray(4).also { buf.get(it) }
+                val chunkId = String(idBytes, Charsets.US_ASCII)
+                val chunkSize = buf.getInt()
+                if (chunkSize < 0 || chunkSize > buf.remaining()) break
+                val chunkStart = buf.position()
+                when (chunkId) {
+                    "fmt " -> {
+                        if (chunkSize >= 16) {
+                            audioFormat = buf.getShort().toInt() and 0xFFFF
+                            channels = (buf.getShort().toInt() and 0xFFFF).coerceIn(1, 8)
+                            sampleRate = buf.getInt()
+                            buf.getInt() // byteRate
+                            buf.getShort() // blockAlign
+                            bitsPerSample = buf.getShort().toInt() and 0xFFFF
+                        }
+                    }
+                    "data" -> {
+                        dataOffset = chunkStart
+                        dataSize = chunkSize
+                        break
+                    }
+                }
+                val nextPos = chunkStart + chunkSize + (chunkSize and 1)
+                if (nextPos > bytes.size) break
+                buf.position(nextPos)
+            }
+
+            if (audioFormat != 1 || bitsPerSample != 16 || sampleRate <= 0 || dataOffset < 0 || dataSize < 2) {
+                return CapturedAudioInspection(
+                    healthState = ScoutCaptureHealthState.DECODE_FAILED,
+                    decodedSamplesCount = 0,
+                    rmsEnergy = 0f,
+                    peakAmplitude = 0f,
+                    sampleRateHz = sampleRate.coerceAtLeast(0),
+                    diagnosticNote = "Unsupported or missing PCM-16 data in WAV",
+                )
+            }
+
+            val frameBytes = channels * 2
+            val frameCount = dataSize / frameBytes
+            if (frameCount <= 0) {
+                return CapturedAudioInspection(
+                    healthState = ScoutCaptureHealthState.DECODE_FAILED,
+                    decodedSamplesCount = 0,
+                    rmsEnergy = 0f,
+                    peakAmplitude = 0f,
+                    sampleRateHz = sampleRate,
+                    diagnosticNote = "Zero PCM frames decoded",
+                )
+            }
+
+            val dataBuf = ByteBuffer.wrap(bytes, dataOffset, frameCount * frameBytes).order(ByteOrder.LITTLE_ENDIAN)
+            var sumSq = 0.0
+            var peak = 0f
+            for (i in 0 until frameCount) {
+                var mono = 0f
+                for (c in 0 until channels) {
+                    mono += dataBuf.getShort().toFloat() / 32768f
+                }
+                val s = (mono / channels).coerceIn(-1f, 1f)
+                sumSq += (s * s).toDouble()
+                val a = abs(s)
+                if (a > peak) peak = a
+            }
+
+            return classifyDecodedSamples(frameCount, sumSq, peak, sampleRate, "audio/wav")
+        }
+
+        private fun classifyDecodedSamples(
+            sampleCount: Int,
+            sumSq: Double,
+            peak: Float,
+            sampleRateHz: Int,
+            mime: String,
+        ): CapturedAudioInspection {
+            if (sampleCount <= 0) {
+                return CapturedAudioInspection(
+                    healthState = ScoutCaptureHealthState.DECODE_FAILED,
+                    decodedSamplesCount = 0,
+                    rmsEnergy = 0f,
+                    peakAmplitude = 0f,
+                    sampleRateHz = sampleRateHz.coerceAtLeast(0),
+                    diagnosticNote = "Decoder produced 0 audio samples for $mime",
+                )
+            }
+            val rms = sqrt(sumSq / sampleCount).toFloat()
+            val isSilent = rms < 0.008f && peak < 0.025f
+            return CapturedAudioInspection(
+                healthState = if (isSilent) ScoutCaptureHealthState.CONFIRMED_SILENCE else ScoutCaptureHealthState.USABLE_DECODED_INPUT,
+                decodedSamplesCount = sampleCount,
+                rmsEnergy = rms,
+                peakAmplitude = peak,
+                sampleRateHz = sampleRateHz,
+                diagnosticNote = if (isSilent) {
+                    "Decoded silence ($sampleCount samples @ ${sampleRateHz}Hz)"
+                } else {
+                    "Decoded usable audio ($sampleCount samples @ ${sampleRateHz}Hz, rms=${"%.3f".format(rms)})"
+                },
+            )
+        }
     }
 
     private class MutableCueAudioAccumulator(private val sampleRate: Int) {
@@ -1156,6 +1301,156 @@ class AudioAnalyzer(private val context: Context) {
             } else {
                 0f
             }
+        }
+    }
+
+    /**
+     * Decodes a captured WebView MediaRecorder slice (or WAV clip in unit tests) into PCM samples
+     * to verify decode integrity and energy levels before releasing silence or scheduling ASR.
+     */
+    suspend fun inspectCapturedAudioChunk(
+        audioBytes: ByteArray,
+        mimeType: String,
+    ): CapturedAudioInspection = withContext(Dispatchers.Default) {
+        if (audioBytes.size < 16) {
+            return@withContext CapturedAudioInspection(
+                healthState = ScoutCaptureHealthState.DECODE_FAILED,
+                decodedSamplesCount = 0,
+                rmsEnergy = 0f,
+                peakAmplitude = 0f,
+                sampleRateHz = 0,
+                diagnosticNote = "Captured chunk too small (${audioBytes.size} bytes)",
+            )
+        }
+
+        val cleanMime = mimeType.trim().lowercase().substringBefore(';')
+        val hasRiffWave = audioBytes.size >= 12 &&
+            audioBytes[0] == 'R'.code.toByte() &&
+            audioBytes[1] == 'I'.code.toByte() &&
+            audioBytes[2] == 'F'.code.toByte() &&
+            audioBytes[3] == 'F'.code.toByte() &&
+            audioBytes[8] == 'W'.code.toByte() &&
+            audioBytes[9] == 'A'.code.toByte() &&
+            audioBytes[10] == 'V'.code.toByte() &&
+            audioBytes[11] == 'E'.code.toByte()
+
+        if (hasRiffWave || cleanMime == "audio/wav" || cleanMime == "audio/x-wav") {
+            return@withContext inspectPcmWavBytes(audioBytes)
+        }
+
+        val suffix = when (cleanMime) {
+            "audio/mp4", "audio/aac" -> ".m4a"
+            "audio/ogg" -> ".ogg"
+            "audio/mpeg" -> ".mp3"
+            else -> ".webm"
+        }
+        val tempFile = File(context.cacheDir, "dl_inspect_${System.nanoTime()}$suffix")
+        val extractor = MediaExtractor()
+        var codec: MediaCodec? = null
+        try {
+            FileOutputStream(tempFile).use { it.write(audioBytes) }
+            extractor.setDataSource(tempFile.absolutePath)
+            var audioIdx = -1
+            var audioFormat: MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val fmt = extractor.getTrackFormat(i)
+                val trackMime = fmt.getString(MediaFormat.KEY_MIME).orEmpty()
+                if (trackMime.startsWith("audio/")) {
+                    audioIdx = i
+                    audioFormat = fmt
+                    break
+                }
+            }
+            if (audioIdx == -1 || audioFormat == null) {
+                return@withContext CapturedAudioInspection(
+                    healthState = ScoutCaptureHealthState.DECODE_FAILED,
+                    decodedSamplesCount = 0,
+                    rmsEnergy = 0f,
+                    peakAmplitude = 0f,
+                    sampleRateHz = 0,
+                    diagnosticNote = "No decodable audio track in $cleanMime blob",
+                )
+            }
+            val trackMime = audioFormat.getString(MediaFormat.KEY_MIME) ?: cleanMime
+            val sampleRate = if (audioFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE).coerceIn(8000, 96000)
+            } else 48000
+            val channels = if (audioFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceIn(1, 8)
+            } else 1
+
+            extractor.selectTrack(audioIdx)
+            codec = MediaCodec.createDecoderByType(trackMime).apply {
+                configure(audioFormat, null, null, 0)
+                start()
+            }
+
+            var sumSq = 0.0
+            var peak = 0f
+            var sampleCount = 0
+            val info = MediaCodec.BufferInfo()
+            var inDone = false
+            var outDone = false
+            while (!outDone) {
+                if (!inDone) {
+                    val inIdx = codec.dequeueInputBuffer(5_000L)
+                    if (inIdx >= 0) {
+                        val inBuf = codec.getInputBuffer(inIdx)
+                        if (inBuf != null) {
+                            val sz = extractor.readSampleData(inBuf, 0)
+                            if (sz < 0) {
+                                codec.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                inDone = true
+                            } else {
+                                codec.queueInputBuffer(inIdx, 0, sz, extractor.sampleTime, 0)
+                                extractor.advance()
+                            }
+                        }
+                    }
+                }
+                val outIdx = codec.dequeueOutputBuffer(info, 5_000L)
+                if (outIdx >= 0) {
+                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outDone = true
+                    val outBuf = codec.getOutputBuffer(outIdx)
+                    if (outBuf != null && info.size > 0) {
+                        outBuf.position(info.offset)
+                        outBuf.limit(info.offset + info.size)
+                        val shorts = outBuf.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                        val frames = shorts.remaining() / channels
+                        for (f in 0 until frames) {
+                            var monoSum = 0f
+                            for (c in 0 until channels) {
+                                monoSum += shorts.get().toFloat() / 32768f
+                            }
+                            val s = (monoSum / channels).coerceIn(-1f, 1f)
+                            sumSq += (s * s).toDouble()
+                            val a = abs(s)
+                            if (a > peak) peak = a
+                            sampleCount++
+                        }
+                    }
+                    codec.releaseOutputBuffer(outIdx, false)
+                } else if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER && inDone) {
+                    break
+                }
+            }
+
+            classifyDecodedSamples(sampleCount, sumSq, peak, sampleRate, cleanMime)
+        } catch (e: Exception) {
+            Log.w(TAG, "Captured audio inspect failed for $cleanMime", e)
+            CapturedAudioInspection(
+                healthState = ScoutCaptureHealthState.DECODE_FAILED,
+                decodedSamplesCount = 0,
+                rmsEnergy = 0f,
+                peakAmplitude = 0f,
+                sampleRateHz = 0,
+                diagnosticNote = "Decode error (${cleanMime}): ${e.javaClass.simpleName}",
+            )
+        } finally {
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
+            runCatching { extractor.release() }
+            runCatching { tempFile.delete() }
         }
     }
 }

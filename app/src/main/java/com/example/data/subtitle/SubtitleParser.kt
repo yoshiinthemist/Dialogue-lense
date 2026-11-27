@@ -269,11 +269,20 @@ object SubtitleParser {
                                         evt.sourceText to ""
                                     }
                                 }
+                                val parentKey = evt.parentUtteranceKey.ifBlank { evt.stableCueKey.ifBlank { evt.id } }
+                                val spanStart = evt.sourceSpanStartMs ?: evt.startTimeMs
+                                val spanEnd = evt.sourceSpanEndMs ?: evt.endTimeMs
+                                val part1Key = "${parentKey}#p1"
+                                val part2Key = "${parentKey}#p2"
                                 add(
                                     evt.copy(
                                         endTimeMs = part1End,
                                         sourceText = srcSplit.first.ifBlank { firstDisp },
                                         translatedText = firstDisp,
+                                        stableCueKey = part1Key,
+                                        parentUtteranceKey = parentKey,
+                                        sourceSpanStartMs = spanStart,
+                                        sourceSpanEndMs = spanEnd,
                                     )
                                 )
                                 add(
@@ -283,6 +292,10 @@ object SubtitleParser {
                                         endTimeMs = evt.endTimeMs,
                                         sourceText = srcSplit.second.ifBlank { secondDisp },
                                         translatedText = secondDisp,
+                                        stableCueKey = part2Key,
+                                        parentUtteranceKey = parentKey,
+                                        sourceSpanStartMs = spanStart,
+                                        sourceSpanEndMs = spanEnd,
                                     )
                                 )
                                 continue
@@ -456,9 +469,9 @@ object SubtitleParser {
             return body
         }
         val spk = speakers.firstOrNull { it.id == event.speakerId } ?: return body
-        val name = spk.displayName.trim()
+        val name = spk.visibleDisplayNameAt(event.startTimeMs).trim()
         if (name.isBlank() ||
-            (!spk.hasDistinctCharacterName && !spk.isLocked) ||
+            !spk.hasVisibleCharacterNameAt(event.startTimeMs) ||
             body.startsWith("[") ||
             body.startsWith("$name:", ignoreCase = true)
         ) {
@@ -531,7 +544,7 @@ object SubtitleParser {
             val endAss = formatAssTime(evt.endTimeMs)
             val rawText = evt.activeText(project.translationMode).replace("\n", "\\N")
             val spk = project.speakers.firstOrNull { it.id == evt.speakerId }
-            val spkName = spk?.displayName ?: ""
+            val spkName = spk?.visibleDisplayNameAt(evt.startTimeMs) ?: ""
 
             if (evt.dialogueType == DialogueType.SOUND_DESCRIPTION) {
                 if (placed != null &&
@@ -544,7 +557,8 @@ object SubtitleParser {
                     sb.appendLine("Dialogue: 0,$startAss,$endAss,SFXBottom,SFX,0,0,0,,{\\an2\\i1}$rawText{\\i0}")
                 }
             } else {
-                val isUnknown = com.example.data.model.isBubbleSpeakerUnknown(evt, spk)
+                val isUnknown = com.example.data.model.isBubbleSpeakerUnknown(evt, spk) ||
+                    (spk != null && !spk.hasVisibleCharacterNameAt(evt.startTimeMs) && !evt.lockedByUser)
                 val isNonSpeaker = com.example.data.model.isBubbleNonSpeakerSpecific(evt, project.styleSettings) && !isUnknown
                 val styleName = when {
                     isUnknown -> "DialogueDefault"

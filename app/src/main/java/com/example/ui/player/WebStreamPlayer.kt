@@ -30,12 +30,15 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.data.model.ScoutCaptureDiagnostics
+import com.example.data.model.ScoutCaptureHealthState
 import com.example.domain.analysis.RedirectDecision
 import com.example.domain.analysis.SniffedWebMediaStream
 import com.example.domain.analysis.WebNavAction
 import com.example.domain.analysis.WebNavCommand
 import com.example.domain.analysis.WebNavigationGuard
 import com.example.domain.analysis.WebNavigationState
+import org.json.JSONObject
 
 /**
  * Holds a single live WebView session so an instance (such as the background Scout WebView)
@@ -64,7 +67,8 @@ class WebStreamSessionHolder {
     internal var captionsCallback: (String) -> Unit = {}
     internal var mediaUrlCallback: (String) -> Unit = {}
     internal var sniffedMediaCallback: (SniffedWebMediaStream) -> Unit = {}
-    internal var audioSliceCallback: (Long, String, String) -> Unit = { _, _, _ -> }
+    internal var audioSliceCallback: (Long, String, String, Long, Boolean) -> Unit = { _, _, _, _, _ -> }
+    internal var captureDiagnosticsCallback: (ScoutCaptureDiagnostics) -> Unit = {}
     internal var metadataCallback: (String, String, String) -> Unit = { _, _, _ -> }
     internal var navStateCallback: (WebNavigationState) -> Unit = {}
 
@@ -82,6 +86,15 @@ class WebStreamSessionHolder {
         if (reg.isNotEmpty()) {
             temporarilyAllowedHosts[reg] = expiry
         }
+        syncAllowedHostsToJs()
+    }
+
+    internal fun syncAllowedHostsToJs() {
+        val wv = webView ?: return
+        if (!bridgeReady) return
+        val snapshot = activeAllowedHostsSnapshot()
+        val jsonArr = org.json.JSONArray(snapshot.toList()).toString()
+        wv.evaluateJavascript("window.dlUpdateAllowedHosts && window.dlUpdateAllowedHosts($jsonArr);", null)
     }
 
     fun dispose() {
@@ -118,7 +131,8 @@ fun WebStreamPlayer(
     isolateVideoInViewport: Boolean = true,
     onDirectMediaUrl: (String) -> Unit = {},
     onSniffedMediaStream: (SniffedWebMediaStream) -> Unit = {},
-    onCapturedAudioSlice: (startMs: Long, base64Audio: String, mimeType: String) -> Unit = { _, _, _ -> },
+    onCapturedAudioSlice: (startMs: Long, base64Audio: String, mimeType: String, endMs: Long, discontinuity: Boolean) -> Unit = { _, _, _, _, _ -> },
+    onCaptureDiagnostics: (ScoutCaptureDiagnostics) -> Unit = {},
     onPageMetadata: (title: String, author: String, description: String) -> Unit = { _, _, _ -> },
     navCommand: WebNavCommand? = null,
     onNavigationStateChange: (WebNavigationState) -> Unit = {},
@@ -136,6 +150,7 @@ fun WebStreamPlayer(
     holder.mediaUrlCallback = onDirectMediaUrl
     holder.sniffedMediaCallback = onSniffedMediaStream
     holder.audioSliceCallback = onCapturedAudioSlice
+    holder.captureDiagnosticsCallback = onCaptureDiagnostics
     holder.metadataCallback = onPageMetadata
     holder.navStateCallback = onNavigationStateChange
 
@@ -390,15 +405,54 @@ private fun createGuardedWebView(
             }
 
             @JavascriptInterface
-            fun onCapturedAudioChunk(startMs: Long, base64Audio: String, mimeType: String) {
+            fun onCapturedAudioChunk(
+                startMs: Long,
+                base64Audio: String,
+                mimeType: String,
+                endMs: Long,
+                discontinuity: Boolean,
+            ) {
                 if (startMs < 0L) return
                 val cleanMime = mimeType.trim().lowercase().substringBefore(';')
                 if (cleanMime !in ALLOWED_AUDIO_MIME_TYPES) return
                 if (base64Audio.length !in 64..6_000_000) return
+                val safeEnd = endMs.coerceAtLeast(startMs + 250L)
                 mainHandler.post {
                     val currentPageUrl = url.orEmpty().ifBlank { holder.navState.currentUrl }
                     if (!isAuthorizedPageOrigin(currentPageUrl)) return@post
-                    holder.audioSliceCallback(startMs.coerceAtLeast(0L), base64Audio, cleanMime)
+                    holder.audioSliceCallback(startMs.coerceAtLeast(0L), base64Audio, cleanMime, safeEnd, discontinuity)
+                }
+            }
+
+            @JavascriptInterface
+            fun onCaptureDiagnostics(diagJson: String) {
+                if (diagJson.isBlank() || diagJson.length > 8192) return
+                mainHandler.post {
+                    val parsed = runCatching {
+                        val obj = JSONObject(diagJson)
+                        val stateName = obj.optString("healthState", "WAITING_FOR_MEDIA")
+                        val health = ScoutCaptureHealthState.entries.firstOrNull { it.name == stateName }
+                            ?: ScoutCaptureHealthState.WAITING_FOR_MEDIA
+                        ScoutCaptureDiagnostics(
+                            healthState = health,
+                            selectedElementId = obj.optString("selectedElementId", ""),
+                            documentGeneration = obj.optLong("documentGeneration", 0L),
+                            recorderId = obj.optString("recorderId", ""),
+                            outputMuted = obj.optBoolean("outputMuted", true),
+                            outputVolumeZero = obj.optBoolean("outputVolumeZero", true),
+                            trackReadyState = obj.optString("trackReadyState", ""),
+                            trackMuted = obj.optBoolean("trackMuted", false),
+                            trackEnabled = obj.optBoolean("trackEnabled", false),
+                            lastMimeType = obj.optString("lastMimeType", ""),
+                            lastSliceStartMs = obj.optLong("lastSliceStartMs", -1L),
+                            lastSliceEndMs = obj.optLong("lastSliceEndMs", -1L),
+                            droppedGapCount = obj.optInt("droppedGapCount", 0),
+                            diagnosticDetail = obj.optString("diagnosticDetail", ""),
+                        )
+                    }.getOrNull()
+                    if (parsed != null) {
+                        holder.captureDiagnosticsCallback(parsed)
+                    }
                 }
             }
 
@@ -542,6 +596,7 @@ private fun createGuardedWebView(
                     isScoutInstance = isScoutInstance,
                     seedDomain = seedDomain,
                     initialIsolate = holder.isolateVideoInViewport,
+                    initialAllowedHosts = holder.activeAllowedHostsSnapshot(),
                 ),
                 null,
             )
@@ -774,12 +829,20 @@ private fun buildWebStreamHookScript(
     isScoutInstance: Boolean,
     seedDomain: String,
     initialIsolate: Boolean,
+    initialAllowedHosts: Set<String> = emptySet(),
 ): String {
     val safeSeedDomain = seedDomain.replace("'", "")
+    val allowedJson = org.json.JSONArray(initialAllowedHosts.toList()).toString()
     return """
 (function() {
   var isScout = ${if (isScoutInstance) "true" else "false"};
   var seedDomain = '$safeSeedDomain';
+  window.__dlAllowedHosts = $allowedJson;
+  window.dlUpdateAllowedHosts = function(hosts) {
+    if (Array.isArray(hosts)) {
+      window.__dlAllowedHosts = hosts.map(function(x) { return String(x || '').toLowerCase(); });
+    }
+  };
   window.__dlIsolateVideo = ${if (initialIsolate) "true" else "false"};
   if (window.__dlWebHookInstalled) {
     if (window.dlSetVideoIsolation) window.dlSetVideoIsolation(window.__dlIsolateVideo);
@@ -787,13 +850,33 @@ private fun buildWebStreamHookScript(
     return;
   }
   window.__dlWebHookInstalled = true;
-  window.__dlHookVersion = 3;
+  window.__dlHookVersion = 4;
   window.__dlLastTrackSig = '';
   window.__dlLastDirectSrc = '';
   window.__dlLastMetaSig = '';
   window.__dlLastNavSig = '';
   window.__dlPlayGraceUntil = 0;
-  window.__dlAudioCapStarted = false;
+  window.__dlElemSeq = 0;
+  window.__dlDocGeneration = (window.__dlDocGeneration || 0) + 1;
+  window.__dlSelectedElementId = '';
+  window.__dlLastDiagKey = '';
+  window.__dlCapState = window.__dlCapState || {
+    active: false,
+    rec: null,
+    ownedTracks: [],
+    timerId: null,
+    recSeq: 0,
+    elementId: '',
+    sliceStartMs: 0,
+    seekDirty: false,
+    droppedGapCount: 0,
+    discontinuityNext: false,
+    onSeeked: null,
+    onEmptied: null,
+    onEnded: null,
+    onPause: null,
+    video: null
+  };
   window.__dlIsolatedTarget = null;
 
   function notifyPopupBlocked(url) {
@@ -854,6 +937,11 @@ private fun buildWebStreamHookScript(
     try {
       var u = new URL(rawHref, location.href);
       var h = (u.hostname || '').toLowerCase().replace(/^www\./, '');
+      var allowedList = window.__dlAllowedHosts || [];
+      for (var i = 0; i < allowedList.length; i++) {
+        var ah = allowedList[i];
+        if (ah && (h === ah || h.endsWith('.' + ah))) return false;
+      }
       if (seedDomain && h !== seedDomain && h.indexOf('.' + seedDomain) === -1) {
         return true;
       }
@@ -1082,11 +1170,22 @@ private fun buildWebStreamHookScript(
     }
   }
 
+  function ensureVideoElementId(v) {
+    if (!v) return '';
+    if (!v.dataset.dlElementId) {
+      window.__dlElemSeq = (window.__dlElemSeq || 0) + 1;
+      v.dataset.dlElementId = 'dl_vid_' + window.__dlElemSeq;
+    }
+    return v.dataset.dlElementId;
+  }
+
   function scoreVideoCandidate(v) {
     var r = v.getBoundingClientRect();
     var area = Math.max(0, r.width * r.height);
     var score = area;
-    if (!v.paused && !v.ended) score += 200000;
+    var id = ensureVideoElementId(v);
+    if (id && id === window.__dlSelectedElementId && area > 2400) score += 90000;
+    if (v.controls) score += 40000;
     if (v.readyState >= 2) score += 80000;
     if (v.videoWidth > 0 && v.videoHeight > 0) score += 45000;
     if (isFinite(v.duration) && v.duration > 20) score += 60000;
@@ -1115,6 +1214,9 @@ private fun buildWebStreamHookScript(
     if (!top) return null;
     var r = top.getBoundingClientRect();
     var usable = (r.width >= 60 && r.height >= 40) || !top.paused || (isFinite(top.duration) && top.duration > 0);
+    if (usable) {
+      window.__dlSelectedElementId = ensureVideoElementId(top);
+    }
     return usable ? top : null;
   }
 
@@ -1181,65 +1283,209 @@ private fun buildWebStreamHookScript(
     }
   }
 
+  function emitCaptureDiagnostics(healthState, video, mime, lastStartMs, lastEndMs, detail) {
+    if (!isScout || !window.DialogueLensWeb || !window.DialogueLensWeb.onCaptureDiagnostics) return;
+    var st = window.__dlCapState || {};
+    var primaryTrack = (st.ownedTracks && st.ownedTracks.length > 0) ? st.ownedTracks[0] : null;
+    var payload = {
+      healthState: String(healthState || 'WAITING_FOR_MEDIA'),
+      selectedElementId: String((video && video.dataset && video.dataset.dlElementId) || window.__dlSelectedElementId || ''),
+      documentGeneration: Number(window.__dlDocGeneration || 1),
+      recorderId: st.recSeq ? ('rec_' + st.recSeq) : '',
+      outputMuted: video ? !!video.muted : true,
+      outputVolumeZero: video ? (video.volume === 0) : true,
+      trackReadyState: primaryTrack ? String(primaryTrack.readyState || '') : '',
+      trackMuted: primaryTrack ? !!primaryTrack.muted : false,
+      trackEnabled: primaryTrack ? !!primaryTrack.enabled : false,
+      lastMimeType: String(mime || ''),
+      lastSliceStartMs: typeof lastStartMs === 'number' ? lastStartMs : -1,
+      lastSliceEndMs: typeof lastEndMs === 'number' ? lastEndMs : -1,
+      droppedGapCount: Number(st.droppedGapCount || 0),
+      diagnosticDetail: String(detail || '')
+    };
+    var sig = payload.healthState + '|' + payload.recorderId + '|' + payload.trackReadyState + '|' +
+      payload.droppedGapCount + '|' + payload.lastSliceStartMs + '|' + payload.lastSliceEndMs + '|' + payload.diagnosticDetail;
+    if (sig !== window.__dlLastDiagKey) {
+      window.__dlLastDiagKey = sig;
+      try { window.DialogueLensWeb.onCaptureDiagnostics(JSON.stringify(payload)); } catch (e) {}
+    }
+  }
+
+  function stopActiveCapture(reason) {
+    var st = window.__dlCapState;
+    if (!st) return;
+    if (st.timerId) {
+      try { clearTimeout(st.timerId); } catch (e) {}
+      st.timerId = null;
+    }
+    if (st.rec) {
+      try {
+        st.rec.ondataavailable = null;
+        st.rec.onerror = null;
+        st.rec.onstop = null;
+        if (st.rec.state !== 'inactive') st.rec.stop();
+      } catch (e) {}
+      st.rec = null;
+    }
+    if (st.ownedTracks && st.ownedTracks.length) {
+      for (var i = 0; i < st.ownedTracks.length; i++) {
+        try { st.ownedTracks[i].stop(); } catch (e) {}
+      }
+      st.ownedTracks = [];
+    }
+    if (st.video) {
+      try {
+        if (st.onSeeked) st.video.removeEventListener('seeked', st.onSeeked);
+        if (st.onEmptied) st.video.removeEventListener('emptied', st.onEmptied);
+        if (st.onEnded) st.video.removeEventListener('ended', st.onEnded);
+        if (st.onPause) st.video.removeEventListener('pause', st.onPause);
+      } catch (e) {}
+    }
+    st.active = false;
+    st.elementId = '';
+    st.video = null;
+    if (reason) {
+      emitCaptureDiagnostics('WAITING_FOR_MEDIA', null, '', -1, -1, reason);
+    }
+  }
+
   function tryStartAudioCapture(video) {
-    if (!isScout || window.__dlAudioCapStarted || !video || !window.MediaRecorder) return;
+    var st = window.__dlCapState;
+    if (!isScout || !video) return;
+    var elemId = ensureVideoElementId(video);
+    if (st.active && st.video === video && st.elementId === elemId) return;
+    if (st.active) stopActiveCapture('');
+
+    if (!window.MediaRecorder) {
+      emitCaptureDiagnostics('UNSUPPORTED_CAPTURE', video, '', -1, -1, 'MediaRecorder unavailable');
+      return;
+    }
     var captureFn = video.captureStream || video.mozCaptureStream;
-    if (!captureFn) return;
+    if (!captureFn) {
+      emitCaptureDiagnostics('UNSUPPORTED_CAPTURE', video, '', -1, -1, 'HTMLVideoElement.captureStream unavailable');
+      return;
+    }
     try {
       var stream = captureFn.call(video);
-      var audioTracks = stream.getAudioTracks ? stream.getAudioTracks() : [];
-      if (!audioTracks || audioTracks.length === 0) return;
-      var audioOnly = new MediaStream(audioTracks);
+      var rawTracks = stream && stream.getAudioTracks ? stream.getAudioTracks() : [];
+      if (!rawTracks || rawTracks.length === 0) {
+        emitCaptureDiagnostics('UNSUPPORTED_CAPTURE', video, '', -1, -1, 'No audio track exposed by stream');
+        return;
+      }
+      var clonedTracks = [];
+      for (var t = 0; t < rawTracks.length; t++) {
+        var cloned = rawTracks[t].clone ? rawTracks[t].clone() : rawTracks[t];
+        clonedTracks.push(cloned);
+      }
+      var audioOnly = new MediaStream(clonedTracks);
       var mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
-        : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '');
-      if (!mime) return;
-
-      var sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
-      var seekDirty = false;
-      var onSeeked = function() {
-        sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
-        seekDirty = true;
-      };
-      var resetCapture = function() {
-        window.__dlAudioCapStarted = false;
-        try { video.removeEventListener('seeked', onSeeked); } catch (e) {}
-      };
-      video.addEventListener('seeked', onSeeked);
-      video.addEventListener('emptied', resetCapture, { once: true });
-      video.addEventListener('ended', resetCapture, { once: true });
-
-      var rec = new MediaRecorder(audioOnly, { mimeType: mime });
-      rec.onerror = resetCapture;
-      rec.onstop = resetCapture;
-      rec.ondataavailable = function(ev) {
-        if (seekDirty) {
-          seekDirty = false;
-          sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
-          return;
+        : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm'
+          : (MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : ''));
+      if (!mime) {
+        for (var k = 0; k < clonedTracks.length; k++) {
+          try { if (clonedTracks[k].stop) clonedTracks[k].stop(); } catch (e) {}
         }
-        if (ev.data && ev.data.size > 1800 && window.DialogueLensWeb) {
-          var capturedStart = sliceStartMs;
-          sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
-          var reader = new FileReader();
-          reader.onloadend = function() {
-            var res = reader.result || '';
-            var comma = res.indexOf(',');
-            if (comma > 0) {
-              var b64 = res.substring(comma + 1);
-              try {
-                window.DialogueLensWeb.onCapturedAudioChunk(capturedStart, b64, mime.split(';')[0]);
-              } catch (err) {}
+        emitCaptureDiagnostics('UNSUPPORTED_CAPTURE', video, '', -1, -1, 'No supported MediaRecorder audio MIME');
+        return;
+      }
+
+      st.active = true;
+      st.video = video;
+      st.elementId = elemId;
+      st.ownedTracks = clonedTracks;
+      st.sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+      st.seekDirty = false;
+      st.discontinuityNext = false;
+
+      st.onSeeked = function() {
+        st.sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+        st.seekDirty = true;
+        st.discontinuityNext = true;
+        if (st.rec && st.rec.state === 'recording') {
+          try { st.rec.stop(); } catch (e) {}
+        }
+      };
+      st.onEmptied = function() { stopActiveCapture('Media element emptied'); };
+      st.onEnded = function() { stopActiveCapture('Media element ended'); };
+      st.onPause = function() { stopActiveCapture('Scout paused'); };
+      video.addEventListener('seeked', st.onSeeked);
+      video.addEventListener('emptied', st.onEmptied, { once: true });
+      video.addEventListener('ended', st.onEnded, { once: true });
+      video.addEventListener('pause', st.onPause, { once: true });
+
+      function runStandaloneClip() {
+        if (!st.active || st.video !== video || video.paused || video.ended) return;
+        st.recSeq = (st.recSeq || 0) + 1;
+        var cleanMime = mime.split(';')[0];
+        var clipChunks = [];
+        var capturedStart = st.sliceStartMs;
+        try {
+          var rec = new MediaRecorder(audioOnly, { mimeType: mime });
+          st.rec = rec;
+          emitCaptureDiagnostics('RECORDER_STARTED', video, cleanMime, capturedStart, capturedStart, 'Clip #' + st.recSeq + ' started');
+          rec.ondataavailable = function(ev) {
+            if (ev.data && ev.data.size > 0) clipChunks.push(ev.data);
+          };
+          rec.onerror = function() {
+            emitCaptureDiagnostics('DECODE_FAILED', video, cleanMime, capturedStart, capturedStart, 'MediaRecorder error');
+            stopActiveCapture('');
+          };
+          rec.onstop = function() {
+            if (st.timerId) {
+              try { clearTimeout(st.timerId); } catch (e) {}
+              st.timerId = null;
+            }
+            var curEndMs = Math.max(capturedStart + 350, Math.round((video.currentTime || 0) * 1000));
+            if (st.seekDirty) {
+              st.seekDirty = false;
+              st.sliceStartMs = Math.max(0, Math.round((video.currentTime || 0) * 1000));
+              if (st.active && !video.paused && !video.ended) runStandaloneClip();
+              return;
+            }
+            st.sliceStartMs = curEndMs;
+            var blob = clipChunks.length > 0 ? new Blob(clipChunks, { type: mime }) : null;
+            if (blob && blob.size >= 1024 && window.DialogueLensWeb) {
+              var hadDisc = !!st.discontinuityNext;
+              st.discontinuityNext = false;
+              var reader = new FileReader();
+              reader.onloadend = function() {
+                var res = reader.result || '';
+                var comma = res.indexOf(',');
+                if (comma > 0) {
+                  var b64 = res.substring(comma + 1);
+                  try {
+                    window.DialogueLensWeb.onCapturedAudioChunk(capturedStart, b64, cleanMime, curEndMs, hadDisc);
+                  } catch (err) {}
+                }
+              };
+              reader.readAsDataURL(blob);
+            } else {
+              st.droppedGapCount = (st.droppedGapCount || 0) + 1;
+              st.discontinuityNext = true;
+              emitCaptureDiagnostics('WAITING_FOR_MEDIA', video, cleanMime, capturedStart, curEndMs, 'Dropped tiny clip (' + (blob ? blob.size : 0) + 'B)');
+            }
+            if (st.active && !video.paused && !video.ended) {
+              runStandaloneClip();
             }
           };
-          reader.readAsDataURL(ev.data);
+          rec.start();
+          st.timerId = setTimeout(function() {
+            if (st.rec === rec && rec.state === 'recording') {
+              try { rec.stop(); } catch (e) {}
+            }
+          }, 6200);
+        } catch (err) {
+          emitCaptureDiagnostics('SOURCE_INACCESSIBLE', video, cleanMime, capturedStart, capturedStart, String(err && err.name ? err.name : 'CaptureError'));
+          stopActiveCapture('');
         }
-      };
-      rec.start(6800);
-      // Mark started ONLY after MediaRecorder.start() succeeds so transient early calls can retry
-      window.__dlAudioCapStarted = true;
+      }
+
+      runStandaloneClip();
     } catch (securityErr) {
-      window.__dlAudioCapStarted = false;
+      var errName = String(securityErr && securityErr.name ? securityErr.name : 'SecurityError');
+      emitCaptureDiagnostics('SOURCE_INACCESSIBLE', video, '', -1, -1, errName);
+      stopActiveCapture('');
     }
   }
 

@@ -594,17 +594,23 @@ fun PlayerControlsBar(
                             CaptionDisplayMode.primaryModes.forEach { mode ->
                                 val isSelected = activePrimaryMode == mode
                                 val a11yLabel = when (mode) {
-                                    CaptionDisplayMode.BALLOONS -> "Speech bubbles mode"
-                                    CaptionDisplayMode.FIXED_ZONES -> "Fixed zones tailless captions mode"
-                                    CaptionDisplayMode.CLASSIC -> "Standard subtitle bar mode"
-                                    CaptionDisplayMode.OFF -> "No subtitles"
-                                    CaptionDisplayMode.BOTH -> "Speech bubbles mode"
+                                    CaptionDisplayMode.OFF -> "No captions"
+                                    CaptionDisplayMode.CLASSIC -> "Classic captions mode"
+                                    CaptionDisplayMode.BALLOONS -> "Bubble captions without tails mode"
+                                    CaptionDisplayMode.BUBBLES_WITH_TAILS -> "Bubbles with tails mode"
+                                    @Suppress("DEPRECATION")
+                                    CaptionDisplayMode.FIXED_ZONES -> "Bubble captions without tails mode"
+                                    @Suppress("DEPRECATION")
+                                    CaptionDisplayMode.BOTH -> "Bubbles with tails mode"
                                 }
                                 val selectedBg = when (mode) {
-                                    CaptionDisplayMode.BALLOONS -> LensSky
-                                    CaptionDisplayMode.FIXED_ZONES -> LensMint
-                                    CaptionDisplayMode.CLASSIC -> LensAmber
                                     CaptionDisplayMode.OFF -> Color(0xFFEF4444)
+                                    CaptionDisplayMode.CLASSIC -> LensAmber
+                                    CaptionDisplayMode.BALLOONS -> LensMint
+                                    CaptionDisplayMode.BUBBLES_WITH_TAILS -> LensSky
+                                    @Suppress("DEPRECATION")
+                                    CaptionDisplayMode.FIXED_ZONES -> LensMint
+                                    @Suppress("DEPRECATION")
                                     CaptionDisplayMode.BOTH -> LensSky
                                 }
                                 val fgColor = if (isSelected) {
@@ -627,28 +633,31 @@ fun PlayerControlsBar(
                                 ) {
                                     Box(
                                         modifier = Modifier.size(
-                                            width = if (isCompactDock) 40.dp else 44.dp,
-                                            height = 36.dp,
+                                            width = if (isCompactDock) 44.dp else 48.dp,
+                                            height = 40.dp,
                                         ),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         when (mode) {
-                                            CaptionDisplayMode.BALLOONS,
-                                            CaptionDisplayMode.BOTH -> SpeechBubblesModeIcon(
+                                            CaptionDisplayMode.OFF -> BigXOffIcon(
                                                 tint = fgColor,
-                                                modifier = Modifier.size(22.dp),
-                                            )
-                                            CaptionDisplayMode.FIXED_ZONES -> FixedZonesModeIcon(
-                                                tint = fgColor,
-                                                modifier = Modifier.size(22.dp),
+                                                modifier = Modifier.size(20.dp),
                                             )
                                             CaptionDisplayMode.CLASSIC -> ScreenSubtitleBarIcon(
                                                 tint = fgColor,
                                                 modifier = Modifier.size(22.dp),
                                             )
-                                            CaptionDisplayMode.OFF -> BigXOffIcon(
+                                            CaptionDisplayMode.BALLOONS,
+                                            @Suppress("DEPRECATION")
+                                            CaptionDisplayMode.FIXED_ZONES -> FixedZonesModeIcon(
                                                 tint = fgColor,
-                                                modifier = Modifier.size(20.dp),
+                                                modifier = Modifier.size(22.dp),
+                                            )
+                                            CaptionDisplayMode.BUBBLES_WITH_TAILS,
+                                            @Suppress("DEPRECATION")
+                                            CaptionDisplayMode.BOTH -> SpeechBubblesModeIcon(
+                                                tint = fgColor,
+                                                modifier = Modifier.size(22.dp),
                                             )
                                         }
                                     }

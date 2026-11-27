@@ -348,11 +348,18 @@ class TwoScoutReleasePipelineTest {
         val repairedTranslation = reviewer.reviewDraft(translatedDraft, authoredJaRef, layout, jaToEnProject)
         val outEvt = repairedTranslation.repairedEvents.first()
         assertEquals("今日は新しい計画を発表します", outEvt.sourceText)
-        assertEquals(
+        assertFalse(
             "Translated display text must NEVER be overwritten with source-language reference text",
-            "Today we are announcing a new plan.",
+            outEvt.translatedText.contains("今日"),
+        )
+        assertEquals(
+            "Material source repair must invalidate stale English translation while re-translation is pending",
+            "",
             outEvt.translatedText,
         )
+        assertTrue(outEvt.needsTranslation)
+        assertEquals(2, outEvt.sourceTextRevision)
+        assertFalse(repairedTranslation.isTranslationVerified)
     }
 
     // -------------------------------------------------------------------------

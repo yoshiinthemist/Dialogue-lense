@@ -77,6 +77,7 @@ fun CinemaIntroOverlay(
     bufferedWindows: Int = 0,
     totalWindows: Int = 0,
     requiredOpeningWindows: Int = 1,
+    currentTimeMs: Long = 0L,
     readinessSnapshot: PlaybackReadinessSnapshot? = null,
     onRetryBuffering: () -> Unit = {},
     onOpenAttachCaptions: () -> Unit = {},
@@ -164,7 +165,9 @@ fun CinemaIntroOverlay(
                         textAlign = TextAlign.Center,
                     )
 
-                    val displaySpeakers = speakers.filter { it.isConfirmedCharacter }.take(4)
+                    val displaySpeakers = speakers.filter {
+                        it.isLocked || (it.isIdentityConfirmed && it.hasVisibleCharacterNameAt(currentTimeMs))
+                    }.take(4)
                     if (displaySpeakers.isNotEmpty() && !isErrorOrTimeout) {
                         FlowRow(
                             horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
@@ -190,7 +193,7 @@ fun CinemaIntroOverlay(
                                                 .background(chipTint)
                                         )
                                         Text(
-                                            text = spk.displayName,
+                                            text = spk.visibleDisplayNameAt(currentTimeMs),
                                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                             color = InkPrimary,
                                             maxLines = 1,
